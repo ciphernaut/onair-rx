@@ -32,17 +32,20 @@ public:
     size_t read(std::vector<cf32>& out);
     uint64_t samples() const { return samples_; }
     int64_t startUsec() const { return startUsec_; }   // wall clock when the first sample arrived (0 before)
+    int error() const { return error_; }               // the errno of a failed read (0: none; the read loop then saw EOF)
 private:
     bool cs16_;
     std::vector<uint8_t> buf_;
     size_t have_ = 0;              // bytes in buf_ not yet converted
     uint64_t samples_ = 0;
     int64_t startUsec_ = 0;
+    int error_ = 0;
 };
 
 // A local TCP port serving one client at a time a classic pcap stream: the file header, then one record per packet.
 // Packets wait in a bounded queue (the oldest go first when it is full), so a client that connects late still gets
-// the recent ones, and nothing grows without bound when no client ever comes. A client that hangs up is dropped and the
+// the recent ones, and nothing grows without bound when no client ever comes (what is queued at the end with no client
+// is counted as dropped). A client that hangs up is dropped and the
 // next one gets a new header.
 class PcapPort {
 public:

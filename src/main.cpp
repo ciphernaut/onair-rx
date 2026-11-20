@@ -10,6 +10,7 @@
 #include "rx.h"
 #include "dect2/wirecap/wire.h"
 #include <cerrno>
+#include <cmath>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -38,7 +39,8 @@ size_t IqInput::read(std::vector<cf32>& out) {
     while (have_ < per) {
         const ssize_t k = ::read(0, buf_.data() + have_, buf_.size() - have_);
         if (k < 0 && errno == EINTR) continue;
-        if (k <= 0) return 0;   // EOF (a cut sample is dropped) or an error
+        if (k < 0) error_ = errno;
+        if (k <= 0) return 0;   // EOF (a cut sample is dropped) or an error (error())
         have_ += (size_t)k;
     }
     if (!startUsec_)
@@ -85,6 +87,7 @@ void Json::key(const char* k) {
 Json& Json::str(const char* k, const std::string& v) { key(k); s_ += '"'; escape(s_, v); s_ += '"'; return *this; }
 Json& Json::num(const char* k, long long v) { key(k); s_ += std::to_string(v); return *this; }
 Json& Json::num(const char* k, double v, int decimals) {
+    if (!std::isfinite(v)) return *this;   // not a value JSON can hold: the member is left out
     char b[48];
     snprintf(b, sizeof b, "%.*f", decimals, v);
     key(k); s_ += b; return *this;
@@ -150,6 +153,7 @@ int main(int argc, char** argv) {
     const int st = mode->run(o, in, out);
     fflush(stdout);
     pcap.finish();
+    if (in.error()) { fprintf(stderr, "onair-rx: stdin: %s\n", strerror(in.error())); return 1; }
     if (st != 0) return st;
     fprintf(stderr, "onair-rx: %llu samples (%.2f s)", (unsigned long long)in.samples(), in.samples() / o.rate);
     if (o.pcapPort) fprintf(stderr, ", pcap %llu sent, %llu dropped", (unsigned long long)pcap.sent(), (unsigned long long)pcap.dropped());

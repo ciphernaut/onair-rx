@@ -78,7 +78,7 @@ void PcapPort::run() {
         if (cfd_ < 0) {
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                if (stop_) break;   // nobody is listening: what is queued goes
+                if (stop_) { dropped_ += q_.size(); q_.clear(); break; }   // nobody is listening: what is queued goes
             }
             pollfd pf{lfd_, POLLIN, 0};
             if (poll(&pf, 1, 100) <= 0) continue;

@@ -21,22 +21,24 @@ onair-rx --version
 
 - **stdin:** interleaved little-endian IQ at `--rate` Hz, `cf32` (the default) or `cs16`. ADS-B needs at least
   2 MHz; 2.4 MHz is usual.
-- **stdout:** one JSON object per decoded Mode S frame, flushed per line. A member whose value is not known is
-  absent, never null.
-  - Always present: `icao` (6 upper-case hex digits), `df` and `level_dbfs` (the preamble pulses' mean power).
-  - Present when the frame has them: `tc` (the type code) and `msg` (its SBS message type, 1 to 8, as OnAir's SBS
-    feed classifies it).
-  - The aircraft as OnAir's aircraft table holds it just after the frame: `callsign`, `altitude_ft` (barometric),
-    `lat`, `lon`, `ground_speed_kt`, `track_deg`, `squawk` (four octal digits, a string) and `on_ground` (only once
-    a frame has said whether the aircraft is on the ground).
+- **stdout:** one JSON object per decoded Mode S frame, flushed per line. A line carries only what its own frame
+  established, as an SBS (BaseStation) line does, never a value remembered from an earlier frame. A member whose value
+  is not known is absent, never null.
+  - On every line: `icao` (6 upper-case hex digits), `df` and `level_dbfs` (the preamble pulses' mean power).
+  - When the frame has them: `tc` (the type code) and `msg` (its SBS message type, 1 to 8, as OnAir's SBS writer
+    classifies it).
+  - The members OnAir's SBS writer fills for that message type, from the frame: `callsign` (msg 1), `altitude_ft`
+    (msg 3, 5, 7), `ground_speed_kt` and `track_deg` (msg 2, 4), `vertical_rate_fpm` (msg 4), `squawk` (msg 6, four
+    octal digits, a string), and `on_ground` when the frame says whether the aircraft is on the ground.
+  - `lat` and `lon` only on the position message (msg 2, 3) that completed a fix in OnAir's tracker.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic
   pcap stream: the file header, then one record per frame (7 or 14 bytes, link type 147, USER0). Every JSON line
   has exactly one record. Records wait in a bounded queue (8192, the oldest dropped first), so a client that
   connects a few seconds late still gets them; a client that hangs up is dropped, and the next one gets a new header.
   Record times are the frame's sample time on the wall clock of the first sample, moved on when the input falls
-  more than a second behind real time.
+  more than 100 ms behind real time. What is still queued at the end with no client is counted as dropped.
 - **stderr:** diagnostics, one line each. An unknown mode exits 2 with `onair-rx: no mode <m>`; a port that
-  cannot be opened exits 1.
+  cannot be opened, or a failed read of stdin (`onair-rx: stdin: <reason>`), exits 1.
 - **EOF** on stdin: what was decoded is written (the queued records to a connected client), then exit 0.
   SIGTERM ends it at once.
 
@@ -55,10 +57,13 @@ SoapySDR (OnAir's server link line).
 
 - `src/main.cpp`: the options, the mode table (a mode's name, its pcap link type and the function that runs it),
   the IQ input and the JSON writer. Another OnAir receiver is one more row.
-- `src/adsb.cpp`: OnAir's `AdsbReceiver` does the decoding. Its frame callback hands over every good frame; after
-  each `feed()` the frames are applied, one at a time and in order, to a second OnAir `AdsbTracker`. That rebuilds
-  the receiver's own aircraft table from the same frames, and its snapshot gives each frame's aircraft state (the
-  receiver's `telemetry()` refreshes only every 0.25 s of signal). The same frame's bytes become the pcap record.
+- `src/adsb.cpp`: OnAir's `AdsbReceiver` does the decoding. Its frame callback hands over every good frame, decoded
+  by OnAir into `AdsbFrame::msg`; after each `feed()` each frame becomes a line, from the members `feedfmt::sbsLine`
+  fills for its message type. A position needs the aircraft's earlier frames, so each address has a small OnAir
+  `AdsbTracker` of its own, fed that address's frames; on a position message its one-aircraft snapshot says whether
+  this frame committed the fix (OnAir's own feeds get that as `FeedAdsbFrame::hasPos`, but only over sockets). The
+  per-frame cost does not grow with the number of aircraft (about 5 us a frame on the test capture). The same
+  frame's bytes become the pcap record.
 - `src/pcap_port.cpp`: the port, with OnAir's own pcap byte layout (`wire_format.h`).
 
 ## Findings from the first spike (2026-11-20, OnAir a63c3a8, Ubuntu 24.04, g++ 13)
