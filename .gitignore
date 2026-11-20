@@ -1,7 +1,10 @@
 _onair-build/
+_build/
+_state/
+_scratch/
 iq/
+/onair-rx
 *.o
-spike/onair-rx
 *.pcap
 *.pcapng
 *.log
