@@ -19,12 +19,17 @@ struct BusMode {
     bool (*open)(const Options& o, std::function<void(const cf32*, size_t)>* feed, std::string* err);
     // adds the members the row needs and the bus lacks; false drops the event
     bool (*shape)(const dect2::automation::Event& e, Json& j);
+    // a mode whose lines come from its hub packets (the hub then runs with or without a pcap port): the lines' event, and what
+    // makes, once per run, the function that adds a packet's members to its line (false: no line for this packet). nullptr: none
+    const char* packetEvent;
+    std::function<bool(const uint8_t* p, size_t n, Json& j)> (*packetLines)();
 };
 
 extern const BusMode kBusModes[];
 extern const size_t kBusModeCount;
 
-// Runs a bus mode to EOF: one JSON line per bus event, one pcap record per hub packet (with a pcap port). The exit status.
+// Runs a bus mode to EOF: one JSON line per bus event (and per packet packetLines takes), one pcap record per hub packet (with a
+// pcap port), wrapped as OnAir's capture files wrap the channel's packets. The exit status.
 int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out);
 
 } // namespace onair_rx

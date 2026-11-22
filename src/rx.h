@@ -5,6 +5,8 @@
 #pragma once
 #include "dect2/common/ring.h"
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -41,6 +43,21 @@ private:
     uint64_t samples_ = 0;
     int64_t startUsec_ = 0;
     int error_ = 0;
+};
+
+// The time of a pcap record: its signal time (seconds after the first sample) on the wall clock of the first sample, moved on
+// when the input falls more than 100 ms behind real time. One per run: the move stays for the records after it.
+class RecordClock {
+public:
+    int64_t at(const IqInput& in, double signalSec) {
+        const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        if (!anchorUsec_) anchorUsec_ = in.startUsec();
+        int64_t t = anchorUsec_ + (int64_t)std::llround(signalSec * 1e6);
+        if (t < now - 100000) { anchorUsec_ += now - t; t = now; }
+        return t;
+    }
+private:
+    int64_t anchorUsec_ = 0;   // wall clock of signal time 0
 };
 
 // A local TCP port serving one client at a time a classic pcap stream: the file header, then one record per packet.

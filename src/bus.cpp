@@ -8,13 +8,15 @@
 // the packets pcap records. A mode is a row: how to make and set up its receiver, its hub channel, and what its lines need that
 // the bus lacks.
 #include "bus.h"
+#include "ais.h"
 #include "dect2/acars/acars_rx.h"
+#include "dect2/ais/ais_longrange.h"
+#include "dect2/ais/ais_rx.h"
 #include "dect2/automation/engine.h"
 #include "dect2/packet/packet_rx.h"
 #include "dect2/pager/pager_rx.h"
 #include "dect2/wirecap/wire.h"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -115,6 +117,33 @@ bool shapeAprs(const automation::Event& e, Json& j) {
     return true;
 }
 
+// --- AIS: OnAir's AisReceiver with the centre known places AIS 1 (161.975 MHz) and AIS 2 (162.025 MHz) by their own
+// frequencies and decodes the ones the input holds: one of them is enough. It needs the pair's middle (162.000 MHz) 40 kHz inside
+// the input's edge (ais::aisChannelsCovered), so a centre where that fails is refused rather than run deaf. The long-range
+// channels 75 and 76 (message 27, for satellites) are left out. A line per message comes from the hub's sentences (ais.cpp);
+// of the bus's events, the station summaries (ais.vessel, every few seconds) are dropped, the others stay lines.
+bool openAis(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<AisReceiver>();
+    rx->setCenterHz(o.freq);
+    rx->setChannelMask(3);
+    if (!start(rx, o, "ais", aisTuning().minSampleRate, feed, err)) return false;
+    if (!(ais::aisChannelsCovered(o.freq, o.rate) & 3)) {
+        char b[160];
+        snprintf(b, sizeof b, "ais: no AIS channel within %.0f Hz of %.0f Hz", o.rate, o.freq);
+        *err = b;
+        return false;
+    }
+    return true;
+}
+bool shapeAis(const automation::Event& e, Json&) { return e.type != "ais.vessel"; }
+std::function<bool(const uint8_t*, size_t, Json&)> aisPackets() {
+    auto joiner = std::make_shared<AisJoiner>();
+    return [joiner](const uint8_t* p, size_t n, Json& j) {
+        const auto sentences = joiner->add(std::string((const char*)p, n));
+        return sentences && aisLine(*sentences, j);
+    };
+}
+
 // a bus value as a member: whole numbers without a decimal point, a non-finite number or a null left out
 void member(Json& j, const std::string& k, const automation::Value& v) {
     switch (v.t) {
@@ -132,10 +161,11 @@ void member(Json& j, const std::string& k, const automation::Value& v) {
 } // namespace
 
 const BusMode kBusModes[] = {
-    {"pocsag", -1, false, openPocsag, shapePocsag},
-    {"flex", -1, false, openFlex, shapeFlex},
-    {"acars", -1, true, openAcars, nullptr},
-    {"aprs", wire::Aprs, false, openAprs, shapeAprs},
+    {"pocsag", -1, false, openPocsag, shapePocsag, nullptr, nullptr},
+    {"flex", -1, false, openFlex, shapeFlex, nullptr, nullptr},
+    {"acars", -1, true, openAcars, nullptr, nullptr, nullptr},
+    {"aprs", wire::Aprs, false, openAprs, shapeAprs, nullptr, nullptr},
+    {"ais", wire::Ais, true, openAis, shapeAis, "ais.message", aisPackets},
 };
 const size_t kBusModeCount = sizeof kBusModes / sizeof kBusModes[0];
 
@@ -148,7 +178,9 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
     std::vector<automation::Event> events;
     automation::global().setTap([&events](const automation::Event& e) { events.push_back(e); }, automation::kAllFamilies);
     std::vector<std::vector<uint8_t>> packets;
-    const bool hub = m.chan >= 0 && o.pcapPort;
+    const auto packetLine = m.packetLines ? m.packetLines() : nullptr;
+    const bool records = m.chan >= 0 && o.pcapPort;
+    const bool hub = records || (m.chan >= 0 && packetLine);
     if (hub) {
         wire::Config c;   // no file, no live capture, no GSMTAP: the sink is the hub's only output
         c.dir.clear();
@@ -160,7 +192,7 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
         wire::Hub::get().setEnabled((wire::Chan)m.chan, true);
     }
 
-    int64_t anchorUsec = 0;   // wall clock of signal time 0
+    RecordClock clock;
     uint64_t lines = 0, sent = 0;
     std::vector<cf32> iq(1 << 14);
     for (size_t n; (n = in.read(iq)) > 0;) {
@@ -175,17 +207,27 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
             lines++;
         }
         events.clear();
-        if (!packets.empty()) {
-            // the block's first sample in signal time on the wall clock of the first sample, moved on when the input falls behind
-            // real time (as adsb's records)
-            const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-            if (!anchorUsec) anchorUsec = in.startUsec();
-            int64_t t = anchorUsec + (int64_t)std::llround((double)first / o.rate * 1e6);
-            if (t < now - 100000) { anchorUsec += now - t; t = now; }
-            for (const auto& p : packets) out.packet(t, p.data(), p.size());
+        if (packetLine)
+            for (const auto& p : packets) {
+                Json j;
+                j.str("event", m.packetEvent).num("t_sample", (long long)first);
+                if (!packetLine(p.data(), p.size(), j)) continue;
+                out.line(j.done());
+                lines++;
+            }
+        if (records && !packets.empty()) {
+            // at the block's first sample. A packet the channel has as application data is wrapped as OnAir's capture files
+            // have it (wire.cpp): in IPv4 + UDP to the channel's port, so that the port's dissector reads it
+            const wire::ChanInfo& ci = wire::kChans[m.chan];
+            const int64_t t = clock.at(in, (double)first / o.rate);
+            for (const auto& p : packets) {
+                if (ci.encap == wire::Encap::Direct) { out.packet(t, p.data(), p.size()); continue; }
+                const wire::Bytes w = wire::udpInIpv4(ci.udpPort, p.data(), p.size());
+                out.packet(t, w.data(), w.size());
+            }
             sent += packets.size();
-            packets.clear();
         }
+        packets.clear();
     }
     automation::global().setTap({}, 0);
     if (hub) {
@@ -193,7 +235,7 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
         wire::Hub::get().shutdown();
     }
     fprintf(stderr, "onair-rx: %s: %llu lines", m.name, (unsigned long long)lines);
-    if (hub) fprintf(stderr, ", %llu packets", (unsigned long long)sent);
+    if (records) fprintf(stderr, ", %llu packets", (unsigned long long)sent);
     fprintf(stderr, "\n");
     return 0;
 }

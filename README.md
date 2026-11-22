@@ -19,13 +19,16 @@ onair-rx --lua > onair.lua     # OnAir's Wireshark Lua dissector (USER0 is Mode 
 onair-rx --version
 ```
 
-Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars` and `aprs` (below).
+Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs` and `ais` (below).
 
 - **stdin:** interleaved little-endian IQ at `--rate` Hz, `cf32` (the default) or `cs16`, the signal's channel at
-  0 Hz. The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); POCSAG, FLEX and ACARS 1 MHz; APRS 240 kHz.
-  A rate below the mode's exits 2 with one line saying so.
-- **`--freq HZ`:** the radio frequency at 0 Hz of the input. Every mode takes it; only ACARS needs it (it names its
-  channel by frequency) and exits 2 with `onair-rx: acars needs --freq HZ` without it, before reading any input.
+  0 Hz. The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); POCSAG, FLEX and ACARS 1 MHz; APRS 240 kHz;
+  AIS 250 kHz. A rate below the mode's exits 2 with one line saying so.
+- **`--freq HZ`:** the radio frequency at 0 Hz of the input. Every mode takes it; ACARS and AIS need it (they place
+  their channels by frequency) and exit 2 with `onair-rx: <mode> needs --freq HZ` without it, before reading any input.
+  AIS also exits 2, before reading input, with `onair-rx: ais: no AIS channel within <rate> Hz of <freq> Hz` when the
+  input does not hold AIS 1 (161.975 MHz) or AIS 2 (162.025 MHz) as OnAir's receiver needs them: the middle of the two,
+  162.000 MHz, 40 kHz inside the edge of the input's band (`--freq` plus or minus 0.49 times `--rate`).
 - **stdout, adsb:** one JSON object per decoded Mode S frame, flushed per line. A line carries only what its own frame
   established, as an SBS (BaseStation) line does, never a value remembered from an earlier frame. A member whose value
   is not known is absent, never null.
@@ -47,12 +50,24 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars` and `aprs` (below).
   - `aprs` (`aprs.packet`: `from`, `to`, `info`, `type`, `summary`, `lat`, `lon`; also `aprs.message`): `path` as an
     array of strings, and `fcs_ok`: OnAir passes on only frames whose check sequence was right or that it repaired
     until it was, and marks a repaired frame in its summary; `fcs_ok` is false for those.
+  - `ais`: one line per AIS message, made from the NMEA 0183 sentences OnAir's receiver hands its Wireshark hub
+    (`src/ais.cpp`), not from the bus: its station summaries (`ais.vessel`) are dropped, its other events (such as
+    `ais.anomaly`) stay lines as in the other bus modes. A message's line has `event` `ais.message`, `mmsi`,
+    `msg_type`, `channel` (`A` for AIS 1, `B` for AIS 2), `repeat` and `nmea` (the message's sentences, without line
+    ends), and `lat`, `lon`, `sog_kt`, `cog_deg`, `heading_deg`, `nav_status`, `name`,
+    `callsign`, `destination`, `imo` and `ship_type` when the message type carries them and does not give them as not
+    available (navigational status 15, IMO number 0 and ship type 0 are). The message is read by OnAir's own AIS
+    parser. A message of several sentences becomes one line when its last sentence comes; a part that does not follow
+    the one before it (by channel and sequence id) ends that message without a line, and a channel's complete message
+    forgets the channel's parts still waiting. The receiver decodes AIS 1 and 2, whichever of them the input holds
+    (one is enough, so `--freq` may be either channel's own frequency), not the long-range channels 75 and 76.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic
   pcap stream: the file header, then one record per frame. ADS-B: 7 or 14 bytes, link type 147 (USER0), and every
   JSON line has exactly one record. APRS: the AX.25 frame as OnAir's Wireshark hub gets it (link type 3), also a
-  digipeater's copy, which has no line. The other bus modes have no packets and refuse the option (exit 2). Records
-  wait in a bounded queue (8192, the oldest dropped first), so a client that
-  connects a few seconds late still gets them; a client that hangs up is dropped, and the next one gets a new header.
+  digipeater's copy, which has no line. AIS: each sentence with its line end in IPv4 + UDP to port 10110 (NMEA 0183),
+  link type 101 (raw IP), as OnAir's capture files have it. The other bus modes have no packets and refuse the option
+  (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that connects a few seconds
+  late still gets them; a client that hangs up is dropped, and the next one gets a new header.
   Record times are the frame's sample time (bus modes: its block's first sample) on the wall clock of the first sample,
   moved on when the input falls more than 100 ms behind real time. What is still queued at the end with no client is
   counted as dropped. The decoding never waits for the port.
@@ -71,9 +86,10 @@ test/run.sh                               # needs iq/adsb1090.sigmf-data (cf32, 
 test/bus.sh                               # the bus modes on OnAir's own test signals (_build/onair-gen)
 ```
 
-`build.sh` also builds `_build/onair-gen` (`test/gen.cpp`): `onair-gen --mode pocsag|flex|acars|aprs --rate HZ
-[--freq HZ] [--text TEXT]` writes cf32 IQ of one known message from OnAir's test-signal generator for the mode, with a
-second of noise either side, and says on stderr where the message is.
+`build.sh` also builds `_build/onair-gen` (`test/gen.cpp`): `onair-gen --mode pocsag|flex|acars|aprs|ais --rate HZ
+[--freq HZ] [--text TEXT]` writes cf32 IQ of one known message from OnAir's test-signal generator for the mode (AIS:
+a position report on AIS 1 and a static report on AIS 2), with a second of noise either side, and says on stderr where
+the message is. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links.
 
 The OnAir checkout is never changed. `build.sh` builds OnAir from `_onair-src`, a copy of `$ONAIR_SRC` with every
 `patches/*.patch` applied in name order (`git apply`). The copy is remade when the checkout's commit or a patch's
@@ -93,13 +109,16 @@ followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
 ## How it works
 
 - `src/main.cpp`: the options, the table of modes with a run function of their own (a mode's name, its pcap link
-  type and the function that runs it), the IQ input and the JSON writer.
+  type and the function that runs it) and the IQ input. `src/json.cpp`: the JSON writer.
 - `src/bus.cpp`: the bus modes. OnAir's receivers put each decoded message on OnAir's automation bus and each frame
   on OnAir's Wireshark hub, both inside `feed()` on the calling thread, with no engine started. One run serves them
   all: a tap on the bus and a sink on the hub (`patches/0001`) collect what a block's `feed()` produced, then the
   events become lines and the packets records. A mode is a row of `kBusModes`: how to make and set up its receiver,
-  its hub channel, whether it needs `--freq`, and what its lines need that the bus lacks. Another receiver on the bus
-  is one more row.
+  its hub channel, whether it needs `--freq`, and what its lines need that the bus lacks. A mode whose lines come
+  from its hub packets (AIS) names the lines' event and a function that turns a packet into a line; its hub channel
+  then runs with or without a pcap port. Another receiver on the bus is one more row.
+- `src/ais.cpp`: AIS's lines. A joiner puts a message's sentences back together (OnAir publishes them one after the
+  other); OnAir's `ais::parseNmea`, `ais::unarmour` and `ais::decodeMessage` read the message.
 - `src/adsb.cpp`: OnAir's `AdsbReceiver` does the decoding. Its frame callback hands over every good frame, decoded
   by OnAir into `AdsbFrame::msg`; after each `feed()` each frame becomes a line, from the members `feedfmt::sbsLine`
   fills for its message type. A position needs the aircraft's earlier frames, so each address has a small OnAir

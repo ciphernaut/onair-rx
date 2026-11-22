@@ -16,7 +16,6 @@
 #include "dect2/adsb/adsb_rx.h"
 #include "dect2/adsb/adsb_track.h"
 #include "dect2/net/feeds.h"
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -77,7 +76,7 @@ int runAdsb(const Options& o, IqInput& in, Output& out) {
     std::unordered_map<uint32_t, Aircraft> aircraft;   // by the tracker's key
     AdsbTelemetry snap;
     double nextPrune = 10;
-    int64_t anchorUsec = 0;                             // wall clock of signal time 0
+    RecordClock clock;
     uint64_t frames = 0;
 
     auto emit = [&](const AdsbFrame& f) {
@@ -107,12 +106,8 @@ int runAdsb(const Options& o, IqInput& in, Output& out) {
             nextPrune = f.timeSec + 10;
         }
 
-        // the record: signal time on the wall clock of the first sample, moved on when the input falls behind real time
-        const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        if (!anchorUsec) anchorUsec = in.startUsec();
-        int64_t t = anchorUsec + (int64_t)std::llround(f.timeSec * 1e6);
-        if (t < now - 100000) { anchorUsec += now - t; t = now; }
-        out.packet(t, f.bytes, (size_t)f.bits / 8);
+        // the record, at the frame's signal time
+        out.packet(clock.at(in, f.timeSec), f.bytes, (size_t)f.bits / 8);
 
         // the line: the members sbsLine fills for this message type, from this frame
         char hex[8];

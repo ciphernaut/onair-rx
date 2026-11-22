@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 #
-# End-to-end check of the bus modes (pocsag, flex, acars, aprs) on OnAir's own test signals: _build/onair-gen makes one known
-# message per mode with a second of noise either side, onair-rx decodes it. The signals are synthesised; no capture is used.
-# Also: a mode that needs --freq refuses to start without it, text the bus cuts or that is not ASCII stays one valid line, and
-# a pcap port with no client, or with a client that hangs up, changes neither the lines nor the run time.
+# End-to-end check of the bus modes (pocsag, flex, acars, aprs, ais) on OnAir's own test signals: _build/onair-gen makes one
+# known message per mode (AIS: two) with a second of noise either side, onair-rx decodes it. The signals are synthesised; no
+# capture is used. Also: a mode that needs --freq refuses to start without it, and AIS with a centre its channels do not fall
+# in; text the bus cuts or that is not ASCII stays one valid line; a pcap port with no client, or with a client that hangs up,
+# changes neither the lines nor the run time; AIS's sentences on the pcap port; and the AIS sentence joiner on its own.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -15,33 +16,45 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 d=$(mktemp -d)
 trap 'rm -rf "$d"' EXIT
 acars_hz=131525000
+ais_hz=162000000   # the middle of AIS 1 (161.975 MHz) and AIS 2 (162.025 MHz)
 
 # --- onair-rx has each mode: on empty input it ends with exit 0 and no line
-for m in pocsag flex acars aprs; do
+for m in pocsag flex acars aprs ais; do
   f=()
   [ "$m" != acars ] || f=(--freq "$acars_hz")
+  [ "$m" != ais ] || f=(--freq "$ais_hz")
   "$bin" --mode "$m" --rate 1000000 --format cf32 "${f[@]}" </dev/null >"$d/$m.empty" 2>"$d/$m.empty.err" ||
     fail "$m: $(cat "$d/$m.empty.err")"
   [ ! -s "$d/$m.empty" ] || fail "$m: a line on empty input"
 done
-echo "ok: onair-rx has pocsag, flex, acars and aprs"
+echo "ok: onair-rx has pocsag, flex, acars, aprs and ais"
 
-# --- acars without --freq: exit 2 with one line, before reading any input (stdin stays open and is never written)
-python3 -I - "$bin" <<'EOF' || fail "acars without --freq"
+# --- refuses <stderr> <onair-rx args...>: exit 2 with exactly that one line on stderr, before reading any input (stdin stays
+# open and is never written), and nothing on stdout
+refuses() {
+  python3 -I - "$bin" "$@" <<'EOF'
 import subprocess, sys
-p = subprocess.Popen([sys.argv[1], "--mode", "acars", "--rate", "1000000"], stdin=subprocess.PIPE,
-                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+want, args = sys.argv[2], [sys.argv[1]] + sys.argv[3:]
+p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 try:
     p.wait(timeout=5)
 except subprocess.TimeoutExpired:
     p.kill()
-    sys.exit("acars without --freq waited for input")
+    sys.exit(f"{' '.join(args[1:])} waited for input")
 out, err = p.stdout.read(), p.stderr.read()
 assert p.returncode == 2, f"exit {p.returncode}, not 2"
-assert err == b"onair-rx: acars needs --freq HZ\n", f"stderr {err!r}"
+assert err == (want + "\n").encode(), f"stderr {err!r}"
 assert out == b"", "it wrote to stdout"
-print("ok: acars without --freq exits 2 before reading input: onair-rx: acars needs --freq HZ")
+print(f"ok: {' '.join(args[1:])} exits 2 before reading input: {want}")
 EOF
+}
+refuses "onair-rx: acars needs --freq HZ" --mode acars --rate 1000000 || fail "acars without --freq"
+refuses "onair-rx: ais needs --freq HZ" --mode ais --rate 250000 || fail "ais without --freq"
+# 250 kHz at 161.8 MHz ends at 161.925 MHz, short of AIS 1; at 162.2 MHz it starts at 162.075 MHz, past AIS 2
+refuses "onair-rx: ais: no AIS channel within 250000 Hz of 161800000 Hz" --mode ais --rate 250000 --freq 161800000 ||
+  fail "ais below its channels"
+refuses "onair-rx: ais: no AIS channel within 250000 Hz of 162200000 Hz" --mode ais --rate 250000 --freq 162200000 ||
+  fail "ais above its channels"
 
 [ -x "$gen" ] || fail "no test signal generator at $gen (run ./build.sh)"
 
@@ -59,8 +72,8 @@ rx() {
   [ "$st" = 0 ] || fail "$tag: onair-rx exited $st: $(tail -n 3 "$d/$tag.err")"
 }
 # lines <tag> <rate> <wanted members as JSON> [<exact line count>]: every line is one JSON object with a string event and an
-# integer t_sample below the sample count; one line has the wanted members (a value {"has": [...]} wants those substrings),
-# and its t_sample lies within 0.5 s of where the generator put the message
+# integer t_sample below the sample count; one line has the wanted members (a value {"has": [...]} wants a string with those
+# substrings, and with "len": n one of n characters), and its t_sample lies within 0.5 s of where the generator put the message
 lines() {
   python3 -I - "$d/$1.jsonl" "$d/$1.gen" "$2" "$(($(stat -c %s "$d/$1.iq") / 8))" "$3" "${4:-0}" <<'EOF'
 import json, re, sys
@@ -76,7 +89,7 @@ t0, t1 = float(g.group(1)), float(g.group(2))
 
 def match(v, w):
     if isinstance(w, dict):
-        return isinstance(v, str) and all(s in v for s in w["has"])
+        return isinstance(v, str) and all(s in v for s in w["has"]) and len(v) == w.get("len", len(v))
     if isinstance(w, float):
         return isinstance(v, float) and abs(v - w) < 1e-3
     return type(v) is type(w) and v == w
@@ -122,13 +135,59 @@ rx aprs --mode aprs --rate 240000
 lines aprs 240000 '{"event": "aprs.packet", "from": "VK3ABC", "to": "APRS", "info": "!2723.05S/15307.05E>ZetaSDR", "path": [], "fcs_ok": true, "lat": -27.38417, "lon": 153.1175}' ||
   fail aprs
 
+# --- AIS: a position report (type 1) on AIS 1 and a static report (type 5, two sentences) on AIS 2, one line per message
+# ais_details <tag>: the members a line of each message has, and its sentences
+ais_details() {
+  python3 -I - "$d/$1.jsonl" <<'EOF'
+import json, sys
+ls = [json.loads(l) for l in open(sys.argv[1], "rb")]
+assert len(ls) == 2, f"{len(ls)} lines, want 2"
+p, s = ls
+assert p["msg_type"] == 1 and s["msg_type"] == 5, f"message types {p['msg_type']}, {s['msg_type']}"
+assert abs(p["lat"] - -27.3842) < 1e-4 and abs(p["lon"] - 153.1175) < 1e-4, f"position {p.get('lat')}, {p.get('lon')}"
+for o, n in ((p, 1), (s, 2)):
+    nm = o["nmea"]
+    assert isinstance(nm, list) and len(nm) == n, f"type {o['msg_type']}: nmea {nm!r}, want {n} sentences"
+    assert all(isinstance(x, str) and x.startswith("!AIVDM,") and not x.endswith(("\r", "\n")) for x in nm), f"nmea {nm!r}"
+assert "name" not in p and "lat" not in s and "sog_kt" not in s, "a member the message type does not carry"
+print(f"ok: AIS lines {p['lat']}, {p['lon']} {p['sog_kt']} kt, and {s['name']!r} in {len(s['nmea'])} sentences")
+EOF
+}
+gen ais --mode ais --rate 250000 --freq "$ais_hz"
+rx ais --mode ais --rate 250000 --freq "$ais_hz"
+lines ais 250000 '{"event": "ais.message", "msg_type": 1, "mmsi": 503000001, "channel": "A", "repeat": 0, "sog_kt": 12.3, "cog_deg": 45, "heading_deg": 45, "nav_status": 0}' 2 ||
+  fail "ais: the position report"
+lines ais 250000 '{"event": "ais.message", "msg_type": 5, "mmsi": 503000001, "channel": "B", "repeat": 0, "name": "ZETA TEST"}' 2 ||
+  fail "ais: the static report"
+ais_details ais || fail "ais"
+# centred on one channel, as the node runs it (a 25 kHz channel resampled up), in cs16: the channels are placed by frequency
+for hz in 161975000 162025000; do
+  gen "ais-$hz" --mode ais --rate 250000 --freq "$hz"
+  python3 -I -c '
+import struct, sys
+a = struct.unpack(f"<{len(open(sys.argv[1], "rb").read()) // 4}f", open(sys.argv[1], "rb").read())
+open(sys.argv[2], "wb").write(struct.pack(f"<{len(a)}h", *(max(-32768, min(32767, round(v * 32768))) for v in a)))' "$d/ais-$hz.iq" "$d/ais-$hz.cs16"
+  "$bin" --mode ais --rate 250000 --format cs16 --freq "$hz" <"$d/ais-$hz.cs16" >"$d/ais-$hz.jsonl" 2>"$d/ais-$hz.err" ||
+    fail "ais at $hz Hz: $(tail -n 3 "$d/ais-$hz.err")"
+  lines "ais-$hz" 250000 '{"event": "ais.message", "msg_type": 1, "mmsi": 503000001, "channel": "A"}' 2 || fail "ais at $hz Hz"
+  ais_details "ais-$hz" || fail "ais at $hz Hz"
+done
+
+# the joiner of multi-sentence messages on its own (onair-gen links onair-rx's)
+"$gen" --selftest ais-join || fail "the AIS sentence joiner"
+
 # --- text the bus cuts or that is not ASCII: one line, valid JSON
 long=$(python3 -I -c 'import string; s = (string.ascii_letters + string.digits + " .,:;!?-+=/()\"\\") * 40; print("LONG " + s[:1995])')
 [ "${#long}" = 2000 ] || fail "the long text is ${#long} characters"
 gen pocsag-long --mode pocsag --rate 1000000 --text "$long"
 rx pocsag-long --mode pocsag --rate 1000000
-lines pocsag-long 1000000 '{"event": "pager.message", "address": 1234567, "text": {"has": ["LONG abcdefghij", "()\"\\"]}}' 1 ||
+lines pocsag-long 1000000 '{"event": "pager.message", "address": 1234567, "text": {"has": ["LONG abcdefghij", "()\"\\"], "len": 2000}}' 1 ||
   fail "a POCSAG message of 2000 characters"
+# 2100 characters: the bus keeps the first 2000, still one line
+gen pocsag-longer --mode pocsag --rate 1000000 --text "${long}$(printf 'Z%.0s' $(seq 100))"
+rx pocsag-longer --mode pocsag --rate 1000000
+lines pocsag-longer 1000000 '{"event": "pager.message", "address": 1234567, "text": {"has": ["LONG abcdefghij", "()\"\\"], "len": 2000}}' 1 ||
+  fail "a POCSAG message of 2100 characters"
 
 odd=$'odd \x01 \x22 \x5c \xe9 end'
 gen aprs-odd --mode aprs --rate 240000 --text "$odd"
@@ -223,5 +282,54 @@ for how in ("none", "hang-up"):
     assert n == base_n, f"{how}: {n} lines, without the option {base_n}"
     assert abs(t - base_t) <= 0.2 * base_t, f"{how}: {t:.3f} s, without the option {base_t:.3f} s"
 print("ok: " + ", ".join(f"{h} {best[h][0]} lines in {best[h][1]:.3f} s" for h in ("off", "none", "hang-up")))
+EOF
+
+# --- AIS on the pcap port: link type 101 (raw IP), one record per sentence, each the sentence with its line end in IPv4 + UDP
+# to port 10110 (NMEA 0183), as OnAir's capture files have it; the lines are those of a run without the port
+python3 -I - "$bin" "$d/ais.iq" "$d/ais.jsonl" "$ais_hz" <<'EOF' || fail "AIS on the pcap port"
+import json, socket, struct, subprocess, sys, threading, time
+binary, iq, plain, hz = sys.argv[1:5]
+s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+p = subprocess.Popen([binary, "--mode", "ais", "--rate", "250000", "--format", "cf32", "--freq", hz, "--pcap-port", str(port)],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+deadline = time.time() + 10
+while True:
+    try:
+        c = socket.create_connection(("127.0.0.1", port)); break
+    except OSError:
+        assert time.time() < deadline, "the client did not connect"
+        time.sleep(0.02)
+got = []
+def read():
+    buf = b""
+    while (b := c.recv(65536)): buf += b
+    got.append(buf)
+th = threading.Thread(target=read); th.start()
+out, err = p.communicate(open(iq, "rb").read(), timeout=60)
+th.join(10)
+assert p.returncode == 0, f"exit {p.returncode}: {err.decode(errors='replace')}"
+def members(raw):   # t_sample follows how the pipe hands over the input: the rest is compared
+    return [{k: v for k, v in json.loads(l).items() if k != "t_sample"} for l in raw.splitlines()]
+assert members(out) == members(open(plain, "rb").read()), "the lines differ from a run without the port"
+pcap = got[0]
+magic, vmaj, vmin, _, _, _, link = struct.unpack("<IHHiIII", pcap[:24])
+assert magic == 0xA1B2C3D4 and (vmaj, vmin) == (2, 4), "not a classic little-endian pcap header"
+assert link == 101, f"link type {link}, not 101"
+recs, i = [], 24
+while i < len(pcap):
+    _, _, incl, _ = struct.unpack("<IIII", pcap[i:i + 16])
+    recs.append(pcap[i + 16:i + 16 + incl]); i += 16 + incl
+assert i == len(pcap), "a cut record"
+want = [x.encode() + b"\r\n" for l in out.splitlines() for x in json.loads(l)["nmea"]]
+assert len(recs) == 3 == len(want), f"{len(recs)} records, want 3 ({len(want)} sentences on the lines)"
+for r, w in zip(recs, want):
+    assert r[0] == 0x45 and r[9] == 17, "not IPv4 + UDP"
+    ihl = (r[0] & 15) * 4
+    total, = struct.unpack(">H", r[2:4])
+    dport, ulen = struct.unpack(">HH", r[ihl + 2:ihl + 6])
+    assert total == len(r) and ulen == len(r) - ihl, "the lengths do not fit the record"
+    assert dport == 10110, f"UDP port {dport}, not 10110"
+    assert r[ihl + 8:] == w, f"payload {r[ihl + 8:]!r}, want {w!r}"
+print(f"ok: pcap link type 101, {len(recs)} records, each a line's sentence in IPv4 + UDP to port 10110")
 EOF
 echo "PASS"
