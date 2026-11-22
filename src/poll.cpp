@@ -5,6 +5,7 @@
 // reads. So the run only feeds and polls: the session decides what is new, and the run writes it with the members every line
 // has. A mode is a row: its name, its event, how often it is polled and how its session is made (poll_<mode>.cpp).
 #include "poll.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -38,15 +39,30 @@ int runPolled(const PollMode& m, const Options& o, IqInput& in, Output& out) {
         polled.clear();
     };
 
+    // Every block is a whole 16384 samples (only the last may be short), however the input arrives: a read of a pipe returns
+    // what happens to be there. So the blocks, every t_sample and where each poll lands depend on the input alone, and a
+    // replay gives the same lines as a live run. The polls are at the multiples of the interval from sample 0, each after the
+    // block that reaches one, so they do not drift.
+    constexpr size_t kBlock = 1 << 14;
     const uint64_t every = (uint64_t)std::llround(m.pollSec * o.rate);   // 0: every block
-    uint64_t polledAt = 0, first = 0;
-    std::vector<cf32> iq(1 << 14);
-    for (size_t n; (n = in.read(iq)) > 0;) {
-        first = in.samples() - n;
-        s->feed(iq.data(), n);
-        if (in.samples() - polledAt >= every) {
+    uint64_t fed = 0, first = 0, due = every;
+    std::vector<cf32> iq(kBlock), part;
+    for (bool eof = false; !eof;) {
+        size_t have = 0;
+        while (have < kBlock) {
+            part.resize(kBlock - have);
+            const size_t n = in.read(part);
+            if (n == 0) { eof = true; break; }
+            std::copy(part.begin(), part.begin() + (long)n, iq.begin() + (long)have);
+            have += n;
+        }
+        if (have == 0) break;
+        first = fed;
+        s->feed(iq.data(), have);
+        fed += have;
+        if (fed >= due) {
             poll(false, first);
-            polledAt = in.samples();
+            if (every) due = (fed / every + 1) * every;
         }
     }
     poll(true, first);   // what the last block completed, also when it ended short of the interval

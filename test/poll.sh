@@ -5,7 +5,9 @@
 # End-to-end check of the polled modes (rds) on OnAir's own test signals: _build/onair-gen makes a known station (RDS: PI
 # 2AB1, PS "ZETA FM ", RT "HELLO FROM ZETASDR", 6 s of OnAir's FM generator), onair-rx decodes it. The signals are
 # synthesised; no capture is used. Also: a rate below the receiver's minimum and --pcap-port are refused before any input is
-# read; the programme service name and the radiotext are absent until complete.
+# read; the programme service name and the radiotext are absent until complete, also on input that ends before the name is;
+# a name and a text beyond ASCII are written in UTF-8, one valid line each (and the UTF-8 writer on its own); the input through
+# a pipe in uneven chunks gives the same lines as from a file; onair-gen refuses an option its mode does not take.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -62,16 +64,21 @@ rx() {
   [ "$st" = 0 ] || fail "$tag: onair-rx exited $st: $(tail -n 3 "$d/$tag.err")"
 }
 
-# --- RDS: one line per group, each with the group's own PI, type, PTY and TP; PS and RT from OnAir's snapshot, once complete
-gen rds --mode rds --rate 500000
-rx rds --mode rds --rate 500000
-python3 -I - "$d/rds.jsonl" "$(($(stat -c %s "$d/rds.iq") / 8))" <<'EOF' || fail rds
+# station <tag> <ps> <rt> <min lines> <text|none>: every line of $d/<tag>.jsonl is one rds.group object of PI 2AB1 with the
+# group's own type, PTY and TP, t_sample never decreasing; the output is UTF-8 with no control byte inside a line; a ps or rt
+# present is exactly the station's (so never cut), decoded from the RDS character set. text: some line has each, and the
+# first four (before the name's four segments can have come) have neither; none: no line has either
+station() {
+  python3 -I - "$d/$1.jsonl" "$(($(stat -c %s "$d/$1.iq") / 8))" "$2" "$3" "$4" "$5" <<'EOF'
 import json, re, sys
-path, nsamp = sys.argv[1], int(sys.argv[2])
+path, nsamp, want_ps, want_rt, least, text = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6] == "text"
 raw = open(path, "rb").read()
 assert raw.endswith(b"\n") or not raw, "the last line is not ended"
+raw.decode("utf-8")   # strict: the text is UTF-8, not a byte per character
+bad = [b for b in set(raw) if b < 0x20 and b != 0x0A]
+assert not bad, f"control bytes {sorted(bad)} in the output"
 lines = raw.splitlines()
-assert len(lines) >= 20, f"{len(lines)} lines, want at least 20"
+assert len(lines) >= least, f"{len(lines)} lines, want at least {least}"
 last, ps, rt = -1, 0, 0
 for n, l in enumerate(lines):
     o = json.loads(l)
@@ -88,13 +95,78 @@ for n, l in enumerate(lines):
     assert type(o.get("tp")) is bool, f"line {n}: tp {o.get('tp')!r}"
     if "ps" in o:
         assert isinstance(o["ps"], str) and len(o["ps"]) >= 8, f"line {n}: ps {o['ps']!r} is cut"
-        assert o["ps"] == "ZETA FM ", f"line {n}: ps {o['ps']!r}, not the station's"   # the generator sends one name only
+        assert o["ps"] == want_ps, f"line {n}: ps {o['ps']!r}, not {want_ps!r}"   # the generator sends one name only
         ps += 1
     if "rt" in o:
-        assert o["rt"] == "HELLO FROM ZETASDR", f"line {n}: rt {o['rt']!r} is cut or not the station's"
+        assert o["rt"] == want_rt, f"line {n}: rt {o['rt']!r}, not {want_rt!r} (cut, or spelled otherwise)"
         rt += 1
-assert ps, "no line has ps 'ZETA FM '"
-assert rt, "no line has rt 'HELLO FROM ZETASDR'"
-print(f"ok: {len(lines)} rds.group lines of PI 2AB1, {ps} with the PS and {rt} with the RT")
+    if text and n < 4:
+        assert "ps" not in o and "rt" not in o, f"line {n}: a name or text before it can be complete: {l!r}"
+if text:
+    assert ps, f"no line has ps {want_ps!r}"
+    assert rt, f"no line has rt {want_rt!r}"
+else:
+    assert not ps and not rt, f"{ps} line(s) with ps and {rt} with rt, want none"
+print(f"ok: {len(lines)} rds.group lines of PI 2AB1, {ps} with the PS {want_ps!r} and {rt} with the RT {want_rt!r}")
 EOF
+}
+
+# --- RDS: one line per group, each with the group's own PI, type, PTY and TP; PS and RT from OnAir's snapshot, once complete
+gen rds --mode rds --rate 500000
+rx rds --mode rds --rate 500000
+station rds "ZETA FM " "HELLO FROM ZETASDR" 20 text || fail rds
+
+# the input ends at the block whose poll first had the name: nothing before it has a name or a text, and none comes at the end
+cut=$(python3 -I -c '
+import json, sys
+print(next(o["t_sample"] for o in map(json.loads, open(sys.argv[1], "rb")) if "ps" in o))' "$d/rds.jsonl")
+head -c $((cut * 8)) "$d/rds.iq" >"$d/rds-cut.iq"
+rx rds-cut --mode rds --rate 500000
+station rds-cut "ZETA FM " "HELLO FROM ZETASDR" 1 none || fail "rds cut before its name is complete"
+
+# a name and a text in the RDS character set beyond ASCII (EBU Latin: 0x80 a and 0x82 e with an acute, 0xa9 the euro sign),
+# with a quote and a backslash: one valid line each, the text in UTF-8 as the station spells it
+gen rds-latin --mode rds --rate 500000 --ps $'Z\x82TA FM ' --rt $'R\x80DIO "Z" \\ \xa9'
+rx rds-latin --mode rds --rate 500000
+station rds-latin "ZéTA FM " 'RáDIO "Z" \ €' 20 text || fail "rds beyond ASCII"
+# the writer of that text on its own (onair-gen links onair-rx's): text that is not valid UTF-8 is escaped byte by byte
+"$gen" --selftest json-utf8 || fail "the JSON writer's UTF-8 text"
+
+# --- a replay gives the same lines as a live run: the RDS input through a pipe written in small uneven chunks, so that each
+# read gets what happens to be there, writes byte for byte what the file gave
+python3 -I - "$bin" "$d/rds.iq" "$d/rds.jsonl" <<'EOF' || fail "rds through a pipe"
+import random, subprocess, sys, threading, time
+binary, iq, want = sys.argv[1], open(sys.argv[2], "rb").read(), open(sys.argv[3], "rb").read()
+p = subprocess.Popen([binary, "--mode", "rds", "--rate", "500000", "--format", "cf32"], stdin=subprocess.PIPE,
+                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+got = []
+reader = threading.Thread(target=lambda: got.append(p.stdout.read()))
+reader.start()
+rng = random.Random(5)
+at = writes = 0
+while at < len(iq):
+    k = rng.randint(1, 12000)   # not a whole number of samples, and less than a block
+    p.stdin.write(iq[at:at + k])
+    p.stdin.flush()
+    at += k
+    writes += 1
+    if writes % 64 == 0: time.sleep(0.001)
+p.stdin.close()
+reader.join()
+assert p.wait() == 0, f"exit {p.returncode}"
+n_got, n_want = len(got[0].splitlines()), len(want.splitlines())
+assert got[0] == want, f"{n_got} lines through the pipe differ from the file's {n_want}"
+print(f"ok: the same {n_want} lines through a pipe in {writes} uneven writes")
+EOF
+
+# --- onair-gen's rds takes --ps and --rt only; another mode does not take them
+for a in "--mode rds --rate 500000 --freq 100000000" "--mode rds --rate 500000 --text X" "--mode rds --rate 500000 --info X" \
+  "--mode pocsag --rate 1000000 --ps X" "--mode pocsag --rate 1000000 --rt X"; do
+  st=0
+  # shellcheck disable=SC2086
+  "$gen" $a >/dev/null 2>"$d/gen-refuse.err" || st=$?
+  [ "$st" = 2 ] || fail "onair-gen $a exited $st, not 2"
+  grep -q '^usage: onair-gen' "$d/gen-refuse.err" || fail "onair-gen $a gave no usage"
+done
+echo "ok: onair-gen refuses an option its mode does not take"
 echo "ok: poll.sh"

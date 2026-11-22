@@ -116,12 +116,15 @@ the polled mode `rds` (below).
   Not on the generic path: none of the modes so far. A receiver that needs more than a channel, a centre and a type
   filter (a second channel, an engine of its own) gets a line here saying what it needed.
 - **stdout, polled modes:** some OnAir receivers put nothing on the bus and offer only a snapshot of their state
-  (`telemetry()`). A polled mode feeds its receiver blocks of 16384 and, each time the input has advanced by the
-  mode's poll interval (counted in samples, so a replay gives the same lines as a live run), writes one JSON object per
-  line for what is new or has changed since the last poll; once more at the end of input, so that what the last block
-  completed is written. Every line has `event` (the mode's) and `t_sample` (the index of the first sample of the block
-  after which the poll ran), a member only when its value is known, whole numbers without a decimal point, strings
-  byte by byte as above. None of them has packets: `--pcap-port` exits 2 with
+  (`telemetry()`). A polled mode feeds its receiver blocks of 16384 samples, each one whole however the input arrives
+  (only the last may be short), and polls at the multiples of the mode's poll interval from sample 0, each after the
+  block that reaches one, so a replay gives the same lines as a live run, byte for byte. A poll writes one JSON object
+  per line for what is new or has changed since the last poll; one more poll runs at the end of input, so that what
+  the last block completed is written. Every line has `event` (the mode's) and `t_sample` (the index of the first
+  sample of the block after which the poll ran), a member only when its value is known, whole numbers without a
+  decimal point. Text the receiver hands over in UTF-8 (`ps`, `rt`) is written as UTF-8, escaping only a quote, a
+  backslash and a control character; text that is not valid UTF-8 is written byte by byte as above, so a line is
+  always valid JSON. None of them has packets: `--pcap-port` exits 2 with
   `onair-rx: <mode> has no packets (no --pcap-port)`, before reading any input. The modes:
 
   | mode | OnAir receiver | minimum rate | poll | event | members |
@@ -135,14 +138,15 @@ the polled mode `rds` (below).
     before that. From the group: `pi` (four upper-case hex digits), `group` (its type and version, `0A`, `2B`), `pty`
     (the programme type, 0 to 31) and `tp` (the traffic programme flag). From OnAir's snapshot at that group (published
     every 0.1 s of signal): `ps`, the programme service name, once all its segments came, and `rt`, the radiotext,
-    once it is complete; each is absent until then.
+    once it is complete; each is absent until then. Both are UTF-8, read by OnAir from the station's character set
+    (EBU Latin, or GB2312 when the bytes pair up as it): a station's `Rádio` is `Rádio`.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic
   pcap stream: the file header, then one record per frame. ADS-B: 7 or 14 bytes, link type 147 (USER0), and every
   JSON line has exactly one record. APRS: the AX.25 frame as OnAir's Wireshark hub gets it (link type 3), also a
   digipeater's copy, which has no line. AIS: each sentence with its line end in IPv4 + UDP to port 10110 (NMEA 0183),
   link type 101 (raw IP), as OnAir's capture files have it. The other bus modes and the polled modes have no packets
-  and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that connects a few seconds
-  late still gets them; a client that hangs up is dropped, and the next one gets a new header.
+  and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that
+  connects a few seconds late still gets them; a client that hangs up is dropped, and the next one gets a new header.
   Record times are the frame's sample time (bus modes: its block's first sample) on the wall clock of the first sample,
   moved on when the input falls more than 100 ms behind real time. What is still queued at the end with no client is
   counted as dropped. The decoding never waits for the port.
@@ -169,13 +173,17 @@ The wrapper's headers are on the quoted include path only (`-iquote`), so that `
 system's `<poll.h>`.
 
 `build.sh` also builds `_build/onair-gen` (`test/gen.cpp`): `onair-gen --mode
-pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20|rds --rate HZ [--freq HZ] [--text TEXT] [--info INFO]` writes cf32 IQ of one known
-message from OnAir's test-signal generator for the mode (AIS: a position report on AIS 1 and a static report on AIS 2;
-VDL2: a downlink, an uplink and a ground station's GSIF; HFDL: a squitter and a logon request; a sonde: 12 s of one
-sonde of OnAir's scene, moved to 0 Hz; `--info` replaces APRS's whole information field), with a second of noise either side, and says on stderr where the message is.
-`--mode rds` is a station instead, with nothing around it: 6 s of OnAir's `FmGenerator` with PI `2AB1`, PS `ZETA FM `
-and RT `HELLO FROM ZETASDR`, with the generator's own noise. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links, and `onair-gen
---selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`) on serials the test signals do not have.
+pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO]` writes cf32 IQ of
+one known message from OnAir's test-signal generator for the mode (AIS: a position report on AIS 1 and a static report
+on AIS 2; VDL2: a downlink, an uplink and a ground station's GSIF; HFDL: a squitter and a logon request; a sonde: 12 s
+of one sonde of OnAir's scene, moved to 0 Hz; `--info` replaces APRS's whole information field), with a second of
+noise either side, and says on stderr where the message is. `onair-gen --mode rds --rate HZ [--ps PS] [--rt RT]` is a
+station instead, with nothing around it: 6 s of OnAir's `FmGenerator` with PI `2AB1`, PS `ZETA FM ` and RT
+`HELLO FROM ZETASDR` (or the bytes of the RDS character set given), with the generator's own noise. An option the mode
+does not take is refused with the usage line. `onair-gen --selftest ais-join` tests the AIS sentence joiner of
+`src/ais.cpp`, which it links, `onair-gen --selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`)
+on serials the test signals do not have, and `onair-gen --selftest json-utf8` the UTF-8 text writer (`Json::utf8`,
+`src/json.cpp`) on valid and broken UTF-8.
 
 The OnAir checkout is never changed. `build.sh` builds OnAir from `_onair-src`, a copy of `$ONAIR_SRC` with every
 `patches/*.patch` applied in name order (`git apply`). The copy is remade when the checkout's commit or a patch's

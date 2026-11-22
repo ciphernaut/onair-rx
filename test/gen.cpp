@@ -4,9 +4,11 @@
 // transmitted.
 // Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 //
-//   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20|rds --rate HZ [--freq HZ] [--text TEXT] [--info INFO]
+//   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO]
+//   onair-gen --mode rds --rate HZ [--ps PS] [--rt RT]
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
+//   onair-gen --selftest json-utf8    onair-rx's UTF-8 text writer (src/json.cpp, Json::utf8) on valid and broken UTF-8
 //
 // The known messages: POCSAG address 1234567 function 3 "HELLO ZETA" at 1200 baud (alphanumeric); FLEX capcode 1234567
 // "HELLO ZETA" (alphanumeric, 1600/2); ACARS tail VH-ZET label H1 flight ZET001 ("HELLO ZETA" after the message number and
@@ -19,7 +21,9 @@
 // stations. HFDL: ground station 1's squitter, then a logon request from aircraft 7C1234. A radiosonde (rs41, dfm, m20): one
 // sonde of OnAir's scene sending its frames for 12 s, not drifting: the RS41 as serial S1234567 at -27.3842, 153.1175 (12 km,
 // climbing 5 m/s); the DFM-17 (17012345) and the M20 (211-4-01234) where OnAir's scene has them (25.30, 55.50 and 25.00, 55.60).
-// RDS: an FM station with PI 2AB1, PS "ZETA FM " and RT "HELLO FROM ZETASDR" for 6 s (rdsSignal).
+// RDS: an FM station with PI 2AB1, PS "ZETA FM " and RT "HELLO FROM ZETASDR" for 6 s (rdsSignal); --ps and --rt replace the
+// name and the text (bytes of the RDS character set). --freq, --text and --info are not taken with rds, nor --ps and --rt
+// with another mode.
 // The channel is at 0 Hz of the output, as onair-rx expects it: the pager and packet generators put it at their mode's tune
 // offset, which is cancelled here; ACARS is generated for one channel at --freq (default 131.525 MHz) with the centre there;
 // AIS 1 and 2 are placed by their frequencies (161.975 and 162.025 MHz) around --freq (default 162 MHz, between the two).
@@ -68,8 +72,9 @@ constexpr double kSnrDb = 25;   // carrier to noise in 25 kHz
 constexpr size_t kChunk = 1 << 14;
 
 int usage() {
-    fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20|rds --rate HZ [--freq HZ] [--text TEXT] [--info INFO] > iq\n"
-                    "       onair-gen --selftest ais-join|sonde-id\n");
+    fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO] > iq\n"
+                    "       onair-gen --mode rds --rate HZ [--ps PS] [--rt RT] > iq\n"
+                    "       onair-gen --selftest ais-join|sonde-id|json-utf8\n");
     return 2;
 }
 
@@ -279,14 +284,15 @@ std::vector<cf32> sondeSignal(double rate, const std::string& type) {
 
 // --- RDS: a station of OnAir's FM generator (fm_gen.h) for kFmSec at 0 Hz, with the generator's own stereo tones and its own
 // noise (40 dB carrier to noise in 200 kHz). A broadcast never stops, so there is no silence around it: the whole output is
-// the message
+// the message. ps and rt are bytes of the RDS character set (EBU Latin above 0x7f: 0x80 is a, 0x82 e with an acute); the
+// generator pads the name to 8 bytes and ends the text with a carriage return
 constexpr double kFmSec = 6;
-std::vector<cf32> rdsSignal(double rate) {
+std::vector<cf32> rdsSignal(double rate, const std::string& ps, const std::string& rt) {
     FmGenConfig c;
     c.rate = rate;
     c.pi = 0x2AB1;
-    c.ps = "ZETA FM ";
-    c.rt = "HELLO FROM ZETASDR";
+    c.ps = ps;
+    c.rt = rt;
     FmGenerator g(c);
     std::vector<cf32> out((size_t)(kFmSec * rate));
     g.generate(out.data(), out.size());
@@ -366,16 +372,40 @@ int selftestSondeId() {
     return fails ? 1 : 0;
 }
 
+// --- the JSON writer's UTF-8 text (src/json.cpp, Json::utf8): valid UTF-8 as it is, the rest as Json::str writes it
+int selftestJsonUtf8() {
+    int fails = 0;
+    auto check = [&fails](const std::string& v, const std::string& want, const char* what) {
+        const std::string got = onair_rx::Json().utf8("t", v).done();
+        const std::string w = "{\"t\":\"" + want + "\"}";
+        printf("%s: %s: %s", got == w ? "ok" : "FAIL", what, got.c_str());
+        if (got != w) printf(", want %s", w.c_str());
+        printf("\n");
+        fails += got != w;
+    };
+    check("ZETA FM ", "ZETA FM ", "ASCII as it is");
+    check("R\xc3\xa1" "DIO \xe2\x82\xac \xf0\x9f\x93\xbb", "R\xc3\xa1" "DIO \xe2\x82\xac \xf0\x9f\x93\xbb", "two-, three- and four-byte characters as they are");
+    check("a\"b\\c\x01\x7f", "a\\\"b\\\\c\\u0001\\u007f", "a quote, a backslash and control characters escaped");
+    check("R\xe1" "DIO", "R\\u00e1DIO", "a Latin-1 byte: not UTF-8, so byte by byte");
+    check("\xc3", "\\u00c3", "a character cut short");
+    check("\xc0\xaf", "\\u00c0\\u00af", "an overlong form");
+    check("\xed\xa0\x80", "\\u00ed\\u00a0\\u0080", "a surrogate");
+    check("\xf4\x90\x80\x80", "\\u00f4\\u0090\\u0080\\u0080", "past U+10FFFF");
+    check("\x80" "a", "\\u0080a", "a continuation byte first");
+    return fails ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--selftest") {
         if (std::string(argv[2]) == "ais-join") return selftestAisJoin();
         if (std::string(argv[2]) == "sonde-id") return selftestSondeId();
+        if (std::string(argv[2]) == "json-utf8") return selftestJsonUtf8();
         return usage();
     }
-    std::string mode, text = "HELLO ZETA", info;
-    bool haveText = false, haveInfo = false;
+    std::string mode, text = "HELLO ZETA", info, ps = "ZETA FM ", rt = "HELLO FROM ZETASDR";
+    bool haveText = false, haveInfo = false, haveStation = false;
     double rate = 0, freq = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -385,12 +415,16 @@ int main(int argc, char** argv) {
         else if (a == "--freq" && val) { freq = atof(argv[++i]); if (freq <= 0) return usage(); }
         else if (a == "--text" && val) { text = argv[++i]; haveText = true; }
         else if (a == "--info" && val) { info = argv[++i]; haveInfo = true; }
+        else if (a == "--ps" && val) { ps = argv[++i]; haveStation = true; }
+        else if (a == "--rt" && val) { rt = argv[++i]; haveStation = true; }
         else return usage();
     }
-    if (!freq) freq = mode == "ais" ? 162e6 : 131.525e6;
     if (rate <= 0) return usage();
+    // each option belongs to its modes: one another mode would ignore is refused
+    if (mode == "rds" ? freq || haveText || haveInfo : haveStation) return usage();
+    if (!freq) freq = mode == "ais" ? 162e6 : 131.525e6;
     if (mode == "rds") {   // a polled mode's station is written as it is made: no cut, no silence, no added noise
-        const std::vector<cf32> x = rdsSignal(rate);
+        const std::vector<cf32> x = rdsSignal(rate, ps, rt);
         if (fwrite(x.data(), sizeof(cf32), x.size(), stdout) != x.size() || fflush(stdout) != 0) {
             fprintf(stderr, "onair-gen: stdout: %s\n", strerror(errno));
             return 1;

@@ -3,8 +3,8 @@
 //
 // A polled mode is one OnAir receiver that publishes nothing (no bus event, no hub packet) and offers a state snapshot
 // instead (its telemetry()). One generic run feeds it and, as the input advances by the mode's poll interval, asks the mode's
-// session for a line per thing that is new or has changed since the last poll. The interval is counted in samples, so a
-// replay gives the same lines as a live run.
+// session for a line per thing that is new or has changed since the last poll. The blocks and the interval are counted in
+// samples, so a replay gives the same lines as a live run. Text in a line goes through Json::utf8.
 #pragma once
 #include "rx.h"
 #include <cstddef>
@@ -32,8 +32,9 @@ struct PollMode {
 extern const PollMode kPollModes[];
 extern const size_t kPollModeCount;
 
-// Runs a polled mode to EOF: blocks of 16384 are fed; a poll runs after the block that takes the input pollSec * o.rate
-// samples past the last poll, and once more, with last true, at EOF. Each line is written with "event" (the mode's) and
+// Runs a polled mode to EOF: blocks of 16384 are fed, each one whole however stdin delivers it (only the last may be short); a
+// poll runs after each block that reaches a multiple of pollSec * o.rate samples from sample 0 (every block when 0), and once
+// more, with last true, at EOF. Each line is written with "event" (the mode's) and
 // "t_sample" (the first sample of the block after which its poll ran) in front. The exit status: 2 with "onair-rx: <err>"
 // when open fails, before any sample is read.
 int runPolled(const PollMode& m, const Options& o, IqInput& in, Output& out);   // the exit status

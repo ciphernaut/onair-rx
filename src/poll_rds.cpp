@@ -59,8 +59,9 @@ private:
         snprintf(type, sizeof type, "%d%c", b[1] >> 12, verB ? 'B' : 'A');
         Json j;
         j.str("pi", hex).str("group", type).num("pty", (long long)((b[1] >> 5) & 31)).flag("tp", (b[1] >> 10) & 1);
-        if (!tel_.psName.empty()) j.str("ps", tel_.psName);   // OnAir sets it only once all four segments came
-        if (tel_.radioTextComplete && !tel_.radioText.empty()) j.str("rt", tel_.radioText);
+        // OnAir hands both over in UTF-8, read from the station's character set (rdsText)
+        if (!tel_.psName.empty()) j.utf8("ps", tel_.psName);   // OnAir sets it only once all four segments came
+        if (tel_.radioTextComplete && !tel_.radioText.empty()) j.utf8("rt", tel_.radioText);
         queued_.push_back(std::move(j));
     }
 

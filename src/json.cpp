@@ -16,7 +16,44 @@ void escape(std::string& o, const std::string& v) {
         else o += (char)c;
     }
 }
+
+// v is well-formed UTF-8 (RFC 3629): no stray continuation byte, no overlong form, no surrogate, nothing above U+10FFFF
+bool validUtf8(const std::string& v) {
+    const auto* p = (const unsigned char*)v.data();
+    const size_t n = v.size();
+    for (size_t i = 0; i < n;) {
+        const unsigned char c = p[i];
+        if (c < 0x80) { i++; continue; }
+        size_t len;
+        uint32_t cp;
+        if (c >= 0xC2 && c <= 0xDF) { len = 2; cp = c & 0x1F; }
+        else if (c >= 0xE0 && c <= 0xEF) { len = 3; cp = c & 0x0F; }
+        else if (c >= 0xF0 && c <= 0xF4) { len = 4; cp = c & 0x07; }
+        else return false;   // a continuation byte first, an overlong 2-byte lead (0xC0, 0xC1), or past U+10FFFF
+        if (i + len > n) return false;
+        for (size_t k = 1; k < len; k++) {
+            if ((p[i + k] & 0xC0) != 0x80) return false;
+            cp = cp << 6 | (p[i + k] & 0x3F);
+        }
+        if ((len == 3 && cp < 0x800) || (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)) || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+        i += len;
+    }
+    return true;
+}
 } // namespace
+
+Json& Json::utf8(const char* k, const std::string& v) {
+    if (!validUtf8(v)) return str(k, v);
+    key(k);
+    s_ += '"';
+    for (unsigned char c : v) {
+        if (c == '"' || c == '\\') { s_ += '\\'; s_ += (char)c; }
+        else if (c < 0x20 || c == 0x7f) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); s_ += b; }
+        else s_ += (char)c;
+    }
+    s_ += '"';
+    return *this;
+}
 
 void Json::key(const char* k) {
     if (s_.size() > 1) s_ += ',';

@@ -102,6 +102,9 @@ private:
 class Json {
 public:
     Json& str(const char* k, const std::string& v);
+    // Text a receiver hands over in UTF-8 (the polled modes' ps, rt, ...): written as it is when v is valid UTF-8, escaping only
+    // a quote, a backslash and a control character (0x7f too); otherwise as str() writes it, so a line is always valid JSON.
+    Json& utf8(const char* k, const std::string& v);
     Json& num(const char* k, long long v);
     Json& num(const char* k, double v, int decimals);
     Json& flag(const char* k, bool v);
