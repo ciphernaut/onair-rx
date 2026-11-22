@@ -88,7 +88,12 @@ for f in "$here"/src/*.cpp; do
   g++ $flags -Wall -Wextra -I"$here/src" -I"$s/core/include" -c "$f" -o "$obj"
   objs+=("$obj")
 done
+# the tests' signal generator (test/bus.sh): OnAir's own test signals, one known message per mode
+# shellcheck disable=SC2086
+g++ $flags -Wall -Wextra -I"$s/core/include" -c "$here/test/gen.cpp" -o "$o/gen.o"
 cd "$b"   # the library list has paths relative to the OnAir build
 # shellcheck disable=SC2086
 g++ -o "$here/onair-rx" "${objs[@]}" -Wl,--start-group $libs -Wl,--end-group -lpthread
-echo "built $here/onair-rx"
+# shellcheck disable=SC2086
+g++ -o "$o/onair-gen" "$o/gen.o" -Wl,--start-group $libs -Wl,--end-group -lpthread
+echo "built $here/onair-rx and $o/onair-gen"

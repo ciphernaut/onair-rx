@@ -21,6 +21,7 @@ struct Options {
     std::string mode;
     std::string format = "cf32";   // cf32 or cs16, interleaved little endian
     double rate = 0;               // input sample rate, Hz
+    double freq = 0;               // --freq: the radio frequency at 0 Hz of the input, Hz (0 when not given)
     int pcapPort = 0;              // 0: no pcap port
 };
 
@@ -79,17 +80,22 @@ private:
     PcapPort* pcap_;
 };
 
-// A JSON object built member by member; a member is only added when its value is known.
+// A JSON object built member by member; a member is only added when its value is known. Strings are written byte by byte: a
+// quote, a backslash, a control character and a byte above 0x7e are escaped (such a byte as the code point of its value).
 class Json {
 public:
     Json& str(const char* k, const std::string& v);
     Json& num(const char* k, long long v);
     Json& num(const char* k, double v, int decimals);
     Json& flag(const char* k, bool v);
+    Json& arr(const char* k, const std::vector<std::string>& v);   // an array of strings
+    Json& raw(const char* k, const std::string& json);             // a value already written as JSON
+    bool has(const std::string& k) const;                          // a member of that name is there
     std::string done() const { return s_ + "}"; }
 private:
     void key(const char* k);
     std::string s_ = "{";
+    std::vector<std::string> keys_;
 };
 
 // The mode table: a mode's name, the pcap link type of its packets and how to run it. run returns the exit status.
@@ -99,6 +105,6 @@ struct Mode {
     int (*run)(const Options& o, IqInput& in, Output& out);
 };
 
-int runAdsb(const Options& o, IqInput& in, Output& out);
+int runAdsb(const Options& o, IqInput& in, Output& out);   // the bus modes are in bus.h
 
 } // namespace onair_rx

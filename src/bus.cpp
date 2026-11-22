@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// onair-rx: the bus modes. Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
+//
+// OnAir's receivers report what they decode on OnAir's automation bus (one event per message: a type and named fields) and
+// hand the frames they receive to OnAir's Wireshark hub, both from inside feed(), on the thread that calls it, with no engine
+// started. So one run serves every mode that has a receiver on the bus: a tap on the bus (every family) collects the events of
+// a block's feed(), a sink on the hub (patches/0001) collects its packets, and after the feed() the events become JSON lines and
+// the packets pcap records. A mode is a row: how to make and set up its receiver, its hub channel, and what its lines need that
+// the bus lacks.
+#include "bus.h"
+#include "dect2/acars/acars_rx.h"
+#include "dect2/automation/engine.h"
+#include "dect2/packet/packet_rx.h"
+#include "dect2/pager/pager_rx.h"
+#include "dect2/wirecap/wire.h"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+
+namespace onair_rx {
+
+using namespace dect2;
+using Feed = std::function<void(const cf32*, size_t)>;
+
+namespace {
+
+// configures the receiver for the input rate; its feed when the rate suits it
+template <class Rx>
+bool start(std::shared_ptr<Rx> rx, const Options& o, const char* name, double minRate, Feed* feed, std::string* err) {
+    rx->configure(o.rate);
+    if (!rx->ready()) {
+        char b[160];
+        snprintf(b, sizeof b, "%.0f Hz is too low for %s (at least %.0f Hz)", o.rate, name, minRate);
+        *err = b;
+        return false;
+    }
+    *feed = [rx](const cf32* x, size_t n) { rx->feed(x, n); };
+    return true;
+}
+
+const automation::Value* field(const automation::Event& e, const char* k) {
+    const auto it = e.f.find(k);
+    return it == e.f.end() ? nullptr : &it->second;
+}
+std::string text(const automation::Event& e, const char* k) {
+    const automation::Value* v = field(e, k);
+    return v && v->t == automation::Value::Str ? v->s : std::string();
+}
+
+// --- pagers: OnAir's PagerReceiver for one protocol. Its signal offset stays 0: the channel is at 0 Hz of the input.
+bool openPager(int protocols, const char* name, const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<PagerReceiver>();
+    rx->setProtocols(protocols);
+    return start(rx, o, name, pagerTuning().minSampleRate, feed, err);
+}
+bool openPocsag(const Options& o, Feed* feed, std::string* err) { return openPager(1, "pocsag", o, feed, err); }
+bool openFlex(const Options& o, Feed* feed, std::string* err) { return openPager(2, "flex", o, feed, err); }
+
+// The bus gives the speed as a name ("POCSAG 1200", "FLEX 3200/4"): its number is the baud rate, a FLEX one also has the levels
+bool shapePager(const automation::Event& e, Json& j, const char* protocol) {
+    if (e.type != "pager.message") return true;
+    if (text(e, "protocol") != protocol) return false;   // the other protocol's page
+    const std::string speed = text(e, "speed");
+    const size_t sp = speed.find(' ');
+    if (sp == std::string::npos) return true;
+    char* end = nullptr;
+    const long baud = strtol(speed.c_str() + sp + 1, &end, 10);
+    if (baud > 0) j.num("baud", (long long)baud);
+    if (std::string(protocol) == "FLEX" && end && *end == '/') {
+        const long levels = strtol(end + 1, nullptr, 10);
+        if (levels == 2 || levels == 4) j.num("levels", (long long)levels);
+    }
+    return true;
+}
+bool shapePocsag(const automation::Event& e, Json& j) { return shapePager(e, j, "POCSAG"); }
+bool shapeFlex(const automation::Event& e, Json& j) { return shapePager(e, j, "FLEX"); }
+
+// --- ACARS: OnAir's AcarsReceiver ignores a carrier at its tuned centre unless the channel is named, so the one channel is
+// named: the input's centre
+bool openAcars(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<AcarsReceiver>();
+    rx->setCenterHz(o.freq);
+    rx->setChannels({o.freq});
+    return start(rx, o, "acars", acarsTuning().minSampleRate, feed, err);
+}
+
+// --- APRS: OnAir's PacketReceiver, the channel at 0 Hz of the input; its frames go to the hub's APRS channel (AX.25, link type 3)
+bool openAprs(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<PacketReceiver>();
+    return start(rx, o, "aprs", packetTuning().minSampleRate, feed, err);
+}
+
+// fcs_ok. What OnAir's PacketReceiver publishes (packet_rx.cpp, accept()): only frames whose AX.25 frame check sequence was right,
+// as the HDLC receiver handed them over, or frames it repaired until the check fitted: "vote" (a majority over the demodulators'
+// copies, on by default) and "fix bits" (one or two bits flipped, off by default). A repaired frame's summary ends with
+// " [repaired by vote]", " [2 bits fixed]" or " [1 bit fixed]", and that is the only mark the bus carries. So fcs_ok is false
+// exactly for those, true otherwise. (A digipeater's copy of a frame heard within a few seconds goes to the hub, not the bus.)
+// path: the bus has OnAir's "WIDE1-1*,WIDE2-1" (a star marks the last digipeater that repeated it); the line has an array.
+bool shapeAprs(const automation::Event& e, Json& j) {
+    if (e.type != "aprs.packet") return true;
+    const std::string s = text(e, "summary");
+    auto endsWith = [&s](const char* t) { const std::string x = t; return s.size() >= x.size() && s.compare(s.size() - x.size(), x.size(), x) == 0; };
+    j.flag("fcs_ok", !(endsWith(" [repaired by vote]") || endsWith(" [2 bits fixed]") || endsWith(" [1 bit fixed]")));
+    std::vector<std::string> path;
+    const std::string p = text(e, "path");
+    for (size_t i = 0; !p.empty() && i <= p.size();) {
+        const size_t c = std::min(p.find(',', i), p.size());
+        path.push_back(p.substr(i, c - i));
+        i = c + 1;
+    }
+    j.arr("path", path);
+    return true;
+}
+
+// a bus value as a member: whole numbers without a decimal point, a non-finite number or a null left out
+void member(Json& j, const std::string& k, const automation::Value& v) {
+    switch (v.t) {
+    case automation::Value::Num:
+        if (!std::isfinite(v.n)) return;
+        if (v.n == std::floor(v.n) && std::fabs(v.n) < 1e15) j.num(k.c_str(), (long long)v.n);
+        else { char b[32]; snprintf(b, sizeof b, "%.15g", v.n); j.raw(k.c_str(), b); }
+        return;
+    case automation::Value::Str: j.str(k.c_str(), v.s); return;
+    case automation::Value::Bool: j.flag(k.c_str(), v.b); return;
+    default: return;
+    }
+}
+
+} // namespace
+
+const BusMode kBusModes[] = {
+    {"pocsag", -1, false, openPocsag, shapePocsag},
+    {"flex", -1, false, openFlex, shapeFlex},
+    {"acars", -1, true, openAcars, nullptr},
+    {"aprs", wire::Aprs, false, openAprs, shapeAprs},
+};
+const size_t kBusModeCount = sizeof kBusModes / sizeof kBusModes[0];
+
+int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
+    Feed feed;
+    std::string err;
+    if (!m.open(o, &feed, &err)) { fprintf(stderr, "onair-rx: %s\n", err.c_str()); return 2; }
+
+    // both are called on this thread, inside feed(): they only collect
+    std::vector<automation::Event> events;
+    automation::global().setTap([&events](const automation::Event& e) { events.push_back(e); }, automation::kAllFamilies);
+    std::vector<std::vector<uint8_t>> packets;
+    const bool hub = m.chan >= 0 && o.pcapPort;
+    if (hub) {
+        wire::Config c;   // no file, no live capture, no GSMTAP: the sink is the hub's only output
+        c.dir.clear();
+        c.files = c.live = c.gsmtap = false;
+        wire::Hub::get().configure(c);
+        wire::Hub::get().setSink([&packets, &m](wire::Chan c, int64_t, const uint8_t* p, size_t n) {
+            if (c == m.chan) packets.emplace_back(p, p + n);
+        });
+        wire::Hub::get().setEnabled((wire::Chan)m.chan, true);
+    }
+
+    int64_t anchorUsec = 0;   // wall clock of signal time 0
+    uint64_t lines = 0, sent = 0;
+    std::vector<cf32> iq(1 << 14);
+    for (size_t n; (n = in.read(iq)) > 0;) {
+        const uint64_t first = in.samples() - n;
+        feed(iq.data(), n);
+        for (const automation::Event& e : events) {
+            Json j;
+            j.str("event", e.type).num("t_sample", (long long)first);
+            if (m.shape && !m.shape(e, j)) continue;
+            for (const auto& [k, v] : e.f) if (!j.has(k)) member(j, k, v);   // what shape wrote stands
+            out.line(j.done());
+            lines++;
+        }
+        events.clear();
+        if (!packets.empty()) {
+            // the block's first sample in signal time on the wall clock of the first sample, moved on when the input falls behind
+            // real time (as adsb's records)
+            const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            if (!anchorUsec) anchorUsec = in.startUsec();
+            int64_t t = anchorUsec + (int64_t)std::llround((double)first / o.rate * 1e6);
+            if (t < now - 100000) { anchorUsec += now - t; t = now; }
+            for (const auto& p : packets) out.packet(t, p.data(), p.size());
+            sent += packets.size();
+            packets.clear();
+        }
+    }
+    automation::global().setTap({}, 0);
+    if (hub) {
+        wire::Hub::get().setSink({});
+        wire::Hub::get().shutdown();
+    }
+    fprintf(stderr, "onair-rx: %s: %llu lines", m.name, (unsigned long long)lines);
+    if (hub) fprintf(stderr, ", %llu packets", (unsigned long long)sent);
+    fprintf(stderr, "\n");
+    return 0;
+}
+
+} // namespace onair_rx

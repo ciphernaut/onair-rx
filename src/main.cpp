@@ -8,6 +8,7 @@
 // as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 // It is distributed WITHOUT ANY WARRANTY; see the LICENSE file.
 #include "rx.h"
+#include "bus.h"
 #include "dect2/wirecap/wire.h"
 #include <cerrno>
 #include <cmath>
@@ -26,9 +27,10 @@ namespace onair_rx {
 
 namespace wire = dect2::wire;
 
-static const char* kVersion = "0.1.0";
+static const char* kVersion = "0.2.0";
 
-// The modes: each is one OnAir receiver. Another mode is one more row and its run function.
+// The modes with a run function of their own: each is one OnAir receiver. The modes read from OnAir's automation bus are
+// rows of the bus mode table (bus.cpp) instead.
 static const Mode kModes[] = {
     {"adsb", wire::kChans[wire::AdsB].linktype, runAdsb},
 };
@@ -82,8 +84,21 @@ void escape(std::string& o, const std::string& v) {
 
 void Json::key(const char* k) {
     if (s_.size() > 1) s_ += ',';
-    s_ += '"'; s_ += k; s_ += "\":";
+    s_ += '"'; escape(s_, k); s_ += "\":";
+    keys_.emplace_back(k);
 }
+bool Json::has(const std::string& k) const {
+    for (const std::string& h : keys_) if (h == k) return true;
+    return false;
+}
+Json& Json::arr(const char* k, const std::vector<std::string>& v) {
+    key(k);
+    s_ += '[';
+    for (size_t i = 0; i < v.size(); i++) { if (i) s_ += ','; s_ += '"'; escape(s_, v[i]); s_ += '"'; }
+    s_ += ']';
+    return *this;
+}
+Json& Json::raw(const char* k, const std::string& json) { key(k); s_ += json; return *this; }
 Json& Json::str(const char* k, const std::string& v) { key(k); s_ += '"'; escape(s_, v); s_ += '"'; return *this; }
 Json& Json::num(const char* k, long long v) { key(k); s_ += std::to_string(v); return *this; }
 Json& Json::num(const char* k, double v, int decimals) {
@@ -99,12 +114,14 @@ Json& Json::flag(const char* k, bool v) { key(k); s_ += v ? "true" : "false"; re
 using namespace onair_rx;
 
 static void usage(FILE* f) {
-    fprintf(f, "usage: onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--pcap-port PORT] < iq\n"
+    fprintf(f, "usage: onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] < iq\n"
                "       onair-rx --lua      OnAir's Wireshark Lua dissector (USER0 is Mode S)\n"
                "       onair-rx --version\n"
-               "IQ on stdin, interleaved little endian; one JSON object per decode on stdout; with --pcap-port, a classic\n"
-               "pcap stream of the frames for one client at a time on 127.0.0.1:PORT. Modes:");
+               "IQ on stdin, interleaved little endian; --freq is the radio frequency at 0 Hz of the input; one JSON object\n"
+               "per decode on stdout; with --pcap-port, a classic pcap stream of the frames for one client at a time on\n"
+               "127.0.0.1:PORT. Modes:");
     for (const Mode& m : kModes) fprintf(f, " %s", m.name);
+    for (size_t i = 0; i < kBusModeCount; i++) fprintf(f, " %s", kBusModes[i].name);
     fprintf(f, "\n");
 }
 
@@ -117,6 +134,12 @@ int main(int argc, char** argv) {
         if (a == "--mode" && val) o.mode = argv[++i];
         else if (a == "--rate" && val) o.rate = atof(argv[++i]);
         else if (a == "--format" && val) o.format = argv[++i];
+        else if (a == "--freq" && val) {   // every mode takes it; only the modes that place channels by frequency read it
+            char* end = nullptr;
+            const double hz = strtod(argv[++i], &end);
+            if (!*argv[i] || *end || !std::isfinite(hz) || hz <= 0) { fprintf(stderr, "onair-rx: bad --freq %s\n", argv[i]); return 2; }
+            o.freq = hz;
+        }
         else if (a == "--pcap-port" && val) {
             char* end = nullptr;
             const long p = strtol(argv[++i], &end, 10);
@@ -135,22 +158,28 @@ int main(int argc, char** argv) {
         else { usage(stderr); return 2; }
     }
     const Mode* mode = nullptr;
+    const BusMode* bus = nullptr;
     for (const Mode& m : kModes) if (o.mode == m.name) mode = &m;
-    if (!mode) { fprintf(stderr, "onair-rx: no mode %s\n", o.mode.c_str()); return 2; }
+    for (size_t i = 0; i < kBusModeCount; i++) if (o.mode == kBusModes[i].name) bus = &kBusModes[i];
+    if (!mode && !bus) { fprintf(stderr, "onair-rx: no mode %s\n", o.mode.c_str()); return 2; }
     if (o.rate <= 0) { fprintf(stderr, "onair-rx: --rate HZ is needed\n"); return 2; }
     if (o.format != "cf32" && o.format != "cs16") { fprintf(stderr, "onair-rx: no format %s (cf32 or cs16)\n", o.format.c_str()); return 2; }
+    // before any sample is read: a mode that places its channels by frequency never runs without one
+    if (bus && bus->needsFreq && o.freq <= 0) { fprintf(stderr, "onair-rx: %s needs --freq HZ\n", bus->name); return 2; }
+    if (bus && bus->chan < 0 && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", bus->name); return 2; }
 
     PcapPort pcap;
     if (o.pcapPort) {
         std::string err;
-        if (!pcap.listen(o.pcapPort, mode->linktype, err)) {
+        const uint32_t linktype = bus ? wire::kChans[bus->chan].linktype : mode->linktype;
+        if (!pcap.listen(o.pcapPort, linktype, err)) {
             fprintf(stderr, "onair-rx: cannot listen on 127.0.0.1:%d: %s\n", o.pcapPort, err.c_str());
             return 1;
         }
     }
     IqInput in(o.format);
     Output out(o.pcapPort ? &pcap : nullptr);
-    const int st = mode->run(o, in, out);
+    const int st = bus ? runBus(*bus, o, in, out) : mode->run(o, in, out);
     fflush(stdout);
     pcap.finish();
     if (in.error()) { fprintf(stderr, "onair-rx: stdin: %s\n", strerror(in.error())); return 1; }
