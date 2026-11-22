@@ -53,21 +53,25 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2
   | `pocsag` | `PagerReceiver` (POCSAG) | 1 MHz | no | `pager.message` (`protocol`, `speed`, `address`, `function`, `type`, `text`, `damaged`) | `baud`; POCSAG pages only |
   | `flex` | `PagerReceiver` (FLEX) | 1 MHz | no | `pager.message` (the same) | `baud`, `levels`; FLEX pages only |
   | `acars` | `AcarsReceiver` | 1 MHz | yes: the channel | `acars.message` (`tail`, `flight`, `label`, `text`, `downlink`, `msg_num`, `lat`, `lon`) | nothing |
-  | `aprs` | `PacketReceiver` | 240 kHz | no | `aprs.packet` (`from`, `to`, `info`, `type`, `summary`, `lat`, `lon`); also `aprs.message` | `path`, `fcs_ok` |
+  | `aprs` | `PacketReceiver` | 240 kHz | no | `aprs.packet` (`from`, `to`, `info`, `type`, `summary`, `lat`, `lon`) | `path`, `fcs_ok`; no `lat`, `lon` for an object, item or third-party packet |
   | `ais` | `AisReceiver` | 250 kHz | yes: AIS 1 or 2 inside the band | none: `ais.message` from the hub's sentences | the whole line |
   | `vdl2` | `Vdl2Receiver` | 250 kHz | yes: the channel | `vdl2.message` (`src`, `dst`, `from_air`, `proto`, `summary`, `frame`) | `icao`, `addr_type` |
   | `hfdl` | `HfdlReceiver` | 24 kHz | yes: the dial frequency | `hfdl.message` (`kind`, `summary`, `icao`, `uplink`, `snr_db`) | `icao` left out when the bus has none |
   | `rs41`, `dfm`, `m20` | `SondeReceiver` | 2 MHz (1 MHz with an L-band `--freq`) | no (taken) | `sonde.update` (`serial`, `type`, `lat`, `lon`, `alt_m`, `vspeed_ms`, `hspeed_ms`, `temp_c`, `batt_v`, `sats`) | `id` (the serial as rs1729 spells it); that type's sondes only |
 
-  AIS, VDL2, HFDL and the sondes write only the event of their row: any other event their receiver puts on the bus is
-  dropped. In more detail:
+  Every mode writes only the event of its row: any other event its receiver puts on the bus is dropped. In more
+  detail:
   - `pocsag`, `flex` (`pager.message`: `protocol`, `speed`, `address`, `function`, `type`, `text`, `damaged`):
     `baud` from the speed, and for FLEX `levels` (2 or 4). Each mode decodes its own protocol only.
   - `acars` (`acars.message`: `tail`, `flight`, `label`, `text`, `downlink`, `msg_num`, `lat`, `lon`): nothing; the
     receiver watches the one channel at `--freq`.
-  - `aprs` (`aprs.packet`: `from`, `to`, `info`, `type`, `summary`, `lat`, `lon`; also `aprs.message`): `path` as an
+  - `aprs` (`aprs.packet`: `from`, `to`, `info`, `type`, `summary`, `lat`, `lon`): `path` as an
     array of strings, and `fcs_ok`: OnAir passes on only frames whose check sequence was right or that it repaired
-    until it was, and marks a repaired frame in its summary; `fcs_ok` is false for those.
+    until it was, and marks a repaired frame in its summary; `fcs_ok` is false for those. `lat` and `lon` are left out
+    for an object or an item (`type` `Object` or `Item`: the position is the object's) and for a third-party packet
+    (`info` starting with `}`: the position is the station's inside it), so that a line's position is always the
+    sender's, as OnAir keeps it. An APRS message is its `aprs.packet` line only: the `aprs.message` OnAir's bus also has
+    for it is dropped.
   - `ais`: one line per AIS message, made from the NMEA 0183 sentences OnAir's receiver hands its Wireshark hub
     (`src/ais.cpp`), not from the bus: every line is an `ais.message`, and the receiver's own bus events (the station
     summaries `ais.vessel`, and `ais.anomaly`, `ais.behaviour`, `ais.cpa`, `ais.geofence`, which OnAir makes of the
@@ -139,10 +143,10 @@ test/bus.sh                               # the bus modes on OnAir's own test si
 ```
 
 `build.sh` also builds `_build/onair-gen` (`test/gen.cpp`): `onair-gen --mode
-pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT]` writes cf32 IQ of one known
+pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO]` writes cf32 IQ of one known
 message from OnAir's test-signal generator for the mode (AIS: a position report on AIS 1 and a static report on AIS 2;
 VDL2: a downlink, an uplink and a ground station's GSIF; HFDL: a squitter and a logon request; a sonde: 12 s of one
-sonde of OnAir's scene, moved to 0 Hz), with a second of noise either side, and says on stderr where the message is. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links, and `onair-gen
+sonde of OnAir's scene, moved to 0 Hz; `--info` replaces APRS's whole information field), with a second of noise either side, and says on stderr where the message is. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links, and `onair-gen
 --selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`) on serials the test signals do not have.
 
 The OnAir checkout is never changed. `build.sh` builds OnAir from `_onair-src`, a copy of `$ONAIR_SRC` with every

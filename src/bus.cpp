@@ -5,8 +5,8 @@
 // hand the frames they receive to OnAir's Wireshark hub, both from inside feed(), on the thread that calls it, with no engine
 // started. So one run serves every mode that has a receiver on the bus: a tap on the bus (every family) collects the events of
 // a block's feed(), a sink on the hub (patches/0001) collects its packets, and after the feed() the events become JSON lines and
-// the packets pcap records. A mode is a row: how to make and set up its receiver, its hub channel, and what its lines need that
-// the bus lacks.
+// the packets pcap records. A mode is a row: its event (the only bus event it writes), how to make and set up its receiver, its
+// hub channel, and what its lines need that the bus lacks.
 #include "bus.h"
 #include "ais.h"
 #include "dect2/acars/acars_rx.h"
@@ -66,7 +66,6 @@ bool openFlex(const Options& o, Feed* feed, std::string* err) { return openPager
 
 // The bus gives the speed as a name ("POCSAG 1200", "FLEX 3200/4"): its number is the baud rate, a FLEX one also has the levels
 bool shapePager(const automation::Event& e, Json& j, const char* protocol) {
-    if (e.type != "pager.message") return true;
     if (text(e, "protocol") != protocol) return false;   // the other protocol's page
     const std::string speed = text(e, "speed");
     const size_t sp = speed.find(' ');
@@ -104,8 +103,12 @@ bool openAprs(const Options& o, Feed* feed, std::string* err) {
 // " [repaired by vote]", " [2 bits fixed]" or " [1 bit fixed]", and that is the only mark the bus carries. So fcs_ok is false
 // exactly for those, true otherwise. (A digipeater's copy of a frame heard within a few seconds goes to the hub, not the bus.)
 // path: the bus has OnAir's "WIDE1-1*,WIDE2-1" (a star marks the last digipeater that repeated it); the line has an array.
+// lat, lon: left out for an object or an item (the position is the object's, not the sender's) and for a third-party packet
+// (info "}...": the position is the station's inside it), as OnAir keeps them off the sender (packet_rx.cpp, accept()).
+// A message (info ":...") is its aprs.packet line only: the bus's aprs.message for it is not the row's event.
 bool shapeAprs(const automation::Event& e, Json& j) {
-    if (e.type != "aprs.packet") return true;
+    const std::string type = text(e, "type");
+    if (type == "Object" || type == "Item" || text(e, "info").rfind("}", 0) == 0) j.omit("lat").omit("lon");
     const std::string s = text(e, "summary");
     auto endsWith = [&s](const char* t) { const std::string x = t; return s.size() >= x.size() && s.compare(s.size() - x.size(), x.size(), x) == 0; };
     j.flag("fcs_ok", !(endsWith(" [repaired by vote]") || endsWith(" [2 bits fixed]") || endsWith(" [1 bit fixed]")));
@@ -125,7 +128,8 @@ bool shapeAprs(const automation::Event& e, Json& j) {
 // the input's edge (ais::aisChannelsCovered), so a centre where that fails is refused rather than run deaf. The long-range
 // channels 75 and 76 (message 27, for satellites) are left out. A line per message comes from the hub's sentences (ais.cpp);
 // the bus's AIS events (ais.vessel, ais.anomaly, ais.behaviour, ais.cpa, ais.geofence: what OnAir makes of the messages over
-// time) are all dropped, so that the mode writes only ais.message lines.
+// time) are not the row's event, and a bus event named ais.message would be a second line of a message: all are dropped, so
+// that the mode writes only the hub's ais.message lines.
 bool openAis(const Options& o, Feed* feed, std::string* err) {
     auto rx = std::make_shared<AisReceiver>();
     rx->setCenterHz(o.freq);
@@ -162,17 +166,15 @@ bool flagOf(const automation::Event& e, const char* k) {
 // icao: the frame's source address, as dumpvdl2 has it (and so ZetaSDR's VDL2 row, whose subjects are keyed on it): the
 // aircraft's on a downlink, the ground station's on an uplink or a broadcast. addr_type: the source's type in dumpvdl2's
 // words, "Aircraft" when from_air, else "Ground station" (the bus carries no address types; from_air is the source being an
-// aircraft). dst stays as the bus has it (FFFFFF: all stations). Only vdl2.message events are lines.
+// aircraft). dst stays as the bus has it (FFFFFF: all stations).
 bool shapeVdl2(const automation::Event& e, Json& j) {
-    if (e.type != "vdl2.message") return false;
     j.str("icao", text(e, "src")).str("addr_type", flagOf(e, "from_air") ? "Aircraft" : "Ground station");
     return true;
 }
 
 // --- HFDL: OnAir's HfdlReceiver with the one channel named by its dial frequency: the input's centre. The receiver puts the
 // carrier 1440 Hz above the dial frequency (kHfdlCarrierHz), so the input is centred on the dial frequency, as a USB receiver
-// tuned to the listed frequency has it. Only hfdl.message events are lines; the bus's empty icao (a frame that names no
-// aircraft, such as a squitter) is left out.
+// tuned to the listed frequency has it. The bus's empty icao (a frame that names no aircraft, such as a squitter) is left out.
 bool openHfdl(const Options& o, Feed* feed, std::string* err) {
     auto rx = std::make_shared<HfdlReceiver>();
     rx->setCenterHz(o.freq);
@@ -180,7 +182,6 @@ bool openHfdl(const Options& o, Feed* feed, std::string* err) {
     return start(rx, o, "hfdl", hfdlTuning().minSampleRate, feed, err);
 }
 bool shapeHfdl(const automation::Event& e, Json& j) {
-    if (e.type != "hfdl.message") return false;
     if (text(e, "icao").empty()) j.omit("icao");
     return true;
 }
@@ -201,7 +202,7 @@ bool openRs41(const Options& o, Feed* feed, std::string* err) { return openSonde
 bool openDfm(const Options& o, Feed* feed, std::string* err) { return openSonde(o, feed, err, "dfm"); }
 bool openM20(const Options& o, Feed* feed, std::string* err) { return openSonde(o, feed, err, "m20"); }
 bool shapeSonde(const automation::Event& e, Json& j, const char* type) {
-    if (e.type != "sonde.update" || text(e, "type") != type) return false;
+    if (text(e, "type") != type) return false;
     const std::string serial = text(e, "serial");
     if (serial.empty()) return false;
     j.str("id", sondeId(type, serial));
@@ -228,16 +229,16 @@ void member(Json& j, const std::string& k, const automation::Value& v) {
 } // namespace
 
 const BusMode kBusModes[] = {
-    {"pocsag", -1, false, openPocsag, shapePocsag, nullptr, nullptr},
-    {"flex", -1, false, openFlex, shapeFlex, nullptr, nullptr},
-    {"acars", -1, true, openAcars, nullptr, nullptr, nullptr},
-    {"aprs", wire::Aprs, false, openAprs, shapeAprs, nullptr, nullptr},
-    {"ais", wire::Ais, true, openAis, shapeAis, "ais.message", aisPackets},
-    {"vdl2", -1, true, openVdl2, shapeVdl2, nullptr, nullptr},
-    {"hfdl", -1, true, openHfdl, shapeHfdl, nullptr, nullptr},
-    {"rs41", -1, false, openRs41, shapeRs41, nullptr, nullptr},
-    {"dfm", -1, false, openDfm, shapeDfm, nullptr, nullptr},
-    {"m20", -1, false, openM20, shapeM20, nullptr, nullptr},
+    {"pocsag", "pager.message", -1, false, openPocsag, shapePocsag, nullptr},
+    {"flex", "pager.message", -1, false, openFlex, shapeFlex, nullptr},
+    {"acars", "acars.message", -1, true, openAcars, nullptr, nullptr},
+    {"aprs", "aprs.packet", wire::Aprs, false, openAprs, shapeAprs, nullptr},
+    {"ais", "ais.message", wire::Ais, true, openAis, shapeAis, aisPackets},
+    {"vdl2", "vdl2.message", -1, true, openVdl2, shapeVdl2, nullptr},
+    {"hfdl", "hfdl.message", -1, true, openHfdl, shapeHfdl, nullptr},
+    {"rs41", "sonde.update", -1, false, openRs41, shapeRs41, nullptr},
+    {"dfm", "sonde.update", -1, false, openDfm, shapeDfm, nullptr},
+    {"m20", "sonde.update", -1, false, openM20, shapeM20, nullptr},
 };
 const size_t kBusModeCount = sizeof kBusModes / sizeof kBusModes[0];
 
@@ -271,6 +272,7 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
         const uint64_t first = in.samples() - n;
         feed(iq.data(), n);
         for (const automation::Event& e : events) {
+            if (e.type != m.event) continue;   // not the row's event
             Json j;
             j.str("event", e.type).num("t_sample", (long long)first);
             if (m.shape && !m.shape(e, j)) continue;
@@ -282,7 +284,7 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
         if (packetLine)
             for (const auto& p : packets) {
                 Json j;
-                j.str("event", m.packetEvent).num("t_sample", (long long)first);
+                j.str("event", m.event).num("t_sample", (long long)first);
                 if (!packetLine(p.data(), p.size(), j)) continue;
                 out.line(j.done());
                 lines++;

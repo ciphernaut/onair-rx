@@ -3,13 +3,14 @@
 // either side. For onair-rx's tests (test/bus.sh); nothing is transmitted.
 // Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 //
-//   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT]
+//   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO]
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
 //
 // The known messages: POCSAG address 1234567 function 3 "HELLO ZETA" at 1200 baud (alphanumeric); FLEX capcode 1234567
 // "HELLO ZETA" (alphanumeric, 1600/2); ACARS tail VH-ZET label H1 flight ZET001 ("HELLO ZETA" after the message number and
-// flight); APRS VK3ABC>APRS:!2723.05S/15307.05E>ZetaSDR. --text replaces the text (APRS: the comment after the position).
+// flight); APRS VK3ABC>APRS:!2723.05S/15307.05E>ZetaSDR. --text replaces the text (APRS: the comment after the position);
+// --info replaces APRS's whole information field (a message, an object, a third-party packet).
 // AIS: two messages of MMSI 503000001, a position report (type 1: -27.3842, 153.1175, 12.3 kt, course 45.0 and heading 45
 // degrees, under way using engine) on AIS 1, then a static report (type 5, two sentences) named ZETA TEST on AIS 2.
 // VDL2: three bursts on one channel: an ACARS downlink (label H1, "HELLO ZETA" after the message number and flight) from
@@ -64,7 +65,7 @@ constexpr double kSnrDb = 25;   // carrier to noise in 25 kHz
 constexpr size_t kChunk = 1 << 14;
 
 int usage() {
-    fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] > iq\n"
+    fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO] > iq\n"
                     "       onair-gen --selftest ais-join|sonde-id\n");
     return 2;
 }
@@ -94,11 +95,11 @@ std::vector<cf32> pagerSignal(double rate, bool flex, const std::string& text) {
     return s ? cut(*s, rate, 0.25, 120) : std::vector<cf32>{};
 }
 
-std::vector<cf32> aprsSignal(double rate, const std::string& comment) {
+std::vector<cf32> aprsSignal(double rate, const std::string& info) {
     ax25::Frame f;
     f.to.call = "APRS";
     f.from.call = "VK3ABC";
-    f.info = "!2723.05S/15307.05E>" + comment;
+    f.info = info;
     PacketGenFrame g;
     g.frame = f;
     g.baud = 1200;
@@ -354,8 +355,8 @@ int main(int argc, char** argv) {
         if (std::string(argv[2]) == "sonde-id") return selftestSondeId();
         return usage();
     }
-    std::string mode, text = "HELLO ZETA";
-    bool haveText = false;
+    std::string mode, text = "HELLO ZETA", info;
+    bool haveText = false, haveInfo = false;
     double rate = 0, freq = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -364,6 +365,7 @@ int main(int argc, char** argv) {
         else if (a == "--rate" && val) rate = atof(argv[++i]);
         else if (a == "--freq" && val) { freq = atof(argv[++i]); if (freq <= 0) return usage(); }
         else if (a == "--text" && val) { text = argv[++i]; haveText = true; }
+        else if (a == "--info" && val) { info = argv[++i]; haveInfo = true; }
         else return usage();
     }
     if (!freq) freq = mode == "ais" ? 162e6 : 131.525e6;
@@ -371,7 +373,7 @@ int main(int argc, char** argv) {
     std::vector<cf32> msg;
     if (mode == "pocsag" || mode == "flex") msg = pagerSignal(rate, mode == "flex", text);
     else if (mode == "acars") msg = acarsSignal(rate, freq, text);
-    else if (mode == "aprs") msg = aprsSignal(rate, haveText ? text : "ZetaSDR");
+    else if (mode == "aprs") msg = aprsSignal(rate, haveInfo ? info : "!2723.05S/15307.05E>" + (haveText ? text : std::string("ZetaSDR")));
     else if (mode == "ais") msg = aisSignal(rate, freq);
     else if (mode == "vdl2") msg = vdl2Signal(rate, text);   // VDL2's, HFDL's and a sonde's signal is the same at any --freq
     else if (mode == "hfdl") msg = hfdlSignal(rate);

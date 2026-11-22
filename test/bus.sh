@@ -5,10 +5,11 @@
 # End-to-end check of the bus modes (pocsag, flex, acars, aprs, ais, vdl2, hfdl, rs41, dfm, m20) on OnAir's own test signals:
 # _build/onair-gen makes one known message per mode (AIS: two; VDL2: three frames; HFDL: two; a sonde: 12 s of its frames) with
 # a second of noise either side, onair-rx decodes it. The signals are synthesised; no capture is used. Also: a mode that needs
-# --freq refuses to start without it, and AIS with a centre its channels do not fall in; AIS, VDL2, HFDL and the sondes write
-# only their own bus event, each sonde mode only its own type; text the bus cuts or that is not ASCII stays one valid line; a
-# pcap port with no client, or with a client that hangs up, changes neither the lines nor the run time; AIS's sentences on the
-# pcap port; and the AIS sentence joiner on its own.
+# --freq refuses to start without it, and AIS with a centre its channels do not fall in; every mode writes only its own bus
+# event (an APRS message is one aprs.packet line), each sonde mode only its own type; an APRS object's or third-party packet's
+# position is left out; text the bus cuts or that is not ASCII stays one valid line; a pcap port with no client, or with a
+# client that hangs up, changes neither the lines nor the run time; AIS's sentences on the pcap port; and the AIS sentence
+# joiner on its own.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -136,6 +137,7 @@ gen pocsag --mode pocsag --rate 1000000
 rx pocsag --mode pocsag --rate 1000000 --freq "$acars_hz"   # --freq is taken and ignored
 lines pocsag 1000000 '{"event": "pager.message", "protocol": "POCSAG", "address": 1234567, "function": 3, "text": "HELLO ZETA", "baud": 1200}' ||
   fail pocsag
+only pocsag pager.message || fail pocsag
 
 gen flex --mode flex --rate 1000000
 rx flex --mode flex --rate 1000000
@@ -146,15 +148,44 @@ o = [json.loads(l) for l in open(sys.argv[1])][0]
 b, n = o.get("baud"), o.get("levels")
 assert type(b) is int and n in (2, 4), "baud %r levels %r" % (b, n)
 print("ok: FLEX baud %d, levels %d" % (b, n))' "$d/flex.jsonl" || fail flex
+only flex pager.message || fail flex
 
 gen acars --mode acars --rate 1000000 --freq "$acars_hz"
 rx acars --mode acars --rate 1000000 --freq "$acars_hz"
 lines acars 1000000 '{"event": "acars.message", "tail": "VH-ZET", "label": "H1", "flight": "ZET001"}' || fail acars
+only acars acars.message || fail acars
 
 gen aprs --mode aprs --rate 240000
 rx aprs --mode aprs --rate 240000
 lines aprs 240000 '{"event": "aprs.packet", "from": "VK3ABC", "to": "APRS", "info": "!2723.05S/15307.05E>ZetaSDR", "path": [], "fcs_ok": true, "lat": -27.38417, "lon": 153.1175}' ||
   fail aprs
+only aprs aprs.packet || fail aprs
+# an APRS message: one line, its aprs.packet (OnAir's bus also has an aprs.message for it, which is not the row's event)
+gen aprs-msg --mode aprs --rate 240000 --info ':VK3XYZ   :hello{001'
+rx aprs-msg --mode aprs --rate 240000
+lines aprs-msg 240000 '{"event": "aprs.packet", "from": "VK3ABC", "to": "APRS", "info": ":VK3XYZ   :hello{001"}' 1 ||
+  fail "an APRS message"
+only aprs-msg aprs.packet || fail "an APRS message"
+# an object's and a third-party packet's position is not the sender's: the line has no lat and no lon
+# no_fix <tag>: no line has lat or lon
+no_fix() {
+  python3 -I -c '
+import json, sys
+ls = [json.loads(l) for l in open(sys.argv[1], "rb")]
+bad = [o for o in ls if "lat" in o or "lon" in o]
+assert not bad, f"a position on {bad[0]!r}"
+print(f"ok: {len(ls)} line(s), none with lat or lon")' "$d/$1.jsonl"
+}
+gen aprs-object --mode aprs --rate 240000 --info ';LEADER   *092345z4903.50N/07201.75W>'
+rx aprs-object --mode aprs --rate 240000
+lines aprs-object 240000 '{"event": "aprs.packet", "from": "VK3ABC", "type": "Object", "info": ";LEADER   *092345z4903.50N/07201.75W>"}' 1 ||
+  fail "an APRS object"
+no_fix aprs-object || fail "an APRS object"
+gen aprs-third --mode aprs --rate 240000 --info '}VK3XYZ>APRS,TCPIP,VK3ABC*:!2723.05S/15307.05E>inside'
+rx aprs-third --mode aprs --rate 240000
+lines aprs-third 240000 '{"event": "aprs.packet", "from": "VK3ABC", "info": {"has": ["}VK3XYZ>APRS"]}}' 1 ||
+  fail "a third-party APRS packet"
+no_fix aprs-third || fail "a third-party APRS packet"
 
 # --- AIS: a position report (type 1) on AIS 1 and a static report (type 5, two sentences) on AIS 2, one line per message
 # ais_details <tag>: the members a line of each message has, and its sentences
