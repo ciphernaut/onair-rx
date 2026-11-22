@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 #
-# End-to-end check of the bus modes (pocsag, flex, acars, aprs, ais) on OnAir's own test signals: _build/onair-gen makes one
-# known message per mode (AIS: two) with a second of noise either side, onair-rx decodes it. The signals are synthesised; no
-# capture is used. Also: a mode that needs --freq refuses to start without it, and AIS with a centre its channels do not fall
-# in; text the bus cuts or that is not ASCII stays one valid line; a pcap port with no client, or with a client that hangs up,
-# changes neither the lines nor the run time; AIS's sentences on the pcap port; and the AIS sentence joiner on its own.
+# End-to-end check of the bus modes (pocsag, flex, acars, aprs, ais, vdl2, hfdl, rs41, dfm, m20) on OnAir's own test signals:
+# _build/onair-gen makes one known message per mode (AIS: two; VDL2: three frames; HFDL: two; a sonde: 12 s of its frames) with
+# a second of noise either side, onair-rx decodes it. The signals are synthesised; no capture is used. Also: a mode that needs
+# --freq refuses to start without it, and AIS with a centre its channels do not fall in; AIS, VDL2, HFDL and the sondes write
+# only their own bus event, each sonde mode only its own type; text the bus cuts or that is not ASCII stays one valid line; a
+# pcap port with no client, or with a client that hangs up, changes neither the lines nor the run time; AIS's sentences on the
+# pcap port; and the AIS sentence joiner on its own.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -17,17 +19,23 @@ d=$(mktemp -d)
 trap 'rm -rf "$d"' EXIT
 acars_hz=131525000
 ais_hz=162000000   # the middle of AIS 1 (161.975 MHz) and AIS 2 (162.025 MHz)
+vdl2_hz=136975000
+hfdl_hz=8927000    # a dial frequency: the carrier is 1440 Hz above it
+sonde_hz=403000000
 
 # --- onair-rx has each mode: on empty input it ends with exit 0 and no line
-for m in pocsag flex acars aprs ais; do
-  f=()
+for m in pocsag flex acars aprs ais vdl2 hfdl rs41 dfm m20; do
+  f=() rate=1000000
   [ "$m" != acars ] || f=(--freq "$acars_hz")
   [ "$m" != ais ] || f=(--freq "$ais_hz")
-  "$bin" --mode "$m" --rate 1000000 --format cf32 "${f[@]}" </dev/null >"$d/$m.empty" 2>"$d/$m.empty.err" ||
+  [ "$m" != vdl2 ] || f=(--freq "$vdl2_hz")
+  [ "$m" != hfdl ] || f=(--freq "$hfdl_hz")
+  case $m in rs41 | dfm | m20) rate=2000000 ;; esac
+  "$bin" --mode "$m" --rate "$rate" --format cf32 "${f[@]}" </dev/null >"$d/$m.empty" 2>"$d/$m.empty.err" ||
     fail "$m: $(cat "$d/$m.empty.err")"
   [ ! -s "$d/$m.empty" ] || fail "$m: a line on empty input"
 done
-echo "ok: onair-rx has pocsag, flex, acars, aprs and ais"
+echo "ok: onair-rx has pocsag, flex, acars, aprs, ais, vdl2, hfdl, rs41, dfm and m20"
 
 # --- refuses <stderr> <onair-rx args...>: exit 2 with exactly that one line on stderr, before reading any input (stdin stays
 # open and is never written), and nothing on stdout
@@ -50,6 +58,9 @@ EOF
 }
 refuses "onair-rx: acars needs --freq HZ" --mode acars --rate 1000000 || fail "acars without --freq"
 refuses "onair-rx: ais needs --freq HZ" --mode ais --rate 250000 || fail "ais without --freq"
+refuses "onair-rx: vdl2 needs --freq HZ" --mode vdl2 --rate 250000 || fail "vdl2 without --freq"
+refuses "onair-rx: hfdl needs --freq HZ" --mode hfdl --rate 24000 || fail "hfdl without --freq"
+refuses "onair-rx: 1000000 Hz is too low for rs41 (at least 2000000 Hz)" --mode rs41 --rate 1000000 || fail "rs41 at 1 MHz"
 # 250 kHz at 161.8 MHz ends at 161.925 MHz, short of AIS 1; at 162.2 MHz it starts at 162.075 MHz, past AIS 2
 refuses "onair-rx: ais: no AIS channel within 250000 Hz of 161800000 Hz" --mode ais --rate 250000 --freq 161800000 ||
   fail "ais below its channels"
@@ -90,8 +101,8 @@ t0, t1 = float(g.group(1)), float(g.group(2))
 def match(v, w):
     if isinstance(w, dict):
         return isinstance(v, str) and all(s in v for s in w["has"]) and len(v) == w.get("len", len(v))
-    if isinstance(w, float):
-        return isinstance(v, float) and abs(v - w) < 1e-3
+    if isinstance(w, float):   # a whole number is written without a decimal point
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v - w) < 1e-3
     return type(v) is type(w) and v == w
 
 found = None
@@ -107,6 +118,16 @@ assert found, "no line has " + ", ".join(f"{k}={w!r}" for k, w in want.items() i
 t = found["t_sample"] / rate
 assert t0 - 0.5 <= t <= t1 + 0.5, f"t_sample is {t:.3f} s, the message is at {t0:.3f} s to {t1:.3f} s"
 print(f"ok: {len(lines)} line(s), {found['event']} at {t:.3f} s for a message at {t0:.3f} s to {t1:.3f} s")
+EOF
+}
+# only <tag> <event>: every line is of that event: a mode writes only the bus event its row is for
+only() {
+  python3 -I - "$d/$1.jsonl" "$2" <<'EOF'
+import json, sys
+ev = [json.loads(l)["event"] for l in open(sys.argv[1], "rb")]
+other = sorted(set(e for e in ev if e != sys.argv[2]))
+assert not other, f"lines of {other}, not only {sys.argv[2]}"
+print(f"ok: all {len(ev)} line(s) are {sys.argv[2]}")
 EOF
 }
 
@@ -160,6 +181,7 @@ lines ais 250000 '{"event": "ais.message", "msg_type": 1, "mmsi": 503000001, "ch
 lines ais 250000 '{"event": "ais.message", "msg_type": 5, "mmsi": 503000001, "channel": "B", "repeat": 0, "name": "ZETA TEST"}' 2 ||
   fail "ais: the static report"
 ais_details ais || fail "ais"
+only ais ais.message || fail "ais"
 # centred on one channel, as the node runs it (a 25 kHz channel resampled up), in cs16: the channels are placed by frequency
 for hz in 161975000 162025000; do
   gen "ais-$hz" --mode ais --rate 250000 --freq "$hz"
@@ -171,6 +193,58 @@ open(sys.argv[2], "wb").write(struct.pack(f"<{len(a)}h", *(max(-32768, min(32767
     fail "ais at $hz Hz: $(tail -n 3 "$d/ais-$hz.err")"
   lines "ais-$hz" 250000 '{"event": "ais.message", "msg_type": 1, "mmsi": 503000001, "channel": "A"}' 2 || fail "ais at $hz Hz"
   ais_details "ais-$hz" || fail "ais at $hz Hz"
+  only "ais-$hz" ais.message || fail "ais at $hz Hz"
+done
+
+# --- VDL2: a downlink from aircraft 7C1234 to ground station 10A000, the station's uplink to it, the station's GSIF to all
+# stations; icao is the aircraft's address on both of its frames, the station's on its broadcast
+gen vdl2 --mode vdl2 --rate 250000
+rx vdl2 --mode vdl2 --rate 250000 --freq "$vdl2_hz"
+lines vdl2 250000 '{"event": "vdl2.message", "icao": "7C1234", "addr_type": "Aircraft", "from_air": true, "src": "7C1234", "dst": "10A000", "proto": "ACARS"}' 3 ||
+  fail "vdl2: the downlink"
+lines vdl2 250000 '{"event": "vdl2.message", "icao": "7C1234", "addr_type": "Aircraft", "from_air": false, "src": "10A000", "dst": "7C1234"}' 3 ||
+  fail "vdl2: the uplink"
+lines vdl2 250000 '{"event": "vdl2.message", "icao": "10A000", "addr_type": "Ground station", "from_air": false, "dst": "FFFFFF"}' 3 ||
+  fail "vdl2: the GSIF"
+only vdl2 vdl2.message || fail vdl2
+
+# --- HFDL: on the dial frequency (the carrier 1440 Hz above it, as the receiver expects), ground station 1's squitter, then a
+# logon request from aircraft 7C1234; the squitter's line has no icao (the bus has "" for none)
+gen hfdl --mode hfdl --rate 24000
+rx hfdl --mode hfdl --rate 24000 --freq "$hfdl_hz"
+lines hfdl 24000 '{"event": "hfdl.message", "icao": "7C1234", "uplink": false}' 2 || fail "hfdl: the logon request"
+python3 -I -c '
+import json, sys
+ls = [json.loads(l) for l in open(sys.argv[1], "rb")]
+sq = [o for o in ls if "icao" not in o]
+assert len(sq) == 1 and sq[0]["uplink"] is True, f"lines without icao: {sq!r}"
+assert all(o.get("icao") != "" for o in ls), "an empty icao"
+print("ok: the squitter (%s) has no icao" % sq[0]["kind"])' "$d/hfdl.jsonl" || fail "hfdl: the squitter"
+only hfdl hfdl.message || fail hfdl
+
+# --- the radiosondes, each its own type only: 12 s of one sonde at 0 Hz; id is the serial, the position within 0.001
+for s in "rs41 RS41 S1234567 -27.3842 153.1175" "dfm DFM 17012345 25.30 55.50" "m20 M20 211-4-01234 25.00 55.60"; do
+  read -r m type id lat lon <<<"$s"
+  gen "$m" --mode "$m" --rate 2000000
+  rx "$m" --mode "$m" --rate 2000000 --freq "$sonde_hz"
+  lines "$m" 2000000 "{\"event\": \"sonde.update\", \"type\": \"$type\", \"id\": \"$id\", \"serial\": \"$id\", \"lat\": $lat, \"lon\": $lon}" ||
+    fail "$m"
+  python3 -I -c '
+import json, sys
+ls = [json.loads(l) for l in open(sys.argv[1], "rb")]
+bad = [o for o in ls if o.get("type") != sys.argv[2] or not o.get("id")]
+assert not bad, f"lines of another type or with no id: {bad[:2]!r}"
+print(f"ok: {len(ls)} line(s), all {sys.argv[2]} with an id")' "$d/$m.jsonl" "$type" || fail "$m"
+  only "$m" sonde.update || fail "$m"
+  # each sonde mode reports its own type only: the other two find the same sonde and write nothing
+  for o in rs41 dfm m20; do
+    [ "$o" != "$m" ] || continue
+    "$bin" --mode "$o" --rate 2000000 --format cf32 <"$d/$m.iq" >"$d/$m-as-$o.jsonl" 2>"$d/$m-as-$o.err" ||
+      fail "$m as $o: $(tail -n 3 "$d/$m-as-$o.err")"
+    [ ! -s "$d/$m-as-$o.jsonl" ] || fail "$o wrote a line for the $type sonde: $(head -n 1 "$d/$m-as-$o.jsonl")"
+  done
+  echo "ok: rs41, dfm and m20 other than $m write nothing for the $type sonde"
+  rm -f "$d/$m.iq"
 done
 
 # the joiner of multi-sentence messages on its own (onair-gen links onair-rx's)

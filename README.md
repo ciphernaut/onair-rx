@@ -19,13 +19,15 @@ onair-rx --lua > onair.lua     # OnAir's Wireshark Lua dissector (USER0 is Mode 
 onair-rx --version
 ```
 
-Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs` and `ais` (below).
+Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm` and `m20`
+(below).
 
 - **stdin:** interleaved little-endian IQ at `--rate` Hz, `cf32` (the default) or `cs16`, the signal's channel at
-  0 Hz. The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); POCSAG, FLEX and ACARS 1 MHz; APRS 240 kHz;
-  AIS 250 kHz. A rate below the mode's exits 2 with one line saying so.
-- **`--freq HZ`:** the radio frequency at 0 Hz of the input. Every mode takes it; ACARS and AIS need it (they place
-  their channels by frequency) and exit 2 with `onair-rx: <mode> needs --freq HZ` without it, before reading any input.
+  0 Hz (HFDL: its dial frequency at 0 Hz). The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); the bus
+  modes' are in the table below. A rate below the mode's exits 2 with one line saying so.
+- **`--freq HZ`:** the radio frequency at 0 Hz of the input. Every mode takes it; ACARS, AIS, VDL2 and HFDL need it
+  (they place their channels by frequency) and exit 2 with `onair-rx: <mode> needs --freq HZ` without it, before
+  reading any input.
   AIS also exits 2, before reading input, with `onair-rx: ais: no AIS channel within <rate> Hz of <freq> Hz` when the
   input does not hold AIS 1 (161.975 MHz) or AIS 2 (162.025 MHz) as OnAir's receiver needs them: the middle of the two,
   162.000 MHz, 40 kHz inside the edge of the input's band (`--freq` plus or minus 0.49 times `--rate`).
@@ -42,7 +44,21 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs` and `ais` (be
 - **stdout, bus modes:** one JSON object per event OnAir's receiver puts on its automation bus, flushed per line:
   the event's fields as members (whole numbers without a decimal point, a non-finite number left out), plus `event`
   (the bus type) and `t_sample` (the index of the first sample of the block of 16384 whose decoding produced it).
-  Strings are written byte by byte, a byte above 0x7e as `\u00XX`. What each mode adds:
+  Strings are written byte by byte, a byte above 0x7e as `\u00XX`. The modes:
+
+  | mode | OnAir receiver | minimum rate | `--freq` | bus event (its fields) | what onair-rx adds |
+  |---|---|---|---|---|---|
+  | `pocsag` | `PagerReceiver` (POCSAG) | 1 MHz | no | `pager.message` (`protocol`, `speed`, `address`, `function`, `type`, `text`, `damaged`) | `baud`; POCSAG pages only |
+  | `flex` | `PagerReceiver` (FLEX) | 1 MHz | no | `pager.message` (the same) | `baud`, `levels`; FLEX pages only |
+  | `acars` | `AcarsReceiver` | 1 MHz | yes: the channel | `acars.message` (`tail`, `flight`, `label`, `text`, `downlink`, `msg_num`, `lat`, `lon`) | nothing |
+  | `aprs` | `PacketReceiver` | 240 kHz | no | `aprs.packet` (`from`, `to`, `info`, `type`, `summary`, `lat`, `lon`); also `aprs.message` | `path`, `fcs_ok` |
+  | `ais` | `AisReceiver` | 250 kHz | yes: AIS 1 or 2 inside the band | none: `ais.message` from the hub's sentences | the whole line |
+  | `vdl2` | `Vdl2Receiver` | 250 kHz | yes: the channel | `vdl2.message` (`src`, `dst`, `from_air`, `proto`, `summary`, `frame`) | `icao`, `addr_type` |
+  | `hfdl` | `HfdlReceiver` | 24 kHz | yes: the dial frequency | `hfdl.message` (`kind`, `summary`, `icao`, `uplink`, `snr_db`) | `icao` left out when the bus has none |
+  | `rs41`, `dfm`, `m20` | `SondeReceiver` | 2 MHz | no (taken) | `sonde.update` (`serial`, `type`, `lat`, `lon`, `alt_m`, `vspeed_ms`, `hspeed_ms`, `temp_c`, `batt_v`, `sats`) | `id`; that type's sondes only |
+
+  AIS, VDL2, HFDL and the sondes write only the event of their row: any other event their receiver puts on the bus is
+  dropped. In more detail:
   - `pocsag`, `flex` (`pager.message`: `protocol`, `speed`, `address`, `function`, `type`, `text`, `damaged`):
     `baud` from the speed, and for FLEX `levels` (2 or 4). Each mode decodes its own protocol only.
   - `acars` (`acars.message`: `tail`, `flight`, `label`, `text`, `downlink`, `msg_num`, `lat`, `lon`): nothing; the
@@ -51,8 +67,9 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs` and `ais` (be
     array of strings, and `fcs_ok`: OnAir passes on only frames whose check sequence was right or that it repaired
     until it was, and marks a repaired frame in its summary; `fcs_ok` is false for those.
   - `ais`: one line per AIS message, made from the NMEA 0183 sentences OnAir's receiver hands its Wireshark hub
-    (`src/ais.cpp`), not from the bus: its station summaries (`ais.vessel`) are dropped, its other events (such as
-    `ais.anomaly`) stay lines as in the other bus modes. A message's line has `event` `ais.message`, `mmsi`,
+    (`src/ais.cpp`), not from the bus: every line is an `ais.message`, and the receiver's own bus events (the station
+    summaries `ais.vessel`, and `ais.anomaly`, `ais.behaviour`, `ais.cpa`, `ais.geofence`, which OnAir makes of the
+    messages over time) are all dropped. A message's line has `event` `ais.message`, `mmsi`,
     `msg_type`, `channel` (`A` for AIS 1, `B` for AIS 2), `repeat` and `nmea` (the message's sentences, without line
     ends), and `lat`, `lon`, `sog_kt`, `cog_deg`, `heading_deg`, `nav_status`, `name`,
     `callsign`, `destination`, `imo` and `ship_type` when the message type carries them and does not give them as not
@@ -61,6 +78,28 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs` and `ais` (be
     the one before it (by channel and sequence id) ends that message without a line, and a channel's complete message
     forgets the channel's parts still waiting. The receiver decodes AIS 1 and 2, whichever of them the input holds
     (one is enough, so `--freq` may be either channel's own frequency), not the long-range channels 75 and 76.
+  - `vdl2`: the receiver decodes the one channel at `--freq` (OnAir's default list, the European set, is not used),
+    a 25 kHz channel at 0 Hz of the input. `icao` is the aircraft's address of the frame, six upper-case hex digits:
+    the source of a downlink (`from_air`), the destination of an uplink; a ground station's frame to all stations
+    (destination `FFFFFF`, such as its GSIF) names no aircraft, and its `icao` is the station's own address.
+    `addr_type` says which `icao` is, in dumpvdl2's words: `Aircraft` or `Ground station`. (The bus carries no
+    address types; they follow from `from_air` and the broadcast address.) `frame` is the AVLC frame (`I`, `RR`,
+    `XID`, `GSIF` ...), `proto` what it carries (`ACARS`, `X.25`, `CLNP`, `XID`, `COTP`, or empty).
+  - `hfdl`: `--freq` is the channel's dial frequency, the one HFDL's frequency lists give, and the input is centred
+    on it: the receiver takes the carrier 1440 Hz above the dial frequency (OnAir's `kHfdlCarrierHz`), as a USB
+    receiver tuned to the listed frequency hears it, so a band of 6 kHz around `--freq` holds it. The one channel at
+    `--freq` is decoded, not OnAir's station table. `icao` is absent on a frame that names no aircraft (a squitter);
+    `kind` is the PDU (`SPDU` for a squitter, `Logon request` ...).
+  - `rs41`, `dfm`, `m20`: the receiver finds the sondes in the band by their carriers, opens a channel on each and
+    tells the type from the frame sync, so the sonde may sit anywhere in the band, at 0 Hz too (as a 12.5 kHz channel
+    resampled up to 2 MHz has it); nothing is set but the rate (and the centre, with `--freq`, for the bus's
+    frequency). Each mode keeps the events of its own type (`type` `RS41`, `DFM` or `M20`) and drops the others'. An
+    event comes with a frame that has a position, at most every 5 s per sonde (OnAir's own pace); one before the
+    sonde's serial is known is dropped, so that every line has `id` (the serial). The receiver runs inside `feed()`
+    (OnAir's synchronous mode), so that nothing is dropped when the input comes faster than real time.
+
+  Not on the generic path: none of the modes so far. A receiver that needs more than a channel, a centre and a type
+  filter (a second channel, an engine of its own) gets a line here saying what it needed.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic
   pcap stream: the file header, then one record per frame. ADS-B: 7 or 14 bytes, link type 147 (USER0), and every
   JSON line has exactly one record. APRS: the AX.25 frame as OnAir's Wireshark hub gets it (link type 3), also a
@@ -86,10 +125,11 @@ test/run.sh                               # needs iq/adsb1090.sigmf-data (cf32, 
 test/bus.sh                               # the bus modes on OnAir's own test signals (_build/onair-gen)
 ```
 
-`build.sh` also builds `_build/onair-gen` (`test/gen.cpp`): `onair-gen --mode pocsag|flex|acars|aprs|ais --rate HZ
-[--freq HZ] [--text TEXT]` writes cf32 IQ of one known message from OnAir's test-signal generator for the mode (AIS:
-a position report on AIS 1 and a static report on AIS 2), with a second of noise either side, and says on stderr where
-the message is. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links.
+`build.sh` also builds `_build/onair-gen` (`test/gen.cpp`): `onair-gen --mode
+pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT]` writes cf32 IQ of one known
+message from OnAir's test-signal generator for the mode (AIS: a position report on AIS 1 and a static report on AIS 2;
+VDL2: a downlink, an uplink and a ground station's GSIF; HFDL: a squitter and a logon request; a sonde: 12 s of one
+sonde of OnAir's scene, moved to 0 Hz), with a second of noise either side, and says on stderr where the message is. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links.
 
 The OnAir checkout is never changed. `build.sh` builds OnAir from `_onair-src`, a copy of `$ONAIR_SRC` with every
 `patches/*.patch` applied in name order (`git apply`). The copy is remade when the checkout's commit or a patch's

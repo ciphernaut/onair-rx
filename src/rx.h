@@ -107,7 +107,8 @@ public:
     Json& flag(const char* k, bool v);
     Json& arr(const char* k, const std::vector<std::string>& v);   // an array of strings
     Json& raw(const char* k, const std::string& json);             // a value already written as JSON
-    bool has(const std::string& k) const;                          // a member of that name is there
+    Json& omit(const char* k) { keys_.emplace_back(k); return *this; }   // k is left out: has(k) is then true, nothing is written
+    bool has(const std::string& k) const;                          // a member of that name is there (or omitted)
     std::string done() const { return s_ + "}"; }
 private:
     void key(const char* k);

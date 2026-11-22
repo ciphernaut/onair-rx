@@ -13,8 +13,11 @@
 #include "dect2/ais/ais_longrange.h"
 #include "dect2/ais/ais_rx.h"
 #include "dect2/automation/engine.h"
+#include "dect2/hfdl/hfdl_rx.h"
 #include "dect2/packet/packet_rx.h"
 #include "dect2/pager/pager_rx.h"
+#include "dect2/sonde/sonde_rx.h"
+#include "dect2/vdl2/vdl2_rx.h"
 #include "dect2/wirecap/wire.h"
 #include <algorithm>
 #include <cmath>
@@ -121,7 +124,8 @@ bool shapeAprs(const automation::Event& e, Json& j) {
 // frequencies and decodes the ones the input holds: one of them is enough. It needs the pair's middle (162.000 MHz) 40 kHz inside
 // the input's edge (ais::aisChannelsCovered), so a centre where that fails is refused rather than run deaf. The long-range
 // channels 75 and 76 (message 27, for satellites) are left out. A line per message comes from the hub's sentences (ais.cpp);
-// of the bus's events, the station summaries (ais.vessel, every few seconds) are dropped, the others stay lines.
+// the bus's AIS events (ais.vessel, ais.anomaly, ais.behaviour, ais.cpa, ais.geofence: what OnAir makes of the messages over
+// time) are all dropped, so that the mode writes only ais.message lines.
 bool openAis(const Options& o, Feed* feed, std::string* err) {
     auto rx = std::make_shared<AisReceiver>();
     rx->setCenterHz(o.freq);
@@ -135,7 +139,7 @@ bool openAis(const Options& o, Feed* feed, std::string* err) {
     }
     return true;
 }
-bool shapeAis(const automation::Event& e, Json&) { return e.type != "ais.vessel"; }
+bool shapeAis(const automation::Event&, Json&) { return false; }
 std::function<bool(const uint8_t*, size_t, Json&)> aisPackets() {
     auto joiner = std::make_shared<AisJoiner>();
     return [joiner](const uint8_t* p, size_t n, Json& j) {
@@ -143,6 +147,71 @@ std::function<bool(const uint8_t*, size_t, Json&)> aisPackets() {
         return sentences && aisLine(*sentences, j);
     };
 }
+
+// --- VDL2: OnAir's Vdl2Receiver with the one channel named: the input's centre (an empty list would be the European set)
+bool openVdl2(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<Vdl2Receiver>();
+    rx->setCenterHz(o.freq);
+    rx->setChannels({o.freq});
+    return start(rx, o, "vdl2", vdl2Tuning().minSampleRate, feed, err);
+}
+bool flagOf(const automation::Event& e, const char* k) {
+    const automation::Value* v = field(e, k);
+    return v && v->t == automation::Value::Bool && v->b;
+}
+// icao: the aircraft's address of the frame: the source of a downlink (from_air), the destination of an uplink. A ground
+// station's frame to all stations (destination FFFFFF) has no aircraft: its icao is the station's own address. addr_type says
+// which of the two icao is, in dumpvdl2's words ("Aircraft", "Ground station"); the bus does not carry the address types, so
+// it follows from from_air and the broadcast address. Only vdl2.message events are lines.
+bool shapeVdl2(const automation::Event& e, Json& j) {
+    if (e.type != "vdl2.message") return false;
+    const std::string src = text(e, "src"), dst = text(e, "dst");
+    if (flagOf(e, "from_air")) j.str("icao", src).str("addr_type", "Aircraft");
+    else if (dst == "FFFFFF") j.str("icao", src).str("addr_type", "Ground station");
+    else j.str("icao", dst).str("addr_type", "Aircraft");
+    return true;
+}
+
+// --- HFDL: OnAir's HfdlReceiver with the one channel named by its dial frequency: the input's centre. The receiver puts the
+// carrier 1440 Hz above the dial frequency (kHfdlCarrierHz), so the input is centred on the dial frequency, as a USB receiver
+// tuned to the listed frequency has it. Only hfdl.message events are lines; the bus's empty icao (a frame that names no
+// aircraft, such as a squitter) is left out.
+bool openHfdl(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<HfdlReceiver>();
+    rx->setCenterHz(o.freq);
+    rx->setChannels({o.freq});
+    return start(rx, o, "hfdl", hfdlTuning().minSampleRate, feed, err);
+}
+bool shapeHfdl(const automation::Event& e, Json& j) {
+    if (e.type != "hfdl.message") return false;
+    if (text(e, "icao").empty()) j.omit("icao");
+    return true;
+}
+
+// --- radiosondes: OnAir's SondeReceiver, which finds the carriers in the band, opens a channel on each and tells the type
+// from the frame sync; one mode per type keeps only that type's sonde.update events. It runs synchronously (inside feed(),
+// so that its events come on this thread and no sample is dropped when the input runs faster than real time). With --freq
+// its events carry absolute frequencies (an L-band centre would lower its minimum rate to 1 MHz). id is the bus's serial;
+// an event before the sonde's serial is known is dropped.
+bool openSonde(const Options& o, Feed* feed, std::string* err, const char* name) {
+    auto rx = std::make_shared<SondeReceiver>();
+    rx->setSynchronous(true);
+    if (o.freq > 0) rx->setCenterMhz(o.freq * 1e-6);
+    return start(rx, o, name, sondeMinSampleRateHz(o.freq * 1e-6), feed, err);
+}
+bool openRs41(const Options& o, Feed* feed, std::string* err) { return openSonde(o, feed, err, "rs41"); }
+bool openDfm(const Options& o, Feed* feed, std::string* err) { return openSonde(o, feed, err, "dfm"); }
+bool openM20(const Options& o, Feed* feed, std::string* err) { return openSonde(o, feed, err, "m20"); }
+bool shapeSonde(const automation::Event& e, Json& j, const char* type) {
+    if (e.type != "sonde.update" || text(e, "type") != type) return false;
+    const std::string serial = text(e, "serial");
+    if (serial.empty()) return false;
+    j.str("id", serial);
+    return true;
+}
+bool shapeRs41(const automation::Event& e, Json& j) { return shapeSonde(e, j, "RS41"); }
+bool shapeDfm(const automation::Event& e, Json& j) { return shapeSonde(e, j, "DFM"); }
+bool shapeM20(const automation::Event& e, Json& j) { return shapeSonde(e, j, "M20"); }
 
 // a bus value as a member: whole numbers without a decimal point, a non-finite number or a null left out
 void member(Json& j, const std::string& k, const automation::Value& v) {
@@ -166,6 +235,11 @@ const BusMode kBusModes[] = {
     {"acars", -1, true, openAcars, nullptr, nullptr, nullptr},
     {"aprs", wire::Aprs, false, openAprs, shapeAprs, nullptr, nullptr},
     {"ais", wire::Ais, true, openAis, shapeAis, "ais.message", aisPackets},
+    {"vdl2", -1, true, openVdl2, shapeVdl2, nullptr, nullptr},
+    {"hfdl", -1, true, openHfdl, shapeHfdl, nullptr, nullptr},
+    {"rs41", -1, false, openRs41, shapeRs41, nullptr, nullptr},
+    {"dfm", -1, false, openDfm, shapeDfm, nullptr, nullptr},
+    {"m20", -1, false, openM20, shapeM20, nullptr, nullptr},
 };
 const size_t kBusModeCount = sizeof kBusModes / sizeof kBusModes[0];
 
