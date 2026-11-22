@@ -13,6 +13,9 @@ namespace onair_rx {
 
 const PollMode kPollModes[] = {
     {"rds", "rds.group", 0, openRds},
+    {"dmr", "voice.call", 0.25, openDmr},   // the voice receivers publish their snapshot every 0.25 s of signal
+    {"p25", "voice.call", 0.25, openP25},
+    {"m17", "voice.call", 0.25, openM17},
 };
 const size_t kPollModeCount = sizeof kPollModes / sizeof kPollModes[0];
 

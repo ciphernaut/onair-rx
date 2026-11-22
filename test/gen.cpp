@@ -6,9 +6,11 @@
 //
 //   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO]
 //   onair-gen --mode rds --rate HZ [--ps PS] [--rt RT]
+//   onair-gen --mode dmr|p25|m17 --rate HZ
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
 //   onair-gen --selftest json-utf8    onair-rx's UTF-8 text writer (src/json.cpp, Json::utf8) on valid and broken UTF-8
+//   onair-gen --selftest calls        onair-rx's call keying (src/calls.h, CallLog) on snapshots made here
 //
 // The known messages: POCSAG address 1234567 function 3 "HELLO ZETA" at 1200 baud (alphanumeric); FLEX capcode 1234567
 // "HELLO ZETA" (alphanumeric, 1600/2); ACARS tail VH-ZET label H1 flight ZET001 ("HELLO ZETA" after the message number and
@@ -24,6 +26,12 @@
 // RDS: an FM station with PI 2AB1, PS "ZETA FM " and RT "HELLO FROM ZETASDR" for 6 s (rdsSignal); --ps and --rt replace the
 // name and the text (bytes of the RDS character set). --freq, --text and --info are not taken with rds, nor --ps and --rt
 // with another mode.
+// The voice modes, one call each with the values of the node's own check (its rows' test): DMR, a handheld's group call in
+// direct mode on time slot 1 (OnAir's single-transmission path), colour code 5, from 9990001 to talkgroup 9990, three
+// superframes; P25 phase 1, a group call of NAC 0x123 from 9990001 to talkgroup 65000, three LDU1/LDU2 pairs with its header
+// and terminator; M17, a voice stream (3200 bps) from VK4ZET to ALL (the broadcast address) on CAN 0, 25 frames, its voice the
+// generator's known pattern (not Codec 2, so the signal is the same whether the system has the library or not). A voice mode
+// takes none of the options.
 // The channel is at 0 Hz of the output, as onair-rx expects it: the pager and packet generators put it at their mode's tune
 // offset, which is cancelled here; ACARS is generated for one channel at --freq (default 131.525 MHz) with the centre there;
 // AIS 1 and 2 are placed by their frequencies (161.975 and 162.025 MHz) around --freq (default 162 MHz, between the two).
@@ -34,16 +42,21 @@
 // last sample (ACARS: the burst the generator logs; a sonde: the whole 12 s), a second of silence is put either side, and noise
 // is added over the whole at 25 dB carrier to noise in 25 kHz (the carrier: the mean power of the samples above -120 dB, so
 // AIS's gap between its bursts, and a sonde's between its frames, do not count). stderr says where the message is: "message
-// from A s to B s".
+// from A s to B s". A voice mode's call is sent twice, 2 s of silence between, as the node's check source repeats its
+// capture: "message from A s to B s and again from C s to D s".
 #include "ais.h"
 #include "bus.h"
+#include "calls.h"
 #include "dect2/acars/acars_gen.h"
 #include "dect2/ais/ais_gen.h"
 #include "dect2/ais/ais_proto.h"
+#include "dect2/dmr/dmr_gen.h"
 #include "dect2/dsp/gen_util.h"
 #include "dect2/fm/fm_gen.h"
 #include "dect2/hfdl/hfdl_gen.h"
 #include "dect2/hfdl/hfdl_proto.h"
+#include "dect2/m17/m17_gen.h"
+#include "dect2/p25/p25_gen.h"
 #include "dect2/packet/packet_gen.h"
 #include "dect2/packet/packet_rx.h"
 #include "dect2/pager/pager_gen.h"
@@ -68,13 +81,15 @@ using namespace dect2;
 namespace {
 
 constexpr double kPadSec = 1.0;
+constexpr double kRepeatGapSec = 2.0;   // a voice mode's call is sent twice, this much silence between
 constexpr double kSnrDb = 25;   // carrier to noise in 25 kHz
 constexpr size_t kChunk = 1 << 14;
 
 int usage() {
     fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO] > iq\n"
                     "       onair-gen --mode rds --rate HZ [--ps PS] [--rt RT] > iq\n"
-                    "       onair-gen --selftest ais-join|sonde-id|json-utf8\n");
+                    "       onair-gen --mode dmr|p25|m17 --rate HZ > iq\n"
+                    "       onair-gen --selftest ais-join|sonde-id|json-utf8|calls\n");
     return 2;
 }
 
@@ -299,6 +314,83 @@ std::vector<cf32> rdsSignal(double rate, const std::string& ps, const std::strin
     return out;
 }
 
+// --- the voice modes: one call of OnAir's generator for the mode, without noise, made for kVoiceSec (the call and the
+// generator's silence after it) and cut to the call. The values are the node's check values (its rows' test)
+constexpr double kVoiceSec = 3;
+constexpr double kChannelSec = 4;   // --channel: a repeater's downlink or a control channel this long
+constexpr uint32_t kVoiceSrc = 9990001;
+template <class G>
+std::vector<cf32> voiceCut(G& g, double rate, double sec = kVoiceSec) {
+    std::vector<cf32> all((size_t)(sec * rate));
+    g.generate(all.data(), all.size());
+    return trim(all);
+}
+// DMR: OnAir's single transmission (dmr_gen.h, txEnable), a handheld in direct mode on time slot 1; with channel, a
+// repeater's downlink instead, both slots continuous, its traffic quiet and no text messages
+std::vector<cf32> dmrSignal(double rate, bool channel) {
+    DmrGenConfig c;
+    c.rate = rate;
+    c.cc = 5;
+    c.snrDb = 1000;        // no noise of its own: its level underflows to exactly 0, so the silence around the call is zeros
+    if (channel) {
+        c.traffic = 1;
+        c.textMessages = false;
+        DmrSignal g(c);
+        std::vector<cf32> all((size_t)(kChannelSec * rate));
+        g.generate(all.data(), all.size());
+        return all;
+    }
+    c.txEnable = true;
+    c.txCallType = 0;      // group voice
+    c.txSrc = kVoiceSrc;
+    c.txDst = 9990;
+    c.txSlot = 1;
+    c.txMobile = false;    // direct-mode sync patterns, which name the time slot
+    c.txVoiceSuper = 3;
+    DmrSignal g(c);
+    return voiceCut(g, rate);
+}
+// P25 phase 1: one group call (p25_gen.h), header, three LDU1/LDU2 pairs (0.36 s each) and terminator, played once; with
+// channel, a trunked site's control channel of the same NAC for kChannelSec instead
+std::vector<cf32> p25Signal(double rate, bool channel) {
+    P25GenConfig c;
+    c.rate = rate;
+    c.snrDb = 99;          // no noise of its own
+    c.loop = false;
+    P25GenTx t;
+    t.kind = P25GenTx::Voice;
+    t.nac = 0x123;
+    t.src = (int)kVoiceSrc;
+    t.dst = 65000;
+    t.group = true;
+    t.durSec = 3 * 0.36;
+    if (channel) {
+        t.kind = P25GenTx::Control;
+        t.durSec = kChannelSec;
+    }
+    c.txs = {t};
+    P25Generator g(c);
+    return voiceCut(g, rate, channel ? kChannelSec + 1 : kVoiceSec);
+}
+// M17: one voice stream (m17_gen.h), 25 frames of 40 ms, its voice the known pattern (voice false); "@ALL" is OnAir's
+// spelling of the broadcast address, which the node spells ALL
+std::vector<cf32> m17Signal(double rate) {
+    M17GenConfig c;
+    c.rate = rate;
+    c.snrDb = 99;          // no noise of its own
+    c.loop = false;
+    c.voice = false;
+    M17GenTx t;
+    t.src = "VK4ZET";
+    t.dst = "@ALL";
+    t.can = 0;
+    t.dataType = 2;        // voice, 3200 bps
+    t.durSec = 25 * 0.04;
+    c.txs = {t};
+    M17Generator g(c);
+    return voiceCut(g, rate);
+}
+
 // --- the joiner's own test: sentences in as the hub has them (with their line ends), messages out
 int selftestAisJoin() {
     int fails = 0;
@@ -395,6 +487,77 @@ int selftestJsonUtf8() {
     return fails ? 1 : 0;
 }
 
+// --- the call keying (src/calls.h, CallLog): successive snapshots in, lines out
+int selftestCalls() {
+    using onair_rx::CallLog;
+    using onair_rx::CallSeen;
+    using onair_rx::Json;
+    int fails = 0;
+    auto members = [](long long src, const char* alias = nullptr) {
+        Json j;
+        j.num("src", src);
+        if (alias) j.str("alias", alias);
+        return j;
+    };
+    // the lines of one poll of these entries, each ended by a line end
+    auto see = [](CallLog& log, const std::vector<CallSeen>& now) {
+        std::vector<Json> lines;
+        log.see(now, lines);
+        std::string s;
+        for (const Json& l : lines) s += l.done() + "\n";
+        return s;
+    };
+    auto finish = [](CallLog& log) {
+        std::vector<Json> lines;
+        log.finish(lines);
+        std::string s;
+        for (const Json& l : lines) s += l.done() + "\n";
+        return s;
+    };
+    auto check = [&fails](const std::string& got, const std::string& want, const char* what) {
+        printf("%s: %s\n", got == want ? "ok" : "FAIL", what);
+        if (got != want) printf("  got:\n%s  want:\n%s", got.c_str(), want.c_str());
+        fails += got != want;
+    };
+    const std::string a = "{\"src\":1,\"eot\":false}\n", aEnd = "{\"src\":1,\"eot\":true}\n";
+    const std::string aAlias = "{\"src\":1,\"alias\":\"Z\",\"eot\":false}\n", aAliasEnd = "{\"src\":1,\"alias\":\"Z\",\"eot\":true}\n";
+    const std::string b = "{\"src\":2,\"eot\":false}\n", bEnd = "{\"src\":2,\"eot\":true}\n";
+    {
+        CallLog log;
+        std::string s;
+        for (int i = 0; i < 3; i++) s += see(log, {{"a", members(1), false}});
+        check(s, a, "a call seen in three polls with the same members gives one line");
+        check(see(log, {{"a", members(1, "Z"), false}}), aAlias, "a member that changes gives the call's members again");
+        check(see(log, {{"a", members(1, "Z"), true}}), aAliasEnd, "a call marked ended gives its last members with eot true");
+        s.clear();
+        for (int i = 0; i < 3; i++) s += see(log, {{"a", members(1, "Z"), true}});
+        check(s, "", "an ended call still in the log gives nothing more");
+        check(see(log, {{"a", members(1), false}}), a, "the same key open again after its end is a new call: a new first line");
+        s = see(log, {});
+        s += see(log, {});
+        check(s, aEnd, "a call that leaves the log without being marked ended gives one last line");
+        check(see(log, {{"a", members(1), false}}), a, "the same key back after it left the log is a new call");
+    }
+    {
+        CallLog log;
+        see(log, {{"a", members(1), true}});
+        std::string s = see(log, {});   // in turn: the operands of + are not sequenced
+        s += see(log, {{"b", members(2), false}});
+        check(s, b, "an ended call that ages out of the log gives nothing");
+        check(see(log, {{"b", members(2), false}, {"c", members(3), true}}),
+              "{\"src\":3,\"eot\":false}\n{\"src\":3,\"eot\":true}\n", "a call first seen ended gives its first and its last line at once");
+        check(finish(log), bEnd, "finish ends the call still open");
+        check(finish(log), "", "finish ends it once");
+    }
+    {
+        CallLog log;
+        check(see(log, {{"a", members(1), false}, {"b", members(2), false}}), a + b, "two calls at once: a first line each");
+        check(see(log, {{"b", members(2), false}}), aEnd, "one of them leaving the log ends that one only");
+        check(see(log, {{"b", members(2), true}, {"a", members(1), false}}), bEnd + a, "lines in the snapshot's order");
+    }
+    return fails ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -402,15 +565,17 @@ int main(int argc, char** argv) {
         if (std::string(argv[2]) == "ais-join") return selftestAisJoin();
         if (std::string(argv[2]) == "sonde-id") return selftestSondeId();
         if (std::string(argv[2]) == "json-utf8") return selftestJsonUtf8();
+        if (std::string(argv[2]) == "calls") return selftestCalls();
         return usage();
     }
     std::string mode, text = "HELLO ZETA", info, ps = "ZETA FM ", rt = "HELLO FROM ZETASDR";
-    bool haveText = false, haveInfo = false, haveStation = false;
+    bool haveText = false, haveInfo = false, haveStation = false, channel = false;
     double rate = 0, freq = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         const bool val = i + 1 < argc;
         if (a == "--mode" && val) mode = argv[++i];
+        else if (a == "--channel") channel = true;
         else if (a == "--rate" && val) rate = atof(argv[++i]);
         else if (a == "--freq" && val) { freq = atof(argv[++i]); if (freq <= 0) return usage(); }
         else if (a == "--text" && val) { text = argv[++i]; haveText = true; }
@@ -421,7 +586,9 @@ int main(int argc, char** argv) {
     }
     if (rate <= 0) return usage();
     // each option belongs to its modes: one another mode would ignore is refused
-    if (mode == "rds" ? freq || haveText || haveInfo : haveStation) return usage();
+    const bool voice = mode == "dmr" || mode == "p25" || mode == "m17";
+    if (mode == "rds" ? freq || haveText || haveInfo : voice ? freq || haveText || haveInfo || haveStation : haveStation) return usage();
+    if (channel && mode != "dmr" && mode != "p25") return usage();
     if (!freq) freq = mode == "ais" ? 162e6 : 131.525e6;
     if (mode == "rds") {   // a polled mode's station is written as it is made: no cut, no silence, no added noise
         const std::vector<cf32> x = rdsSignal(rate, ps, rt);
@@ -441,6 +608,9 @@ int main(int argc, char** argv) {
     else if (mode == "vdl2") msg = vdl2Signal(rate, text);   // VDL2's, HFDL's and a sonde's signal is the same at any --freq
     else if (mode == "hfdl") msg = hfdlSignal(rate);
     else if (mode == "rs41" || mode == "dfm" || mode == "m20") msg = sondeSignal(rate, mode);
+    else if (mode == "dmr") msg = dmrSignal(rate, channel);
+    else if (mode == "p25") msg = p25Signal(rate, channel);
+    else if (mode == "m17") msg = m17Signal(rate);
     else return usage();
     if (msg.empty()) { fprintf(stderr, "onair-gen: no %s signal at %.0f Hz\n", mode.c_str(), rate); return 1; }
 
@@ -450,15 +620,19 @@ int main(int argc, char** argv) {
         if (std::norm(v) > 1e-12) { power += std::norm(v); on++; }
     const double carrier = std::sqrt(power / (double)on);
     const size_t pad = (size_t)std::llround(kPadSec * rate);
-    std::vector<cf32> out(pad + msg.size() + pad, cf32(0.f, 0.f));
+    const size_t again = voice ? pad + msg.size() + (size_t)std::llround(kRepeatGapSec * rate) : 0;   // where the second call starts
+    std::vector<cf32> out((voice ? again : pad) + msg.size() + pad, cf32(0.f, 0.f));
     std::copy(msg.begin(), msg.end(), out.begin() + (long)pad);
+    if (voice) std::copy(msg.begin(), msg.end(), out.begin() + (long)again);
     genutil::NoiseSource noise(7);
     noise.add(out.data(), out.size(), (float)(carrier * std::sqrt(rate / (2 * 25000.0 * std::pow(10.0, kSnrDb / 10)))));
     if (fwrite(out.data(), sizeof(cf32), out.size(), stdout) != out.size() || fflush(stdout) != 0) {
         fprintf(stderr, "onair-gen: stdout: %s\n", strerror(errno));
         return 1;
     }
-    fprintf(stderr, "onair-gen: %s message from %.3f s to %.3f s, %zu samples at %.0f Hz\n", mode.c_str(), (double)pad / rate,
-            (double)(pad + msg.size()) / rate, out.size(), rate);
+    char twice[96] = "";
+    if (voice) snprintf(twice, sizeof twice, " and again from %.3f s to %.3f s", (double)again / rate, (double)(again + msg.size()) / rate);
+    fprintf(stderr, "onair-gen: %s message from %.3f s to %.3f s%s, %zu samples at %.0f Hz\n", mode.c_str(), (double)pad / rate,
+            (double)(pad + msg.size()) / rate, twice, out.size(), rate);
     return 0;
 }

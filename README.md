@@ -20,7 +20,7 @@ onair-rx --version
 ```
 
 Modes: `adsb`, the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm` and `m20`, and
-the polled mode `rds` (below).
+the polled modes `rds`, `dmr`, `p25` and `m17` (below).
 
 - **stdin:** interleaved little-endian IQ at `--rate` Hz, `cf32` (the default) or `cs16`, the signal's channel at
   0 Hz (HFDL: its dial frequency at 0 Hz). The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); the bus
@@ -122,14 +122,17 @@ the polled mode `rds` (below).
   per line for what is new or has changed since the last poll; one more poll runs at the end of input, so that what
   the last block completed is written. Every line has `event` (the mode's) and `t_sample` (the index of the first
   sample of the block after which the poll ran), a member only when its value is known, whole numbers without a
-  decimal point. Text the receiver hands over in UTF-8 (`ps`, `rt`) is written as UTF-8, escaping only a quote, a
-  backslash and a control character; text that is not valid UTF-8 is written byte by byte as above, so a line is
-  always valid JSON. None of them has packets: `--pcap-port` exits 2 with
+  decimal point. Text the receiver hands over in UTF-8 (`ps`, `rt`, `alias`) is written as UTF-8, escaping only a
+  quote, a backslash and a control character; text that is not valid UTF-8 is written byte by byte as above, so a line
+  is always valid JSON. None of them has packets: `--pcap-port` exits 2 with
   `onair-rx: <mode> has no packets (no --pcap-port)`, before reading any input. The modes:
 
   | mode | OnAir receiver | minimum rate | poll | event | members |
   |---|---|---|---|---|---|
   | `rds` | `FmReceiver` | 500 kHz | every block | `rds.group` | `pi`, `group`, `pty`, `tp`, `ps`, `rt` |
+  | `dmr` | `DmrReceiver` (`configureChannel`) | 48 kHz | 0.25 s | `voice.call` | a call: `type`, `src`, `dst`, `call`, `color_code`, `slot`, `encrypted`, `emergency`, `silent`, `alias`, `eot`; a channel: `type`, `color_code`, `control`, `network` |
+  | `p25` | `P25Receiver` (phase 1) | 250 kHz | 0.25 s | `voice.call` | a call: `type`, `src`, `dst`, `call`, `nac`, `encrypted`, `emergency`, `silent`, `algid`, `kid`, `eot`; a channel: `type`, `nac`, `control`, `network` |
+  | `m17` | `M17Receiver` | 250 kHz | 0.25 s | `voice.call` | `src`, `dst`, `can`, `type`, `encryption`, `lat`, `lon`, `eot` |
 
   - `rds`: the FM station at 0 Hz of the input (OnAir's station finder is off, so the station is the one at the
     centre however weak; the receiver is silent, no sound device is opened). One line per RDS group from the
@@ -140,6 +143,42 @@ the polled mode `rds` (below).
     every 0.1 s of signal): `ps`, the programme service name, once all its segments came, and `rt`, the radiotext,
     once it is complete; each is absent until then. Both are UTF-8, read by OnAir from the station's character set
     (EBU Latin, or GB2312 when the bytes pair up as it): a station's `Rádio` is `Rádio`.
+  - `dmr`, `p25`, `m17` (`voice.call`): the channel at 0 Hz of the input, a call per line as the receiver's call log
+    has it (its snapshot, published every 0.25 s of signal, holds the calls that ended, the oldest aged out, and the one
+    going on). A call gives one line when it is first seen, one when a member of it changes (a talker alias that comes
+    late, the encryption flag) and one when it ends (`eot` true; false on the others): when the log marks it over, or,
+    if it ages out of the log first, when it is gone; the last poll at EOF ends a call still open. A call that stays up
+    gives no line per poll, and an ended call that stays in the log gives none. A call is keyed by where it was heard
+    (DMR: its time slot) and when it started, so the same call sent again (a capture played in a loop) is a new call
+    with its own first and last line. Its first line waits until the source, the destination and the colour code (DMR)
+    or NAC (P25) are in hand (M17: the source, the destination and the type), so the first line of a call is complete;
+    a call whose ids never come gives no line. The values are spelled as ZetaSDR's rows spell them:
+    - `dmr`: `type` `call`, `src` and `dst` (radio and talkgroup ids), `call` (`group`, also for an all call, or
+      `private`), `color_code`, `slot` (1 or 2, when the receiver could tell), `encrypted` (the privacy flag),
+      `emergency`, `alias` (the talker alias, when OnAir has it). The input may be any rate from 48 kHz: the receiver
+      is set up as for a channel already cut out of a wider capture (`configureChannel`), not with its radio minimum of
+      1 MHz.
+    - `p25`: `type` `call`, `src`, `dst`, `call`, `nac`, `encrypted`, `emergency`, and `algid` and `kid` (the
+      algorithm and key ids) once the call's header gave them, or an LDU2 changed them: a call joined late has neither
+      until then. The manufacturer id (`mfid`) is not in OnAir's call log, so it is never written. Voice grants and data
+      packets in the log are not calls of the channel and give no line.
+    - `m17`: `src` and `dst` (callsigns; the broadcast address, OnAir's `@ALL`, is `ALL`, and an extended-range
+      address is `#` and the base-40 digits of its offset, as ZetaSDR spells them), `can`, `type` (`voice`,
+      `voice_data`, `data`, `packet`; a reserved data type is `data`), `encryption` (`scrambler`, `aes`, `other`;
+      absent when clear), and `lat`, `lon` when the transmission carries a position. A BERT stream gives no line.
+    - `silent` is `encrypted` on an encrypted DMR or P25 call and absent otherwise: no speech is decoded here at all.
+      The receivers are silent (no sound device), and each has a voice monitor of the wrapper's own whose allow list is
+      on and empty, so it refuses every call: OnAir decodes a voice frame only for a call its monitor plays, so no
+      frame goes through mbelib or Codec 2 whether they are installed or not, and the lines are the same either way. To
+      check that by hand, hide the libraries from OnAir with `DECT2_MBELIB_PATH=/nonexistent` and
+      `DECT2_CODEC2_PATH=/nonexistent` (OnAir then looks for no other copy).
+    - A channel line (`dmr`, `p25`: `type` `channel`, `color_code` or `nac`, `control`, and `network`, the text
+      ZetaSDR's row shows for it, `channel, colour code 5` or `control channel, NAC 291`) says the channel is on the air
+      with no call. The colour code and the NAC stay in OnAir's snapshot after the carrier is gone, so they alone do not
+      say it; what does: a DMR time slot's latest burst, within the last second, idle or control blocks, on every slot
+      that has bursts (a repeater's: both) and no call going on; a P25 control channel's blocks within the last 3 s
+      (a conventional channel sends nothing between calls, so it gives no channel line). It is written when it first
+      holds, and again only when what it says changes, not after every call.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic
   pcap stream: the file header, then one record per frame. ADS-B: 7 or 14 bytes, link type 147 (USER0), and every
   JSON line has exactly one record. APRS: the AX.25 frame as OnAir's Wireshark hub gets it (link type 3), also a
@@ -166,7 +205,8 @@ ONAIR_SRC=<OnAir checkout> ./build.sh     # the first time: OnAir headless in _o
 test/patch.sh                             # the patches apply, _onair-src is current, and the patch's own test passes
 test/run.sh                               # needs iq/adsb1090.sigmf-data (cf32, 2457600 Hz); skips the decode checks without it
 test/bus.sh                               # the bus modes on OnAir's own test signals (_build/onair-gen)
-test/poll.sh                              # the polled modes on OnAir's own test signals (_build/onair-gen)
+test/poll.sh                              # the polled modes on OnAir's own test signals (_build/onair-gen), the voice
+                                          # modes also with mbelib and Codec 2 hidden
 ```
 
 The wrapper's headers are on the quoted include path only (`-iquote`), so that `src/poll.h` does not stand in for the
@@ -179,11 +219,17 @@ on AIS 2; VDL2: a downlink, an uplink and a ground station's GSIF; HFDL: a squit
 of one sonde of OnAir's scene, moved to 0 Hz; `--info` replaces APRS's whole information field), with a second of
 noise either side, and says on stderr where the message is. `onair-gen --mode rds --rate HZ [--ps PS] [--rt RT]` is a
 station instead, with nothing around it: 6 s of OnAir's `FmGenerator` with PI `2AB1`, PS `ZETA FM ` and RT
-`HELLO FROM ZETASDR` (or the bytes of the RDS character set given), with the generator's own noise. An option the mode
-does not take is refused with the usage line. `onair-gen --selftest ais-join` tests the AIS sentence joiner of
+`HELLO FROM ZETASDR` (or the bytes of the RDS character set given), with the generator's own noise.
+`onair-gen --mode dmr|p25|m17 --rate HZ [--channel]` is one call with the values of ZetaSDR's own checks, sent twice
+with 2 s of noise between, as a check's capture repeats: DMR, a handheld's group call in direct mode on slot 1, colour
+code 5, from 9990001 to talkgroup 9990, three superframes; P25, a group call of NAC 0x123 from 9990001 to talkgroup
+65000; M17, a voice stream from `VK4ZET` to `ALL` on CAN 0, 25 frames. `--channel` is a channel instead (DMR: 4 s of a
+repeater's downlink, its traffic quiet; P25: 4 s of a control channel of the same NAC). An option the mode does not
+take is refused with the usage line. `onair-gen --selftest ais-join` tests the AIS sentence joiner of
 `src/ais.cpp`, which it links, `onair-gen --selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`)
-on serials the test signals do not have, and `onair-gen --selftest json-utf8` the UTF-8 text writer (`Json::utf8`,
-`src/json.cpp`) on valid and broken UTF-8.
+on serials the test signals do not have, `onair-gen --selftest json-utf8` the UTF-8 text writer (`Json::utf8`,
+`src/json.cpp`) on valid and broken UTF-8, and `onair-gen --selftest calls` the call keying of the voice modes
+(`CallLog`, `src/calls.h`) on snapshots it makes.
 
 The OnAir checkout is never changed. `build.sh` builds OnAir from `_onair-src`, a copy of `$ONAIR_SRC` with every
 `patches/*.patch` applied in name order (`git apply`). The copy is remade when the checkout's commit or a patch's
@@ -214,7 +260,10 @@ followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
 - `src/poll.cpp`: the polled modes. A mode is a row of `kPollModes`: its name, its event, its poll interval and the
   function that makes its session (`src/poll_<mode>.cpp`), a `PollSession` that feeds the receiver and, at each poll,
   hands over the lines for what is new or changed in its snapshot; `runPolled` adds `event` and `t_sample`. RDS
-  (`src/poll_rds.cpp`) queues a line per group from the receiver's group tap and is polled after every block.
+  (`src/poll_rds.cpp`) queues a line per group from the receiver's group tap and is polled after every block. The
+  voice modes (`src/poll_voice.cpp`) are polled every 0.25 s: each turns its receiver's call log into what it says
+  about each call (a key and the members) and hands that to a `CallLog` (`src/calls.h`), which writes the first, the
+  changed and the last line of each call.
 - `src/ais.cpp`: AIS's lines. A joiner puts a message's sentences back together (OnAir publishes them one after the
   other); OnAir's `ais::parseNmea`, `ais::unarmour` and `ais::decodeMessage` read the message.
 - `src/adsb.cpp`: OnAir's `AdsbReceiver` does the decoding. Its frame callback hands over every good frame, decoded

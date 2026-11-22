@@ -39,7 +39,10 @@ extern const size_t kPollModeCount;
 // when open fails, before any sample is read.
 int runPolled(const PollMode& m, const Options& o, IqInput& in, Output& out);   // the exit status
 
-// the session of each polled mode (poll_<mode>.cpp)
+// the session of each polled mode (poll_<mode>.cpp; the voice modes dmr, p25 and m17 in poll_voice.cpp)
 std::unique_ptr<PollSession> openRds(const Options& o, std::string* err);
+std::unique_ptr<PollSession> openDmr(const Options& o, std::string* err);
+std::unique_ptr<PollSession> openP25(const Options& o, std::string* err);
+std::unique_ptr<PollSession> openM17(const Options& o, std::string* err);
 
 } // namespace onair_rx
