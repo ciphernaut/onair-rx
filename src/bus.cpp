@@ -159,16 +159,13 @@ bool flagOf(const automation::Event& e, const char* k) {
     const automation::Value* v = field(e, k);
     return v && v->t == automation::Value::Bool && v->b;
 }
-// icao: the aircraft's address of the frame: the source of a downlink (from_air), the destination of an uplink. A ground
-// station's frame to all stations (destination FFFFFF) has no aircraft: its icao is the station's own address. addr_type says
-// which of the two icao is, in dumpvdl2's words ("Aircraft", "Ground station"); the bus does not carry the address types, so
-// it follows from from_air and the broadcast address. Only vdl2.message events are lines.
+// icao: the frame's source address, as dumpvdl2 has it (and so ZetaSDR's VDL2 row, whose subjects are keyed on it): the
+// aircraft's on a downlink, the ground station's on an uplink or a broadcast. addr_type: the source's type in dumpvdl2's
+// words, "Aircraft" when from_air, else "Ground station" (the bus carries no address types; from_air is the source being an
+// aircraft). dst stays as the bus has it (FFFFFF: all stations). Only vdl2.message events are lines.
 bool shapeVdl2(const automation::Event& e, Json& j) {
     if (e.type != "vdl2.message") return false;
-    const std::string src = text(e, "src"), dst = text(e, "dst");
-    if (flagOf(e, "from_air")) j.str("icao", src).str("addr_type", "Aircraft");
-    else if (dst == "FFFFFF") j.str("icao", src).str("addr_type", "Ground station");
-    else j.str("icao", dst).str("addr_type", "Aircraft");
+    j.str("icao", text(e, "src")).str("addr_type", flagOf(e, "from_air") ? "Aircraft" : "Ground station");
     return true;
 }
 

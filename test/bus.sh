@@ -197,12 +197,12 @@ open(sys.argv[2], "wb").write(struct.pack(f"<{len(a)}h", *(max(-32768, min(32767
 done
 
 # --- VDL2: a downlink from aircraft 7C1234 to ground station 10A000, the station's uplink to it, the station's GSIF to all
-# stations; icao is the aircraft's address on both of its frames, the station's on its broadcast
+# stations; icao is the source address and addr_type the source's type, as dumpvdl2 (the node's VDL2 row) has them
 gen vdl2 --mode vdl2 --rate 250000
 rx vdl2 --mode vdl2 --rate 250000 --freq "$vdl2_hz"
 lines vdl2 250000 '{"event": "vdl2.message", "icao": "7C1234", "addr_type": "Aircraft", "from_air": true, "src": "7C1234", "dst": "10A000", "proto": "ACARS"}' 3 ||
   fail "vdl2: the downlink"
-lines vdl2 250000 '{"event": "vdl2.message", "icao": "7C1234", "addr_type": "Aircraft", "from_air": false, "src": "10A000", "dst": "7C1234"}' 3 ||
+lines vdl2 250000 '{"event": "vdl2.message", "icao": "10A000", "addr_type": "Ground station", "from_air": false, "src": "10A000", "dst": "7C1234"}' 3 ||
   fail "vdl2: the uplink"
 lines vdl2 250000 '{"event": "vdl2.message", "icao": "10A000", "addr_type": "Ground station", "from_air": false, "dst": "FFFFFF"}' 3 ||
   fail "vdl2: the GSIF"

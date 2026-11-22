@@ -79,11 +79,11 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2
     forgets the channel's parts still waiting. The receiver decodes AIS 1 and 2, whichever of them the input holds
     (one is enough, so `--freq` may be either channel's own frequency), not the long-range channels 75 and 76.
   - `vdl2`: the receiver decodes the one channel at `--freq` (OnAir's default list, the European set, is not used),
-    a 25 kHz channel at 0 Hz of the input. `icao` is the aircraft's address of the frame, six upper-case hex digits:
-    the source of a downlink (`from_air`), the destination of an uplink; a ground station's frame to all stations
-    (destination `FFFFFF`, such as its GSIF) names no aircraft, and its `icao` is the station's own address.
-    `addr_type` says which `icao` is, in dumpvdl2's words: `Aircraft` or `Ground station`. (The bus carries no
-    address types; they follow from `from_air` and the broadcast address.) `frame` is the AVLC frame (`I`, `RR`,
+    a 25 kHz channel at 0 Hz of the input. `icao` is the frame's source address, six upper-case hex digits, and
+    `addr_type` the source's type, as dumpvdl2 has them: the aircraft's address and `Aircraft` on a downlink
+    (`from_air`), the ground station's address and `Ground station` on an uplink or a broadcast (the bus carries no
+    address types; `from_air` is the source being an aircraft). `dst` is the destination as the bus has it
+    (`FFFFFF` for all stations, as a GSIF has it). `frame` is the AVLC frame (`I`, `RR`,
     `XID`, `GSIF` ...), `proto` what it carries (`ACARS`, `X.25`, `CLNP`, `XID`, `COTP`, or empty).
   - `hfdl`: `--freq` is the channel's dial frequency, the one HFDL's frequency lists give, and the input is centred
     on it: the receiver takes the carrier 1440 Hz above the dial frequency (OnAir's `kHfdlCarrierHz`), as a USB
