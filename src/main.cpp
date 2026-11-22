@@ -9,6 +9,7 @@
 // It is distributed WITHOUT ANY WARRANTY; see the LICENSE file.
 #include "rx.h"
 #include "bus.h"
+#include "poll.h"
 #include "dect2/wirecap/wire.h"
 #include <cerrno>
 #include <cmath>
@@ -30,7 +31,8 @@ namespace wire = dect2::wire;
 static const char* kVersion = "0.2.0";
 
 // The modes with a run function of their own: each is one OnAir receiver. The modes read from OnAir's automation bus are
-// rows of the bus mode table (bus.cpp) instead.
+// rows of the bus mode table (bus.cpp) instead, and the modes that poll their receiver's state rows of the polled mode table
+// (poll.cpp).
 static const Mode kModes[] = {
     {"adsb", wire::kChans[wire::AdsB].linktype, runAdsb},
 };
@@ -85,6 +87,7 @@ static void usage(FILE* f) {
                "127.0.0.1:PORT. Modes:");
     for (const Mode& m : kModes) fprintf(f, " %s", m.name);
     for (size_t i = 0; i < kBusModeCount; i++) fprintf(f, " %s", kBusModes[i].name);
+    for (size_t i = 0; i < kPollModeCount; i++) fprintf(f, " %s", kPollModes[i].name);
     fprintf(f, "\n");
 }
 
@@ -122,14 +125,17 @@ int main(int argc, char** argv) {
     }
     const Mode* mode = nullptr;
     const BusMode* bus = nullptr;
+    const PollMode* polled = nullptr;
     for (const Mode& m : kModes) if (o.mode == m.name) mode = &m;
     for (size_t i = 0; i < kBusModeCount; i++) if (o.mode == kBusModes[i].name) bus = &kBusModes[i];
-    if (!mode && !bus) { fprintf(stderr, "onair-rx: no mode %s\n", o.mode.c_str()); return 2; }
+    for (size_t i = 0; i < kPollModeCount; i++) if (o.mode == kPollModes[i].name) polled = &kPollModes[i];
+    if (!mode && !bus && !polled) { fprintf(stderr, "onair-rx: no mode %s\n", o.mode.c_str()); return 2; }
     if (o.rate <= 0) { fprintf(stderr, "onair-rx: --rate HZ is needed\n"); return 2; }
     if (o.format != "cf32" && o.format != "cs16") { fprintf(stderr, "onair-rx: no format %s (cf32 or cs16)\n", o.format.c_str()); return 2; }
     // before any sample is read: a mode that places its channels by frequency never runs without one
     if (bus && bus->needsFreq && o.freq <= 0) { fprintf(stderr, "onair-rx: %s needs --freq HZ\n", bus->name); return 2; }
     if (bus && bus->chan < 0 && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", bus->name); return 2; }
+    if (polled && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", polled->name); return 2; }   // no polled mode has packets
 
     PcapPort pcap;
     if (o.pcapPort) {
@@ -142,7 +148,7 @@ int main(int argc, char** argv) {
     }
     IqInput in(o.format);
     Output out(o.pcapPort ? &pcap : nullptr);
-    const int st = bus ? runBus(*bus, o, in, out) : mode->run(o, in, out);
+    const int st = bus ? runBus(*bus, o, in, out) : polled ? runPolled(*polled, o, in, out) : mode->run(o, in, out);
     fflush(stdout);
     pcap.finish();
     if (in.error()) { fprintf(stderr, "onair-rx: stdin: %s\n", strerror(in.error())); return 1; }

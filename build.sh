@@ -82,16 +82,18 @@ mkdir -p "$o"
 printf '%s\n' "$flags" >"$o/onair.flags"
 printf '%s\n' "$libs" >"$o/onair.libs"
 objs=()
+# the wrapper's own headers are found for quoted includes only (-iquote): src/poll.h would otherwise stand in for the
+# system's <poll.h>
 for f in "$here"/src/*.cpp; do
   obj=$o/$(basename "${f%.cpp}").o
   # shellcheck disable=SC2086
-  g++ $flags -Wall -Wextra -I"$here/src" -I"$s/core/include" -c "$f" -o "$obj"
+  g++ $flags -Wall -Wextra -iquote "$here/src" -I"$s/core/include" -c "$f" -o "$obj"
   objs+=("$obj")
 done
 # the tests' signal generator (test/bus.sh): OnAir's own test signals, one known message per mode; it also links the wrapper's
 # AIS joiner (ais.o, with the JSON writer json.o) for its self-test
 # shellcheck disable=SC2086
-g++ $flags -Wall -Wextra -I"$here/src" -I"$s/core/include" -c "$here/test/gen.cpp" -o "$o/gen.o"
+g++ $flags -Wall -Wextra -iquote "$here/src" -I"$s/core/include" -c "$here/test/gen.cpp" -o "$o/gen.o"
 cd "$b"   # the library list has paths relative to the OnAir build
 # shellcheck disable=SC2086
 g++ -o "$here/onair-rx" "${objs[@]}" -Wl,--start-group $libs -Wl,--end-group -lpthread

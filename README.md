@@ -19,12 +19,12 @@ onair-rx --lua > onair.lua     # OnAir's Wireshark Lua dissector (USER0 is Mode 
 onair-rx --version
 ```
 
-Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm` and `m20`
-(below).
+Modes: `adsb`, the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm` and `m20`, and
+the polled mode `rds` (below).
 
 - **stdin:** interleaved little-endian IQ at `--rate` Hz, `cf32` (the default) or `cs16`, the signal's channel at
   0 Hz (HFDL: its dial frequency at 0 Hz). The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); the bus
-  modes' are in the table below. A rate below the mode's exits 2 with one line saying so.
+  and polled modes' are in their tables below. A rate below the mode's exits 2 with one line saying so.
 - **`--freq HZ`:** the radio frequency at 0 Hz of the input. Every mode takes it; ACARS, AIS, VDL2 and HFDL need it
   (they place their channels by frequency) and exit 2 with `onair-rx: <mode> needs --freq HZ` without it, before
   reading any input.
@@ -115,12 +115,33 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2
 
   Not on the generic path: none of the modes so far. A receiver that needs more than a channel, a centre and a type
   filter (a second channel, an engine of its own) gets a line here saying what it needed.
+- **stdout, polled modes:** some OnAir receivers put nothing on the bus and offer only a snapshot of their state
+  (`telemetry()`). A polled mode feeds its receiver blocks of 16384 and, each time the input has advanced by the
+  mode's poll interval (counted in samples, so a replay gives the same lines as a live run), writes one JSON object per
+  line for what is new or has changed since the last poll; once more at the end of input, so that what the last block
+  completed is written. Every line has `event` (the mode's) and `t_sample` (the index of the first sample of the block
+  after which the poll ran), a member only when its value is known, whole numbers without a decimal point, strings
+  byte by byte as above. None of them has packets: `--pcap-port` exits 2 with
+  `onair-rx: <mode> has no packets (no --pcap-port)`, before reading any input. The modes:
+
+  | mode | OnAir receiver | minimum rate | poll | event | members |
+  |---|---|---|---|---|---|
+  | `rds` | `FmReceiver` | 500 kHz | every block | `rds.group` | `pi`, `group`, `pty`, `tp`, `ps`, `rt` |
+
+  - `rds`: the FM station at 0 Hz of the input (OnAir's station finder is off, so the station is the one at the
+    centre however weak; the receiver is silent, no sound device is opened). One line per RDS group from the
+    receiver's group tap whose block B and PI (block A, or C' in a version B group) came with a right checkword: a
+    block the receiver corrected is not used, since OnAir trusts one only once it repeats and the tap hands it over
+    before that. From the group: `pi` (four upper-case hex digits), `group` (its type and version, `0A`, `2B`), `pty`
+    (the programme type, 0 to 31) and `tp` (the traffic programme flag). From OnAir's snapshot at that group (published
+    every 0.1 s of signal): `ps`, the programme service name, once all its segments came, and `rt`, the radiotext,
+    once it is complete; each is absent until then.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic
   pcap stream: the file header, then one record per frame. ADS-B: 7 or 14 bytes, link type 147 (USER0), and every
   JSON line has exactly one record. APRS: the AX.25 frame as OnAir's Wireshark hub gets it (link type 3), also a
   digipeater's copy, which has no line. AIS: each sentence with its line end in IPv4 + UDP to port 10110 (NMEA 0183),
-  link type 101 (raw IP), as OnAir's capture files have it. The other bus modes have no packets and refuse the option
-  (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that connects a few seconds
+  link type 101 (raw IP), as OnAir's capture files have it. The other bus modes and the polled modes have no packets
+  and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that connects a few seconds
   late still gets them; a client that hangs up is dropped, and the next one gets a new header.
   Record times are the frame's sample time (bus modes: its block's first sample) on the wall clock of the first sample,
   moved on when the input falls more than 100 ms behind real time. What is still queued at the end with no client is
@@ -129,7 +150,8 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2
   cannot be opened, or a failed read of stdin (`onair-rx: stdin: <reason>`), exits 1.
 - **EOF** on stdin: what was decoded is written (the queued records to a connected client), then exit 0.
   There is no flush at the end of input: a decode a receiver still holds when stdin closes is not written. A short
-  replay (ZetaSDR's `capture_decode`) can lose its last message this way.
+  replay (ZetaSDR's `capture_decode`) can lose its last message this way. A polled mode polls once more at EOF, so
+  what its receiver's snapshot has by then is written.
   SIGTERM ends it at once.
 
 ## Build
@@ -140,13 +162,19 @@ ONAIR_SRC=<OnAir checkout> ./build.sh     # the first time: OnAir headless in _o
 test/patch.sh                             # the patches apply, _onair-src is current, and the patch's own test passes
 test/run.sh                               # needs iq/adsb1090.sigmf-data (cf32, 2457600 Hz); skips the decode checks without it
 test/bus.sh                               # the bus modes on OnAir's own test signals (_build/onair-gen)
+test/poll.sh                              # the polled modes on OnAir's own test signals (_build/onair-gen)
 ```
 
+The wrapper's headers are on the quoted include path only (`-iquote`), so that `src/poll.h` does not stand in for the
+system's `<poll.h>`.
+
 `build.sh` also builds `_build/onair-gen` (`test/gen.cpp`): `onair-gen --mode
-pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO]` writes cf32 IQ of one known
+pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20|rds --rate HZ [--freq HZ] [--text TEXT] [--info INFO]` writes cf32 IQ of one known
 message from OnAir's test-signal generator for the mode (AIS: a position report on AIS 1 and a static report on AIS 2;
 VDL2: a downlink, an uplink and a ground station's GSIF; HFDL: a squitter and a logon request; a sonde: 12 s of one
-sonde of OnAir's scene, moved to 0 Hz; `--info` replaces APRS's whole information field), with a second of noise either side, and says on stderr where the message is. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links, and `onair-gen
+sonde of OnAir's scene, moved to 0 Hz; `--info` replaces APRS's whole information field), with a second of noise either side, and says on stderr where the message is.
+`--mode rds` is a station instead, with nothing around it: 6 s of OnAir's `FmGenerator` with PI `2AB1`, PS `ZETA FM `
+and RT `HELLO FROM ZETASDR`, with the generator's own noise. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links, and `onair-gen
 --selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`) on serials the test signals do not have.
 
 The OnAir checkout is never changed. `build.sh` builds OnAir from `_onair-src`, a copy of `$ONAIR_SRC` with every
@@ -175,6 +203,10 @@ followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
   its hub channel, whether it needs `--freq`, and what its lines need that the bus lacks. A mode whose lines come
   from its hub packets (AIS) names the lines' event and a function that turns a packet into a line; its hub channel
   then runs with or without a pcap port. Another receiver on the bus is one more row.
+- `src/poll.cpp`: the polled modes. A mode is a row of `kPollModes`: its name, its event, its poll interval and the
+  function that makes its session (`src/poll_<mode>.cpp`), a `PollSession` that feeds the receiver and, at each poll,
+  hands over the lines for what is new or changed in its snapshot; `runPolled` adds `event` and `t_sample`. RDS
+  (`src/poll_rds.cpp`) queues a line per group from the receiver's group tap and is polled after every block.
 - `src/ais.cpp`: AIS's lines. A joiner puts a message's sentences back together (OnAir publishes them one after the
   other); OnAir's `ais::parseNmea`, `ais::unarmour` and `ais::decodeMessage` read the message.
 - `src/adsb.cpp`: OnAir's `AdsbReceiver` does the decoding. Its frame callback hands over every good frame, decoded

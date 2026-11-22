@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // onair-gen: one known message of a mode from OnAir's own test-signal generator, as cf32 IQ on stdout, with a second of noise
-// either side. For onair-rx's tests (test/bus.sh); nothing is transmitted.
+// either side (a polled mode's station: its whole broadcast). For onair-rx's tests (test/bus.sh, test/poll.sh); nothing is
+// transmitted.
 // Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 //
-//   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO]
+//   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20|rds --rate HZ [--freq HZ] [--text TEXT] [--info INFO]
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
 //
@@ -18,6 +19,7 @@
 // stations. HFDL: ground station 1's squitter, then a logon request from aircraft 7C1234. A radiosonde (rs41, dfm, m20): one
 // sonde of OnAir's scene sending its frames for 12 s, not drifting: the RS41 as serial S1234567 at -27.3842, 153.1175 (12 km,
 // climbing 5 m/s); the DFM-17 (17012345) and the M20 (211-4-01234) where OnAir's scene has them (25.30, 55.50 and 25.00, 55.60).
+// RDS: an FM station with PI 2AB1, PS "ZETA FM " and RT "HELLO FROM ZETASDR" for 6 s (rdsSignal).
 // The channel is at 0 Hz of the output, as onair-rx expects it: the pager and packet generators put it at their mode's tune
 // offset, which is cancelled here; ACARS is generated for one channel at --freq (default 131.525 MHz) with the centre there;
 // AIS 1 and 2 are placed by their frequencies (161.975 and 162.025 MHz) around --freq (default 162 MHz, between the two).
@@ -35,6 +37,7 @@
 #include "dect2/ais/ais_gen.h"
 #include "dect2/ais/ais_proto.h"
 #include "dect2/dsp/gen_util.h"
+#include "dect2/fm/fm_gen.h"
 #include "dect2/hfdl/hfdl_gen.h"
 #include "dect2/hfdl/hfdl_proto.h"
 #include "dect2/packet/packet_gen.h"
@@ -65,7 +68,7 @@ constexpr double kSnrDb = 25;   // carrier to noise in 25 kHz
 constexpr size_t kChunk = 1 << 14;
 
 int usage() {
-    fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO] > iq\n"
+    fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20|rds --rate HZ [--freq HZ] [--text TEXT] [--info INFO] > iq\n"
                     "       onair-gen --selftest ais-join|sonde-id\n");
     return 2;
 }
@@ -274,6 +277,22 @@ std::vector<cf32> sondeSignal(double rate, const std::string& type) {
     return out;
 }
 
+// --- RDS: a station of OnAir's FM generator (fm_gen.h) for kFmSec at 0 Hz, with the generator's own stereo tones and its own
+// noise (40 dB carrier to noise in 200 kHz). A broadcast never stops, so there is no silence around it: the whole output is
+// the message
+constexpr double kFmSec = 6;
+std::vector<cf32> rdsSignal(double rate) {
+    FmGenConfig c;
+    c.rate = rate;
+    c.pi = 0x2AB1;
+    c.ps = "ZETA FM ";
+    c.rt = "HELLO FROM ZETASDR";
+    FmGenerator g(c);
+    std::vector<cf32> out((size_t)(kFmSec * rate));
+    g.generate(out.data(), out.size());
+    return out;
+}
+
 // --- the joiner's own test: sentences in as the hub has them (with their line ends), messages out
 int selftestAisJoin() {
     int fails = 0;
@@ -370,6 +389,16 @@ int main(int argc, char** argv) {
     }
     if (!freq) freq = mode == "ais" ? 162e6 : 131.525e6;
     if (rate <= 0) return usage();
+    if (mode == "rds") {   // a polled mode's station is written as it is made: no cut, no silence, no added noise
+        const std::vector<cf32> x = rdsSignal(rate);
+        if (fwrite(x.data(), sizeof(cf32), x.size(), stdout) != x.size() || fflush(stdout) != 0) {
+            fprintf(stderr, "onair-gen: stdout: %s\n", strerror(errno));
+            return 1;
+        }
+        fprintf(stderr, "onair-gen: %s message from 0.000 s to %.3f s, %zu samples at %.0f Hz\n", mode.c_str(),
+                (double)x.size() / rate, x.size(), rate);
+        return 0;
+    }
     std::vector<cf32> msg;
     if (mode == "pocsag" || mode == "flex") msg = pagerSignal(rate, mode == "flex", text);
     else if (mode == "acars") msg = acarsSignal(rate, freq, text);
