@@ -1,0 +1,176 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
+
+wirecap: the hub gains a sink (Hub::setSink)
+
+A sink sees every packet published on an enabled channel, on the publisher's thread, before the
+packet is queued and whether or not it is, with the time exactly as the caller passed it (0 when it
+passed none). With files, live and gsmtap off the hub opens no file and no socket, so a program can
+take the packets straight from the decoders. onair-rx's build.sh applies this patch to the copy of
+the OnAir checkout it builds from.
+
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index baaf345..2a30a06 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1881,6 +1881,9 @@ if(DECT2_BUILD_TESTS)
+     target_link_libraries(test_wirecap PRIVATE dect2core)
+     add_dependencies(test_wirecap onair-extcap)
+     add_test(NAME wirecap COMMAND test_wirecap $<TARGET_FILE:onair-extcap>)
++    add_executable(test_wire_sink tests/wirecap/test_wire_sink.cpp)   # Wireshark output: the hub's sink (Hub::setSink) with no file and no socket
++    target_link_libraries(test_wire_sink PRIVATE dect2core)
++    add_test(NAME wire_sink COMMAND test_wire_sink)
+     add_executable(test_asterix_mode tests/app/test_asterix_mode.cpp)   # the ASTERIX mode: registered tuning, mode row, family count, panel strings
+     target_link_libraries(test_asterix_mode PRIVATE dect2core)
+     target_compile_definitions(test_asterix_mode PRIVATE DECT2_SOURCE_DIR="${ONAIR_ROOT}")
+diff --git a/core/include/dect2/wirecap/wire.h b/core/include/dect2/wirecap/wire.h
+index 4eb240d..43f3191 100644
+--- a/core/include/dect2/wirecap/wire.h
++++ b/core/include/dect2/wirecap/wire.h
+@@ -6,6 +6,7 @@
+ #include "dect2/wirecap/wire_chan.h"
+ #include "dect2/wirecap/wire_format.h"
+ #include <atomic>
++#include <functional>
+ #include <memory>
+ #include <string>
+ 
+@@ -27,6 +28,11 @@ struct Stats {
+     int clients = 0;       // live captures attached
+ };
+ 
++// A sink sees every packet published on an enabled channel: on the publisher's thread, before the packet is queued and whether or not it is
++// (a full queue drops it, the sink still saw it), with unixUsec exactly as the caller passed it (0 when it passed none). It must not block.
++// It can stand alone: with files, live and gsmtap all off the hub opens no file and no socket, and the sink is the only output.
++using Sink = std::function<void(Chan c, int64_t unixUsec, const uint8_t* p, size_t n)>;
++
+ class Hub {
+ public:
+     static Hub& get();
+@@ -38,6 +44,7 @@ public:
+     // from any thread; returns at once (the packet is queued; when the queue is full it is dropped and counted). unixUsec 0: now.
+     void publish(Chan c, const uint8_t* p, size_t n, int64_t unixUsec = 0);
+     void publish(Chan c, const Bytes& b) { publish(c, b.data(), b.size()); }
++    void setSink(Sink s);       // one sink at a time; an empty function removes it
+     Stats stats(Chan c) const;
+     int boundPort() const;      // the local port while listening, 0 otherwise
+     bool waitIdle(int timeoutMs);   // everything queued so far has been written (tests)
+diff --git a/core/src/wirecap/wire.cpp b/core/src/wirecap/wire.cpp
+index 012e04a..4fb528e 100644
+--- a/core/src/wirecap/wire.cpp
++++ b/core/src/wirecap/wire.cpp
+@@ -91,6 +91,9 @@ struct Hub::Impl {
+     bool running = false, stopReq = false;
+     Stats st[kChanCount];
+     int bound = 0;
++    std::mutex sinkMu;          // the sink has its own lock: it is copied out under it and called without it
++    Sink sink;
++    std::atomic<bool> hasSink{false};
+ 
+     // the worker's own
+     sock_t listener = kBadSock, udp = kBadSock;
+@@ -368,8 +371,19 @@ void Hub::setEnabled(Chan c, bool on) {
+     else p_->stopWorker();
+ }
+ 
++void Hub::setSink(Sink s) {
++    std::lock_guard<std::mutex> lk(p_->sinkMu);
++    p_->sink = std::move(s);
++    p_->hasSink.store((bool)p_->sink, std::memory_order_relaxed);
++}
++
+ void Hub::publish(Chan c, const uint8_t* d, size_t n, int64_t t) {
+     if (!enabled(c)) return;
++    if (p_->hasSink.load(std::memory_order_relaxed)) {
++        Sink s;
++        { std::lock_guard<std::mutex> lk(p_->sinkMu); s = p_->sink; }
++        if (s) s(c, t, d, n);
++    }
+     std::lock_guard<std::mutex> lk(p_->mu);
+     if (!p_->running) return;
+     Stats& s = p_->st[c];
+diff --git a/tests/wirecap/test_wire_sink.cpp b/tests/wirecap/test_wire_sink.cpp
+new file mode 100644
+index 0000000..e9e3e33
+--- /dev/null
++++ b/tests/wirecap/test_wire_sink.cpp
+@@ -0,0 +1,78 @@
++// Wireshark output: the hub's sink. A packet published on an enabled channel reaches the sink on the publisher's thread with its time exactly as passed and
++// its bytes unchanged; a disabled channel reaches nothing; an empty function removes the sink; with files, live and gsmtap off the hub opens no file and
++// no socket. All packets here are made up.
++#include "dect2/wirecap/wire.h"
++#include <cstdio>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++using namespace dect2;
++using namespace dect2::wire;
++
++static int fails = 0;
++#define CHECK(c, ...) do { if (!(c)) { std::printf("FAIL line %d: ", __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); fails++; } } while (0)
++
++struct Seen { Chan c; int64_t t; Bytes data; std::thread::id th; };
++static std::mutex gMu;
++static std::vector<Seen> gSeen;
++
++static size_t seen() { std::lock_guard<std::mutex> lk(gMu); return gSeen.size(); }
++
++int main() {
++    Hub& h = Hub::get();
++    Config cfg;
++    cfg.files = false; cfg.live = false; cfg.gsmtap = false;
++    h.configure(cfg);
++    h.setSink([](Chan c, int64_t t, const uint8_t* p, size_t n) {
++        std::lock_guard<std::mutex> lk(gMu);
++        gSeen.push_back({c, t, Bytes(p, p + n), std::this_thread::get_id()});
++    });
++
++    std::printf("-- %s\n", "an enabled channel reaches the sink"); std::fflush(stdout);
++    {
++        const Bytes in = {0x82, 0x00, 0x7e, 0xff, 0x01};
++        h.setEnabled(Aprs, true);
++        h.publish(Aprs, in.data(), in.size(), 42);
++        CHECK(seen() == 1, "%zu packets at the sink, want 1", seen());
++        if (seen() == 1) {
++            const Seen& s = gSeen[0];
++            CHECK(s.c == Aprs, "channel %d", (int)s.c);
++            CHECK(s.t == 42, "time %lld, want 42", (long long)s.t);
++            CHECK(s.data == in, "the bytes changed");
++            CHECK(s.th == std::this_thread::get_id(), "not on the publisher's thread");
++        }
++        h.publish(Aprs, in);   // no time given: the sink gets 0, not the hub's clock
++        CHECK(seen() == 2 && gSeen[1].t == 0, "a packet with no time: %zu packets, time %lld", seen(), seen() == 2 ? (long long)gSeen[1].t : -1LL);
++        CHECK(h.waitIdle(5000), "hub did not finish");
++        CHECK(h.stats(Aprs).packets == 2, "%llu packets queued, want 2", (unsigned long long)h.stats(Aprs).packets);
++    }
++
++    std::printf("-- %s\n", "no file and no socket"); std::fflush(stdout);
++    {
++        CHECK(h.boundPort() == 0, "a port is open: %d", h.boundPort());
++        CHECK(h.stats(Aprs).file.empty(), "a file was written: %s", h.stats(Aprs).file.c_str());
++    }
++
++    std::printf("-- %s\n", "a disabled channel reaches nothing"); std::fflush(stdout);
++    {
++        const Bytes in = {1, 2, 3};
++        CHECK(!h.enabled(Ais), "AIS on");
++        h.publish(Ais, in.data(), in.size(), 42);
++        CHECK(seen() == 2, "a disabled channel reached the sink");
++    }
++
++    std::printf("-- %s\n", "an empty function removes the sink"); std::fflush(stdout);
++    {
++        const Bytes in = {4, 5, 6};
++        h.setSink({});
++        h.publish(Aprs, in.data(), in.size(), 42);
++        CHECK(seen() == 2, "a removed sink was called");
++        CHECK(h.waitIdle(5000), "hub did not finish");
++        CHECK(h.stats(Aprs).packets == 3, "the packet was not queued without the sink");
++    }
++
++    h.shutdown();
++    std::printf(fails ? "FAILED: %d\n" : "ok\n", fails);
++    return fails ? 1 : 0;
++}

@@ -8,8 +8,8 @@ Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 OnAir contributors: https://github.com/adswill/OnAir/blob/main/CONTRIBUTORS.md
 
 onair-rx is free software under the GNU General Public License, version 3 or later ([LICENSE](LICENSE)). It links
-OnAir's libraries unchanged; OnAir is GPL-3.0-or-later with an attribution term (its `ADDITIONAL-TERMS.md`), which
-the two lines above and `onair-rx --version` carry.
+OnAir's libraries, built with the small patches in `patches/` (see Build). OnAir is GPL-3.0-or-later with an
+attribution term (its `ADDITIONAL-TERMS.md`), which the two lines above and `onair-rx --version` carry.
 
 ## Use
 
@@ -47,11 +47,24 @@ onair-rx --version
 ```
 ONAIR_SRC=<OnAir checkout> ./build.sh     # the first time: OnAir headless in _onair-build (about 20 minutes)
 ./build.sh                                # then: only src/ is compiled and linked (seconds)
+test/patch.sh                             # the patches apply, _onair-src is current, and the patch's own test passes
 test/run.sh                               # needs iq/adsb1090.sigmf-data (cf32, 2457600 Hz); skips the decode checks without it
 ```
 
-`ONAIR_REBUILD=1 ./build.sh` rebuilds OnAir too. Needs the FFmpeg dev packages, libhackrf, libusb-1.0 and
-SoapySDR (OnAir's server link line).
+The OnAir checkout is never changed. `build.sh` builds OnAir from `_onair-src`, a copy of `$ONAIR_SRC` with every
+`patches/*.patch` applied in name order (`git apply`). The copy is remade when the checkout's commit or a patch's
+content changes (its stamp, `_onair-src/.onair-rx-stamp`, holds both hashes). Only the files whose content changed
+get a new time, so OnAir rebuilds only what they touch. OnAir then reports its version as the checkout's short commit
+followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
+
+- `patches/0001-wirecap-hub-sink.patch`: OnAir's Wireshark hub gains a sink, `Hub::setSink`. The sink sees each
+  packet published on an enabled channel, on the publisher's thread, with the time exactly as the caller gave it.
+  With the hub's files, live capture and GSMTAP off, it opens no file and no socket. The patch carries an OnAir-style
+  test, `tests/wirecap/test_wire_sink.cpp`. OnAir's tests are not built here, so `test/patch.sh` compiles that one
+  test against the built libraries and runs it.
+
+`ONAIR_REBUILD=1 ./build.sh` rebuilds OnAir too. Needs the FFmpeg dev packages, libhackrf, libusb-1.0, SoapySDR
+(OnAir's server link line), rsync and git.
 
 ## How it works
 
@@ -78,5 +91,5 @@ SoapySDR (OnAir's server link line).
 - The spike read frames back from the hub's live stream (`ONAIR-WIRE 1 <mode>` on its local port). The hub stamps
   decode time, not sample time, and needs a loopback socket; taking the bytes from the receiver's frame callback
   instead gives one source for the JSON lines and the records.
-- OnAir's whole engine cannot read stdin as is (its file source sizes, seeks and loops the file); modes that need
-  the engine's own chain rather than a bare receiver need a stdin `IqSource`.
+- OnAir's whole engine has no stdin source as is (its SigMF, WAV and BLUE readers size, seek and loop the file);
+  modes that need the engine's own chain rather than a bare receiver need a stdin `IqSource`.
