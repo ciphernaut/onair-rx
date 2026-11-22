@@ -6,7 +6,7 @@
 //
 //   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO]
 //   onair-gen --mode rds --rate HZ [--ps PS] [--rt RT]
-//   onair-gen --mode dmr|p25|m17 --rate HZ
+//   onair-gen --mode dmr|p25|m17 --rate HZ [--channel]
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
 //   onair-gen --selftest json-utf8    onair-rx's UTF-8 text writer (src/json.cpp, Json::utf8) on valid and broken UTF-8
@@ -30,8 +30,9 @@
 // direct mode on time slot 1 (OnAir's single-transmission path), colour code 5, from 9990001 to talkgroup 9990, three
 // superframes; P25 phase 1, a group call of NAC 0x123 from 9990001 to talkgroup 65000, three LDU1/LDU2 pairs with its header
 // and terminator; M17, a voice stream (3200 bps) from VK4ZET to ALL (the broadcast address) on CAN 0, 25 frames, its voice the
-// generator's known pattern (not Codec 2, so the signal is the same whether the system has the library or not). A voice mode
-// takes none of the options.
+// generator's known pattern (not Codec 2, so the signal is the same whether the system has the library or not). --channel
+// (dmr, p25) is a channel on the air instead: 4 s of a DMR repeater's downlink (both slots, colour code 5, its traffic quiet,
+// no text messages) or of a P25 control channel of NAC 0x123. A voice mode takes none of the other options.
 // The channel is at 0 Hz of the output, as onair-rx expects it: the pager and packet generators put it at their mode's tune
 // offset, which is cancelled here; ACARS is generated for one channel at --freq (default 131.525 MHz) with the centre there;
 // AIS 1 and 2 are placed by their frequencies (161.975 and 162.025 MHz) around --freq (default 162 MHz, between the two).
@@ -88,7 +89,7 @@ constexpr size_t kChunk = 1 << 14;
 int usage() {
     fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO] > iq\n"
                     "       onair-gen --mode rds --rate HZ [--ps PS] [--rt RT] > iq\n"
-                    "       onair-gen --mode dmr|p25|m17 --rate HZ > iq\n"
+                    "       onair-gen --mode dmr|p25|m17 --rate HZ [--channel] > iq\n"
                     "       onair-gen --selftest ais-join|sonde-id|json-utf8|calls\n");
     return 2;
 }
