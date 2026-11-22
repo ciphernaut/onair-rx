@@ -5,6 +5,7 @@
 //
 //   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT]
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
+//   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
 //
 // The known messages: POCSAG address 1234567 function 3 "HELLO ZETA" at 1200 baud (alphanumeric); FLEX capcode 1234567
 // "HELLO ZETA" (alphanumeric, 1600/2); ACARS tail VH-ZET label H1 flight ZET001 ("HELLO ZETA" after the message number and
@@ -28,6 +29,7 @@
 // AIS's gap between its bursts, and a sonde's between its frames, do not count). stderr says where the message is: "message
 // from A s to B s".
 #include "ais.h"
+#include "bus.h"
 #include "dect2/acars/acars_gen.h"
 #include "dect2/ais/ais_gen.h"
 #include "dect2/ais/ais_proto.h"
@@ -63,7 +65,7 @@ constexpr size_t kChunk = 1 << 14;
 
 int usage() {
     fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] > iq\n"
-                    "       onair-gen --selftest ais-join\n");
+                    "       onair-gen --selftest ais-join|sonde-id\n");
     return 2;
 }
 
@@ -323,11 +325,33 @@ int selftestAisJoin() {
     return fails ? 1 : 0;
 }
 
+// --- a sonde's id (bus.h's sondeId) as rs1729's decoders spell it, from serials as OnAir's decoders write them
+int selftestSondeId() {
+    int fails = 0;
+    auto check = [&fails](const std::string& type, const std::string& serial, const std::string& want) {
+        const std::string got = onair_rx::sondeId(type, serial);
+        printf("%s: %s \"%s\" is \"%s\"", got == want ? "ok" : "FAIL", type.c_str(), serial.c_str(), got.c_str());
+        if (got != want) printf(", want \"%s\"", want.c_str());
+        printf("\n");
+        fails += got != want;
+    };
+    check("RS41", "S1234567", "S1234567");
+    check("M20", "611-2-01234", "M20-611-2-01234");
+    check("M20", "M20-611-2-01234", "M20-611-2-01234");
+    check("DFM", "17012345", "DFM-17012345");      // DFM-17, "%u": no padding past 6 digits
+    check("DFM", "123456", "DFM-123456");
+    check("DFM", "12345", "DFM- 12345");           // dfm09mod's "%6u": space-padded
+    check("DFM", "0A1B2C", "DFM- A1B2C");          // DFM-06: OnAir's "%06X", dfm09mod's "%6X"
+    check("DFM", "4294967295", "DFM-429496729");   // dfm09mod copies at most 9 characters
+    return fails ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--selftest") {
         if (std::string(argv[2]) == "ais-join") return selftestAisJoin();
+        if (std::string(argv[2]) == "sonde-id") return selftestSondeId();
         return usage();
     }
     std::string mode, text = "HELLO ZETA";

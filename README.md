@@ -55,7 +55,7 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2
   | `ais` | `AisReceiver` | 250 kHz | yes: AIS 1 or 2 inside the band | none: `ais.message` from the hub's sentences | the whole line |
   | `vdl2` | `Vdl2Receiver` | 250 kHz | yes: the channel | `vdl2.message` (`src`, `dst`, `from_air`, `proto`, `summary`, `frame`) | `icao`, `addr_type` |
   | `hfdl` | `HfdlReceiver` | 24 kHz | yes: the dial frequency | `hfdl.message` (`kind`, `summary`, `icao`, `uplink`, `snr_db`) | `icao` left out when the bus has none |
-  | `rs41`, `dfm`, `m20` | `SondeReceiver` | 2 MHz | no (taken) | `sonde.update` (`serial`, `type`, `lat`, `lon`, `alt_m`, `vspeed_ms`, `hspeed_ms`, `temp_c`, `batt_v`, `sats`) | `id`; that type's sondes only |
+  | `rs41`, `dfm`, `m20` | `SondeReceiver` | 2 MHz (1 MHz with an L-band `--freq`) | no (taken) | `sonde.update` (`serial`, `type`, `lat`, `lon`, `alt_m`, `vspeed_ms`, `hspeed_ms`, `temp_c`, `batt_v`, `sats`) | `id` (the serial as rs1729 spells it); that type's sondes only |
 
   AIS, VDL2, HFDL and the sondes write only the event of their row: any other event their receiver puts on the bus is
   dropped. In more detail:
@@ -93,10 +93,19 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2
   - `rs41`, `dfm`, `m20`: the receiver finds the sondes in the band by their carriers, opens a channel on each and
     tells the type from the frame sync, so the sonde may sit anywhere in the band, at 0 Hz too (as a 12.5 kHz channel
     resampled up to 2 MHz has it); nothing is set but the rate (and the centre, with `--freq`, for the bus's
-    frequency). Each mode keeps the events of its own type (`type` `RS41`, `DFM` or `M20`) and drops the others'. An
-    event comes with a frame that has a position, at most every 5 s per sonde (OnAir's own pace); one before the
-    sonde's serial is known is dropped, so that every line has `id` (the serial). The receiver runs inside `feed()`
-    (OnAir's synchronous mode), so that nothing is dropped when the input comes faster than real time.
+    frequency). The minimum rate is OnAir's: 2 MHz, or 1 MHz when `--freq` is in the L band (OnAir's
+    `sondeIsLbandMhz`, the LMS6-1680 profile); without `--freq` it is 2 MHz. Each mode keeps the events of its own
+    type (`type` `RS41`, `DFM` or `M20`) and drops the others'. An event comes with a frame that has a position, at
+    most every 5 s per sonde (OnAir's own pace); one before the sonde's serial is known is dropped, so that every line
+    has an `id`. Since the next event comes 5 s later, a DFM, whose serial OnAir puts together over several frames,
+    may get its first line up to 5 s after its first position. `serial` is OnAir's; `id` is the serial as rs1729's
+    decoder for the type writes its `id` (so as ZetaSDR's rows for those decoders key their subjects):
+    - `rs41`: the serial (`S1234567`, as rs41mod has it);
+    - `m20`: `M20-` and the serial (`M20-611-2-01234`, as m20mod has it; OnAir's serial is `611-2-01234`);
+    - `dfm`: `DFM-` and the number as dfm09mod writes it: `%6u` (DFM-09/17) or `%6X` (DFM-06), so space-padded to
+      six characters, and at most nine (`DFM-17012345`; a DFM-09's `12345` and a DFM-06's `012345` are `DFM- 12345`).
+    The receiver runs inside `feed()` (OnAir's synchronous mode), so that nothing is dropped when the input comes
+    faster than real time.
 
   Not on the generic path: none of the modes so far. A receiver that needs more than a channel, a centre and a type
   filter (a second channel, an engine of its own) gets a line here saying what it needed.
@@ -129,7 +138,8 @@ test/bus.sh                               # the bus modes on OnAir's own test si
 pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT]` writes cf32 IQ of one known
 message from OnAir's test-signal generator for the mode (AIS: a position report on AIS 1 and a static report on AIS 2;
 VDL2: a downlink, an uplink and a ground station's GSIF; HFDL: a squitter and a logon request; a sonde: 12 s of one
-sonde of OnAir's scene, moved to 0 Hz), with a second of noise either side, and says on stderr where the message is. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links.
+sonde of OnAir's scene, moved to 0 Hz), with a second of noise either side, and says on stderr where the message is. `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links, and `onair-gen
+--selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`) on serials the test signals do not have.
 
 The OnAir checkout is never changed. `build.sh` builds OnAir from `_onair-src`, a copy of `$ONAIR_SRC` with every
 `patches/*.patch` applied in name order (`git apply`). The copy is remade when the checkout's commit or a patch's

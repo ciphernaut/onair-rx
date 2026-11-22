@@ -222,12 +222,14 @@ assert all(o.get("icao") != "" for o in ls), "an empty icao"
 print("ok: the squitter (%s) has no icao" % sq[0]["kind"])' "$d/hfdl.jsonl" || fail "hfdl: the squitter"
 only hfdl hfdl.message || fail hfdl
 
-# --- the radiosondes, each its own type only: 12 s of one sonde at 0 Hz; id is the serial, the position within 0.001
-for s in "rs41 RS41 S1234567 -27.3842 153.1175" "dfm DFM 17012345 25.30 55.50" "m20 M20 211-4-01234 25.00 55.60"; do
-  read -r m type id lat lon <<<"$s"
+# --- the radiosondes, each its own type only: 12 s of one sonde at 0 Hz; serial is OnAir's, id the serial as rs1729's
+# decoder for the type spells it (the node's rows key on it); the position within 0.001
+for s in "rs41 RS41 S1234567 S1234567 -27.3842 153.1175" "dfm DFM 17012345 DFM-17012345 25.30 55.50" \
+  "m20 M20 211-4-01234 M20-211-4-01234 25.00 55.60"; do
+  read -r m type serial id lat lon <<<"$s"
   gen "$m" --mode "$m" --rate 2000000
   rx "$m" --mode "$m" --rate 2000000 --freq "$sonde_hz"
-  lines "$m" 2000000 "{\"event\": \"sonde.update\", \"type\": \"$type\", \"id\": \"$id\", \"serial\": \"$id\", \"lat\": $lat, \"lon\": $lon}" ||
+  lines "$m" 2000000 "{\"event\": \"sonde.update\", \"type\": \"$type\", \"id\": \"$id\", \"serial\": \"$serial\", \"lat\": $lat, \"lon\": $lon}" ||
     fail "$m"
   python3 -I -c '
 import json, sys
@@ -249,6 +251,8 @@ done
 
 # the joiner of multi-sentence messages on its own (onair-gen links onair-rx's)
 "$gen" --selftest ais-join || fail "the AIS sentence joiner"
+# a sonde's id on serials the test signals do not have (a short DFM-09 number, a DFM-06's hex, a long one)
+"$gen" --selftest sonde-id || fail "the sonde id"
 
 # --- text the bus cuts or that is not ASCII: one line, valid JSON
 long=$(python3 -I -c 'import string; s = (string.ascii_letters + string.digits + " .,:;!?-+=/()\"\\") * 40; print("LONG " + s[:1995])')

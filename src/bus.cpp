@@ -188,8 +188,9 @@ bool shapeHfdl(const automation::Event& e, Json& j) {
 // --- radiosondes: OnAir's SondeReceiver, which finds the carriers in the band, opens a channel on each and tells the type
 // from the frame sync; one mode per type keeps only that type's sonde.update events. It runs synchronously (inside feed(),
 // so that its events come on this thread and no sample is dropped when the input runs faster than real time). With --freq
-// its events carry absolute frequencies (an L-band centre would lower its minimum rate to 1 MHz). id is the bus's serial;
-// an event before the sonde's serial is known is dropped.
+// its events carry absolute frequencies (an L-band centre would lower its minimum rate to 1 MHz). An event before the sonde's
+// serial is known is dropped. id is the serial spelled as rs1729's decoders write their "id" (sondeId, bus.h), serial the
+// bus's own value.
 bool openSonde(const Options& o, Feed* feed, std::string* err, const char* name) {
     auto rx = std::make_shared<SondeReceiver>();
     rx->setSynchronous(true);
@@ -203,7 +204,7 @@ bool shapeSonde(const automation::Event& e, Json& j, const char* type) {
     if (e.type != "sonde.update" || text(e, "type") != type) return false;
     const std::string serial = text(e, "serial");
     if (serial.empty()) return false;
-    j.str("id", serial);
+    j.str("id", sondeId(type, serial));
     return true;
 }
 bool shapeRs41(const automation::Event& e, Json& j) { return shapeSonde(e, j, "RS41"); }

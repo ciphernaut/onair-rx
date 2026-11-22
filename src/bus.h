@@ -32,4 +32,23 @@ extern const size_t kBusModeCount;
 // pcap port), wrapped as OnAir's capture files wrap the channel's packets. The exit status.
 int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out);
 
+// A sonde's id: OnAir's serial (sonde.update's serial, of type "RS41", "DFM" or "M20") spelled as rs1729's decoders write their
+// "id", on which ZetaSDR's sonde rows key their subjects (here, so that onair-gen's self-test can call it):
+//  - RS41: the serial as it is (rs41mod: "S1234567").
+//  - M20: "M20-" and the serial (m20mod: "M20-611-2-01234"; OnAir's serial is "611-2-01234").
+//  - DFM: "DFM-" and the serial as dfm09mod's SN_out has it: "%6u" of the number (DFM-09/17) or "%6X" (DFM-06), so
+//    space-padded to 6, then at most 9 characters (dfm09mod strncpy's 9 into its "DFM-xxxxxxxx" id). OnAir writes the number
+//    with "%u" and a DFM-06's with "%06X", so its leading zeros become the padding: "17012345" is "DFM-17012345", "12345"
+//    (DFM-09) and "012345" (DFM-06) are "DFM- 12345".
+// A serial already carrying its prefix is left as it is.
+inline std::string sondeId(const std::string& type, const std::string& serial) {
+    auto has = [&serial](const char* p) { return serial.rfind(p, 0) == 0; };
+    if (type == "M20") return has("M20-") ? serial : "M20-" + serial;
+    if (type != "DFM" || has("DFM-")) return serial;
+    std::string s = serial;
+    while (s.size() > 1 && s[0] == '0') s.erase(0, 1);
+    if (s.size() < 6) s.insert(0, 6 - s.size(), ' ');
+    return "DFM-" + s.substr(0, 9);
+}
+
 } // namespace onair_rx
