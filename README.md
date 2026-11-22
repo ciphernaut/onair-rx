@@ -44,7 +44,9 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2
 - **stdout, bus modes:** one JSON object per event OnAir's receiver puts on its automation bus, flushed per line:
   the event's fields as members (whole numbers without a decimal point, a non-finite number left out), plus `event`
   (the bus type) and `t_sample` (the index of the first sample of the block of 16384 whose decoding produced it).
-  Strings are written byte by byte, a byte above 0x7e as `\u00XX`. The modes:
+  Strings are written byte by byte: a byte above 0x7e, 0x7f and a control character as `\u00XX`. A byte above 0x7e
+  therefore arrives as the Latin-1 character of that value, so a UTF-8 comment shows as two or three characters per
+  character it holds. The modes:
 
   | mode | OnAir receiver | minimum rate | `--freq` | bus event (its fields) | what onair-rx adds |
   |---|---|---|---|---|---|
@@ -122,6 +124,8 @@ Modes: `adsb`, and the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2
 - **stderr:** diagnostics, one line each. An unknown mode exits 2 with `onair-rx: no mode <m>`; a port that
   cannot be opened, or a failed read of stdin (`onair-rx: stdin: <reason>`), exits 1.
 - **EOF** on stdin: what was decoded is written (the queued records to a connected client), then exit 0.
+  There is no flush at the end of input: a decode a receiver still holds when stdin closes is not written. A short
+  replay (ZetaSDR's `capture_decode`) can lose its last message this way.
   SIGTERM ends it at once.
 
 ## Build
