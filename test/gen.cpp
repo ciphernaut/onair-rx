@@ -9,7 +9,7 @@
 //   onair-gen --mode dmr|p25|m17 --rate HZ [--channel]
 //   onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC]
 //   onair-gen --mode video --rate HZ [--deviation HZ]
-//   onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi --rate HZ [--freq HZ]
+//   onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi|wisun --rate HZ [--freq HZ]
 //   onair-gen ... --sigmf STEM        any of the above into STEM.sigmf-data (ci16_le) and STEM.sigmf-meta instead of stdout
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
@@ -58,6 +58,11 @@
 // carrier to noise in 2 MHz (Zigbee, Thread), 100 kHz (Z-Wave) and 20 MHz (Wi-Fi); Wi-Fi has a tenth of a second of noise
 // either side, not a second (at 20 Msps a second is 160 MB). --freq of Zigbee, Thread (default 2425 MHz) and Wi-Fi (2437 MHz)
 // only goes into a --sigmf pair.
+// Wi-SUN, OnAir's FAN scene (makeWisunSynth, wisunTestSchedule: PAN 7A31, the border router 00124BFFFE1A2B3C, the router
+// 000D6FFFFE445566 and the meter 02A1B2FFFEC3D4E5; PAN adverts, a solicit, EAPOL, PAN configurations, data and acks at 150 kbit/s,
+// one PAN configuration solicit at 50 kbit/s) once, on its ANZ channels around --freq (default 921.5 MHz, the scene's own centre:
+// the frames stay on their channels, so another --freq moves them in the input); carrier to noise in 400 kHz, the generator's own
+// measure. stderr also says where each frame is, after the message line: "frame N from A s to B s, R bit/s on F Hz".
 // --sigmf STEM writes the output as a SigMF pair instead of stdout: STEM.sigmf-data, ci16_le (each value times 32768, rounded and
 // clipped), and STEM.sigmf-meta, its sample rate, the centre frequency (--freq, or the mode's default above; left out for a mode
 // with neither) and an annotation per message, in the shape of iq/adsb1090.sigmf-meta.
@@ -105,6 +110,8 @@
 #include "dect2/vdl2/vdl2_proto.h"
 #include "dect2/wifi/wifi_gen.h"
 #include "dect2/wifi/wifi_proto.h"
+#include "dect2/wisun/wisun_gen.h"
+#include "dect2/wisun/wisun_rx.h"
 #include "dect2/zigbee/zigbee_gen.h"
 #include "dect2/zigbee/zigbee_proto.h"
 #include "dect2/zigbee/zigbee_rx.h"
@@ -138,7 +145,7 @@ int usage() {
                     "       onair-gen --mode dmr|p25|m17 --rate HZ [--channel] > iq\n"
                     "       onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC] > iq\n"
                     "       onair-gen --mode video --rate HZ [--deviation HZ] > iq\n"
-                    "       onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi --rate HZ [--freq HZ] > iq\n"
+                    "       onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi|wisun --rate HZ [--freq HZ] > iq\n"
                     "       onair-gen ... --sigmf STEM     (STEM.sigmf-data, ci16_le, and STEM.sigmf-meta instead of stdout)\n"
                     "       onair-gen --selftest ais-join|sonde-id|json-utf8|calls\n");
     return 2;
@@ -640,6 +647,40 @@ std::string number(double v) {   // a whole number without a decimal point, as t
     else snprintf(b, sizeof b, "%.17g", v);
     return b;
 }
+// --- Wi-SUN: OnAir's FAN scene (wisun_gen.h, makeWisunSynth) once, without noise. The scene centres its channels' reference
+// (wisunTuning().defMhz, 921.5 MHz) at 0 Hz; the carrier offset moves it to freq - 921.5 MHz instead, so that freq is at 0 Hz and
+// every frame stays on its channel. Made for as long as its frames last (WisunGenerator's refill: the lead, then each frame and
+// its gap), before the scene would loop. frames: where each frame is in the result, with its bit rate and its channel (Hz)
+struct WisunSpan { size_t start, count; int bitRate; double hz; };
+std::vector<cf32> wisunSignal(double rate, double freq, std::vector<WisunSpan>* frames) {
+    SynthConfig c;
+    c.snrDb = 200;                        // no noise of its own (99 and up)
+    c.cfoHz = wisunTuning().defMhz * 1e6 - freq;
+    auto s = makeWisunSynth(c, rate);
+    if (!s) return {};
+    // the schedule makeWisunSynth plays (wisun_gen.cpp, WisunSynth): its channels within 0.4 of the rate around 921.5 MHz, at most 6 MHz
+    const std::vector<WisunGenFrame> sched = wisunTestSchedule(wisunTuning().defMhz, std::min(6.0, 0.4 * rate / 1e6));
+    const WisunGenConfig defaults;
+    size_t n = (size_t)std::llround(defaults.leadSec * rate);
+    std::vector<WisunSpan> at;
+    for (const WisunGenFrame& f : sched) {
+        const size_t len = (size_t)std::ceil((double)(wisunPpduBits(f).size() + 1) / f.bitRate * rate);
+        at.push_back({n, len, f.bitRate, f.mhz * 1e6});
+        n += len + (size_t)std::llround(f.gapSec * rate);
+    }
+    std::vector<cf32> all(n);
+    s->generate(all.data(), all.size());
+    size_t a = 0;   // where trim() starts the result: the spans move with it
+    while (a < all.size() && all[a] == cf32(0.f, 0.f)) a++;
+    for (WisunSpan& w : at) {
+        const size_t end = w.start + w.count;
+        w.start = w.start > a ? w.start - a : 0;
+        w.count = end - a - w.start;
+    }
+    *frames = at;
+    return trim(all);
+}
+
 bool writeOut(const std::vector<cf32>& x, const std::string& stem, double rate, double centre, const std::vector<Span>& msgs) {
     if (stem.empty()) {
         if (fwrite(x.data(), sizeof(cf32), x.size(), stdout) != x.size() || fflush(stdout) != 0) {
@@ -889,7 +930,8 @@ int main(int argc, char** argv) {
     // each option belongs to its modes: one another mode would ignore is refused
     const bool voice = mode == "dmr" || mode == "p25" || mode == "m17";
     const bool tv = mode == "dvbt" || mode == "video";
-    const bool scene = mode == "ble" || mode == "lorawan" || mode == "zigbee" || mode == "thread" || mode == "zwave" || mode == "wifi";   // a scene of OnAir's own: only --freq
+    const bool scene = mode == "ble" || mode == "lorawan" || mode == "zigbee" || mode == "thread" || mode == "zwave" || mode == "wifi" ||
+                       mode == "wisun";   // a scene of OnAir's own: only --freq
     if (mode == "rds" ? freq || haveText || haveInfo : voice || tv ? freq || haveText || haveInfo || haveStation : haveStation) return usage();
     if (scene && (haveText || haveInfo)) return usage();
     if (channel && mode != "dmr" && mode != "p25") return usage();
@@ -903,6 +945,7 @@ int main(int argc, char** argv) {
                                       : mode == "zigbee" || mode == "thread" ? 2425e6   // channel 15
                                       : mode == "zwave" ? zwave::region(kZwaveRegion)->centreMhz * 1e6
                                       : mode == "wifi" ? 2437e6                         // channel 6
+                                      : mode == "wisun" ? wisunTuning().defMhz * 1e6     // the scene's own centre
                                       : 131.525e6;
     if (!freq) freq = centre ? centre : 131.525e6;
     if (mode == "rds" || tv) {   // a broadcast is written as it is made: no cut and no silence (rds's and video's noise are the generator's own)
@@ -915,6 +958,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::vector<cf32> msg;
+    std::vector<WisunSpan> wisunFrames;   // wisun: where each frame of the scene is in msg
     if (mode == "pocsag" || mode == "flex") msg = pagerSignal(rate, mode == "flex", text);
     else if (mode == "acars") msg = acarsSignal(rate, freq, text);
     else if (mode == "aprs") msg = aprsSignal(rate, haveInfo ? info : "!2723.05S/15307.05E>" + (haveText ? text : std::string("ZetaSDR")));
@@ -931,6 +975,7 @@ int main(int argc, char** argv) {
     else if (mode == "thread") msg = threadSignal(rate);
     else if (mode == "zwave") msg = zwaveSignal(rate, freq);
     else if (mode == "wifi") msg = wifiSignal(rate);
+    else if (mode == "wisun") msg = wisunSignal(rate, freq, &wisunFrames);
     else return usage();
     if (msg.empty()) { fprintf(stderr, "onair-gen: no %s signal at %.0f Hz\n", mode.c_str(), rate); return 1; }
 
@@ -946,7 +991,7 @@ int main(int argc, char** argv) {
     if (voice) std::copy(msg.begin(), msg.end(), out.begin() + (long)again);
     // kSnrDb in the mode's channel: 25 kHz, Bluetooth LE's 1 MHz, a LoRaWAN channel's 125 kHz
     const double noiseBw = mode == "ble" ? 1e6 : mode == "lorawan" ? 125e3 : mode == "zigbee" || mode == "thread" ? 2e6
-                         : mode == "zwave" ? 100e3 : mode == "wifi" ? 20e6 : 25000.0;
+                         : mode == "zwave" ? 100e3 : mode == "wifi" ? 20e6 : mode == "wisun" ? 400e3 : 25000.0;
     genutil::NoiseSource noise(7);
     noise.add(out.data(), out.size(), (float)(carrier * std::sqrt(rate / (2 * noiseBw * std::pow(10.0, kSnrDb / 10)))));
     std::vector<Span> spans = {{pad, msg.size()}};
@@ -956,5 +1001,10 @@ int main(int argc, char** argv) {
     if (voice) snprintf(twice, sizeof twice, " and again from %.3f s to %.3f s", (double)again / rate, (double)(again + msg.size()) / rate);
     fprintf(stderr, "onair-gen: %s message from %.3f s to %.3f s%s, %zu samples at %.0f Hz\n", mode.c_str(), (double)pad / rate,
             (double)(pad + msg.size()) / rate, twice, out.size(), rate);
+    for (size_t i = 0; i < wisunFrames.size(); i++) {
+        const WisunSpan& w = wisunFrames[i];
+        fprintf(stderr, "onair-gen: frame %zu from %.6f s to %.6f s, %d bit/s on %.0f Hz\n", i + 1, (double)(pad + w.start) / rate,
+                (double)(pad + w.start + w.count) / rate, w.bitRate, w.hz);
+    }
     return 0;
 }

@@ -21,15 +21,15 @@ onair-rx --version
 ```
 
 Modes: `adsb`, the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm`, `m20`, `ble`,
-`lorawan`, `zigbee`, `thread`, `zwave` and `wifi`, and the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video`
-(below). `ble`, `lorawan`, `zigbee`, `thread`, `zwave` and `wifi` are modes ZetaSDR has no decoder of its own for: their
-point is their packets, which Wireshark reads.
+`lorawan`, `zigbee`, `thread`, `zwave`, `wifi` and `wisun`, and the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and
+`video` (below). `ble`, `lorawan`, `zigbee`, `thread`, `zwave`, `wifi` and `wisun` are modes ZetaSDR has no decoder of its
+own for: their point is their packets, which Wireshark reads.
 
 - **stdin:** interleaved little-endian IQ at `--rate` Hz, `cf32` (the default) or `cs16`, the signal's channel at
   0 Hz (HFDL: its dial frequency at 0 Hz). The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); the bus
   and polled modes' are in their tables below. A rate below the mode's exits 2 with one line saying so.
 - **`--freq HZ`:** the radio frequency at 0 Hz of the input. Every mode takes it; ACARS, AIS, VDL2 and HFDL need it
-  (they place their channels by frequency), as do `lorawan`, `zigbee`, `thread`, `zwave` and `wifi`; they exit 2 with
+  (they place their channels by frequency), as do `lorawan`, `zigbee`, `thread`, `zwave`, `wifi` and `wisun`; they exit 2 with
   `onair-rx: <mode> needs --freq HZ` without it, before reading any input.
   AIS also exits 2, before reading input, with `onair-rx: ais: no AIS channel within <rate> Hz of <freq> Hz` when the
   input does not hold AIS 1 (161.975 MHz) or AIS 2 (162.025 MHz) as OnAir's receiver needs them: the middle of the two,
@@ -44,8 +44,12 @@ point is their packets, which Wireshark reads.
     `AS923-3`, `AS923-4`, `EU433` (in any case). Without it the plan is found (below).
   - `--region` (`zwave`): the Z-Wave region, one of OnAir's `EU`, `US`, `ANZ`, `HK`, `IN`, `RU`, `CN`, `IL`, `JP`, `KR`
     (in any case). Without it the region is found (below).
-  - `--width` (the job's band, Hz) and `--drop` (a receiver with a worker skips the input that comes while it is busy, as
-    it does live) are taken by no mode yet: every mode refuses them.
+  - `--region` (`wisun`): the Wi-SUN band plan, one of OnAir's `ANZ`, `NA`, `MX`, `BZ`, `JP`, `KR`, `PH`, `MY`, `HK`,
+    `SG`, `SG866`, `TH`, `VN`, `EU863`, `EU870`, `IN`, `CN470`, `CN779`, `CN920`, `WW` (in any case). Without it the
+    receiver takes the plan for `--freq` (below).
+  - `--drop` (`wisun`): a receiver with a worker skips the input that comes while it is busy, as it does live, instead of
+    being waited for (below).
+  - `--width` (the job's band, Hz) is taken by no mode yet: every mode refuses it.
 - **stdout, adsb:** one JSON object per decoded Mode S frame, flushed per line. A line carries only what its own frame
   established, as an SBS (BaseStation) line does, never a value remembered from an earlier frame. A member whose value
   is not known is absent, never null.
@@ -79,6 +83,7 @@ point is their packets, which Wireshark reads.
   | `thread` | `ZigbeeReceiver`, Thread mode | 4 MHz | yes: the channel | none: `thread.frame` from the hub's PSDUs | the whole line |
   | `zwave` | `ZwaveReceiver` | 1 MHz | yes: places the region's channels | none: `zwave.frame` from the hub's MPDUs | the whole line |
   | `wifi` | `WifiReceiver` | 20 MHz | yes: the band | none: `wifi.frame` from the hub's frames | the whole line |
+  | `wisun` | `WisunReceiver` | 2 MHz | yes: places the band plan's channels | none: `wisun.frame` from the hub's MPDUs | the whole line |
 
   Every mode writes only the event of its row: any other event its receiver puts on the bus is dropped. In more
   detail:
@@ -157,9 +162,9 @@ point is their packets, which Wireshark reads.
     (upper-case byte pairs, a space between), `snr_db` in the LoRa bandwidth, `sf` the spreading factor (0 for an FSK
     frame), `modulation` `lora` or `fsk`, `devaddr` (eight lower-case hex digits) on a data frame, and `freq_hz` the
     channel's centre in Hz, from the bus event's frequency. A join request has no `devaddr`: its EUIs are in `hex`.
-  - `zigbee`, `thread`, `zwave`, `wifi`: OnAir's receivers for 802.15.4 (Zigbee, and Thread, which is the same receiver in
-    `setThreadMode(true)`), Z-Wave and Wi-Fi put nothing on the bus and hand each frame whose check passed to the Wireshark
-    hub, from inside `feed()`. A line is what OnAir's own parser reads from that packet (`src/frames.cpp`, one function
+  - `zigbee`, `thread`, `zwave`, `wifi`, `wisun`: OnAir's receivers for 802.15.4 (Zigbee, and Thread, which is the same
+    receiver in `setThreadMode(true)`), Z-Wave, Wi-Fi and Wi-SUN put nothing on the bus and hand each frame whose check
+    passed to the Wireshark hub, from inside `feed()` (Wi-SUN: inside `feed()` or `flush()`, below). A line is what OnAir's own parser reads from that packet (`src/frames.cpp`, one function
     for each mode, a `BusMode`'s `packetLines`); a packet the parser cannot read, or that is not what the mode's line is
     about, gives no line and is still a pcap record. Nothing is decrypted and no key is loaded: frames are given as
     received. Every member is there only when the frame has it. Addresses are lower-case hex without separators.
@@ -201,6 +206,45 @@ point is their packets, which Wireshark reads.
       has none) and `len` (the 802.11 frame's, without its FCS). **No `rate_mbps`:** OnAir's radiotap header has the flags,
       the channel and the signal level, and no data rate, so the rate a frame was received at is not known. The receiver
       wants 20 MHz at least; `--freq` picks the band and the channel the frames are noted on.
+    - `wisun` (`wisun.frame`, `wisun::parse`): OnAir's Wi-SUN FAN monitor (IEEE 802.15.4g SUN FSK) on every channel of the
+      band plan within 0.45 of the rate around `--freq`, at the bit rates the plan's channels carry (50, 100 and
+      150 kbit/s; 200 and 300 kbit/s, on 600 kHz channels, are not demodulated), all at once: the nodes hop, and nothing is
+      followed. `frame_type` (the Wi-SUN frame type of the UTT-IE: `pan_advert`, `pan_advert_solicit`, `pan_config`,
+      `pan_config_solicit`, `data`, `ack`, `eapol`, `lfn_pan_advert`, `lfn_pan_advert_solicit`, `lfn_pan_config`,
+      `lfn_pan_config_solicit`, `extended_data`; a frame without one has its MAC frame's type, as `zigbee`'s), `seq`,
+      `pan` (4 hex digits: the destination's PAN, else the source's), `src` and `dst` (16 hex digits, the EUI-64; 4 for a
+      short address; a broadcast has no `dst`), `freq_hz` (the channel's centre), `rate_bps` and `len` (the MPDU's, without
+      its FCS: the pcap record's length). OnAir's Wi-SUN packet is the MPDU only, so the channel and the bit rate are
+      taken from the receiver's own frame log (its report, `telemetry()`), where the frame is found by its octets. A
+      frame whose header OnAir cannot read is a record and no line. Encrypted frames (PAN configurations, data) stay
+      encrypted: no key is loaded. The band plan: `--region` when given, otherwise the receiver's own pick for `--freq`
+      (OnAir's `bandPlanFor`: ANZ from 914.5 to 929 MHz and everywhere it has no other, NA from 900 to 914.5 MHz, EU863,
+      EU870, CN470, CN779, WW at 2.4 GHz). A plan with no channel inside the input, as the receiver's first report says,
+      exits 2 before reading input with `onair-rx: wisun: region <id> has no channel within <lo>-<hi> MHz` (named) or
+      `onair-rx: wisun: region <id> (OnAir's pick for <freq> MHz) has no channel within <lo>-<hi> MHz` (`--freq` plus or
+      minus 0.45 of the rate); an unknown `--region` with `onair-rx: wisun: no region <name> (ANZ, NA, ...)`. The
+      receiver wants 2 MHz at least (a few channels: at 2 MHz around 921.5 MHz, the four 400 kHz channels from 921.0 to
+      922.2 MHz and the 200 kHz ones from 920.8 to 922.2 MHz).
+      **Its decoder runs on a thread of its own.** The receiver's feed thread finds the bursts (a filter bank, an energy
+      detector per bin) and queues them; the decoder thread demodulates them; a later `feed()` or report hands the frames
+      over to the hub and the frame log. A frame's line would then come at whichever block the threads got to, so
+      onair-rx follows every block with the receiver's `flush()`, which waits for the decoder to finish the bursts queued
+      so far and hands their frames over: a frame's line comes after the block in which its burst ended, whatever the
+      threads did (one CPU or several give the same bytes), and nothing is dropped when the input comes faster than real
+      time (the receiver's `setOffline(true)`: it waits for its decoder instead of dropping bursts). At the end of input
+      (`flushAtEnd`) a last `flush()` hands over the rest. A burst the input cuts off is never queued, so a cut in the
+      middle of a frame loses that frame and the flush does not wait for it.
+      **`t_sample`** is then the first sample of the block of 16384 in which the receiver saw the burst end: 160 bin
+      samples (0.32 ms at 2 MHz) of quiet after the frame's last. It is up to one block (8.2 ms at 2 MHz) before that,
+      never after: on `onair-gen`'s scene at 2 MHz, from 7.0 ms to 0.2 ms before the end of the frame (its frames last
+      2.0 to 7.5 ms, so from 4.5 ms before to 5.4 ms after the frame's start). From a pipe the blocks are what each read
+      returns, so `t_sample` is as near or nearer.
+      **`--drop`** runs the receiver as it runs live (`setOffline(false)`): no `flush()` after each block, bursts that come
+      while the decoder queue is full (`kQueueMax`, 8000000 bin samples) are dropped. A frame's line then comes with the
+      block in which its frame was handed over, and the report its `freq_hz` and `rate_bps` are read from may not have the
+      frame yet (OnAir reports every 0.25 s of input): those two are then left out. The flush at the end of input still
+      hands over the last frames; it waits for the bursts already queued, at most that queue. Without `--drop` it waits for
+      one block's bursts at most. The node uses `--drop` only for a job that cannot keep real time otherwise.
 
   Measured on the build host (12 cores, x86-64), OnAir `a63c3a8`, user CPU per second of input (`/usr/bin/time -f %U`)
   on `onair-gen`'s scenes: `ble` at 4 MHz, 0.09 to 0.10 s a second; `lorawan` at 2 MHz around 868.3 MHz (EU868: seven
@@ -208,7 +252,10 @@ point is their packets, which Wireshark reads.
   four of the hub packets, on their scenes and (second figure) on noise alone, at the receiver's own minimum rate, which is
   also the lowest that decodes the scene: `zigbee` at 4 MHz, 0.49 and 0.59 s a second; `thread` at 4 MHz, 0.48 and 0.61;
   `zwave` at 2 MHz around 869.13 MHz, 0.01 and 0.02 (at 1 MHz around 868.41 MHz it decodes the two channels inside); `wifi` at
-  20 MHz, 0.31 and 0.52. All publish from inside `feed()`.
+  20 MHz, 0.31 and 0.52. All publish from inside `feed()`. `wisun` at 2 MHz around 921.5 MHz, both threads together, 0.07
+  and 0.06 s a second (0.14 to 0.15 s over 2.13 s, 0.49 to 0.51 s over 8 s of noise), the same with `--drop`: the
+  `flush()` after each block costs nothing measurable with the scene's tables (OnAir's report copies its tables of nodes,
+  links and the last 800 frames each time, so a busy network costs more).
 
   Not on the generic path: none of the modes so far. A receiver that needs more than a channel, a centre and a type
   filter (a second channel, an engine of its own) gets a line here saying what it needed.
@@ -358,7 +405,8 @@ point is their packets, which Wireshark reads.
   line. LoRaWAN: the PHY payload of every frame that has a line, behind a LoRaTap header (frequency, bandwidth, spreading
   factor, SNR; link type 270). Zigbee and Thread: the PSDU with its FCS (link type 195, IEEE 802.15.4 with FCS). Z-Wave: a
   byte for the data rate (0 to 2) and the MPDU (link type 148, USER1; `onair-rx --lua` has the dissector). Wi-Fi: a radiotap
-  header and the 802.11 frame, FCS taken off (link type 127), every good frame, also those without a line. Each of these
+  header and the 802.11 frame, FCS taken off (link type 127), every good frame, also those without a line. Wi-SUN: the
+  MPDU as received, without its FCS (link type 230, IEEE 802.15.4 without FCS), one per frame. Each of these
   has at least as many records as lines. The other bus modes and the polled modes have no packets and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that
   connects a few seconds late still gets them; a client that hangs up is dropped, and the next one gets a new header.
   Record times are the frame's sample time (bus modes: its block's first sample) on the wall clock of the first sample,
@@ -367,8 +415,8 @@ point is their packets, which Wireshark reads.
 - **stderr:** diagnostics, one line each. An unknown mode exits 2 with `onair-rx: no mode <m>`; a port that
   cannot be opened, or a failed read of stdin (`onair-rx: stdin: <reason>`), exits 1.
 - **EOF** on stdin: what was decoded is written (the queued records to a connected client), then exit 0.
-  No mode so far flushes its receiver at the end of input (a bus row's `flushAtEnd`, below, is for one that holds frames
-  until told): a decode a receiver still holds when stdin closes is not written. A short
+  Only `wisun` flushes its receiver at the end of input (a bus row's `flushAtEnd`, below, is for one that holds frames
+  until told); with another mode a decode a receiver still holds when stdin closes is not written, and a short
   replay (ZetaSDR's `capture_decode`) can lose its last message this way. A polled mode polls once more at EOF, so
   what its receiver's snapshot has by then is written.
   SIGTERM ends it at once.
@@ -384,9 +432,10 @@ test/bus.sh                               # the bus modes on OnAir's own test si
 test/poll.sh                              # the polled modes on OnAir's own test signals (_build/onair-gen), the voice
                                           # modes also with mbelib and Codec 2 hidden, the status modes also on noise
                                           # (about 40 s; it prints each status run's user CPU)
-test/only.sh                              # the modes only OnAir decodes (ble, lorawan, zigbee, thread, zwave, wifi) on
-                                          # OnAir's own scenes, their packets, the options each mode refuses, noise alone
-                                          # (it prints each mode's user CPU), and onair-gen's --sigmf pair
+test/only.sh                              # the modes only OnAir decodes (ble, lorawan, zigbee, thread, zwave, wifi,
+                                          # wisun) on OnAir's own scenes, their packets, the options each mode refuses,
+                                          # noise alone (it prints each mode's user CPU), onair-gen's --sigmf pair; wisun
+                                          # also cut short, run twice and on one CPU and two (taskset)
 ```
 
 The wrapper's headers are on the quoted include path only (`-iquote`), so that `src/poll.h` does not stand in for the
@@ -438,10 +487,18 @@ channel 6), noise in 20 MHz and **a tenth of a second** of it either side (at 20
 `--freq` defaults of Zigbee and Thread (2425 MHz, channel 15) and Wi-Fi (2437 MHz, channel 6) only go into a `--sigmf` pair;
 Z-Wave's moves the channels in the band. Only the 2.4 GHz Wi-Fi scene is used: the 5 and 6 GHz paths of the receiver
 (OFDM, several channels in a wide input) are not exercised here.
+`onair-gen --mode wisun --rate HZ [--freq HZ]` likewise: OnAir's FAN scene once (`makeWisunSynth`, `wisunTestSchedule`:
+PAN `7A31`, the border router `00:12:4B:FF:FE:1A:2B:3C` and the router `00:0D:6F:FF:FE:44:55:66` advertising, the meter
+`02:A1:B2:FF:FE:C3:D4:E5` soliciting and its EAPOL exchange through the router, a PAN configuration solicit and two PAN
+configurations, three data frames to the router and its acks, the border router's broadcast data, all at 150 kbit/s on
+the ANZ 400 kHz channels within 0.4 of the rate of 921.5 MHz, and a PAN configuration solicit at 50 kbit/s on a 200 kHz
+channel), on its channels around `--freq` (default 921.5 MHz, the scene's centre, between two channels; the frames stay
+on their channels), noise in 400 kHz (the generator's own measure). At 2 MHz that is 16 frames on 921.0, 921.2 and
+922.2 MHz. After its message line stderr says where each frame is: `frame N from A s to B s, R bit/s on F Hz`.
 `onair-gen ... --sigmf STEM`, with any mode, writes `STEM.sigmf-data` (ci16_le: each value times 32768, rounded and
 clipped) and `STEM.sigmf-meta` instead of stdout, the meta in the shape of `iq/adsb1090.sigmf-meta`: the sample rate,
 the datatype, the centre frequency (`--freq`, or the mode's own: ACARS 131.525 MHz, AIS 162 MHz, Bluetooth LE 2402 MHz,
-LoRaWAN 868.3 MHz, Zigbee and Thread 2425 MHz, Z-Wave 869.13 MHz, Wi-Fi 2437 MHz; left out for a mode with neither) and an annotation (`message`) per message: where the stderr line
+LoRaWAN 868.3 MHz, Zigbee and Thread 2425 MHz, Z-Wave 869.13 MHz, Wi-Fi 2437 MHz, Wi-SUN 921.5 MHz; left out for a mode with neither) and an annotation (`message`) per message: where the stderr line
 says it is.
 `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links,
 `onair-gen --selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`)
@@ -474,13 +531,14 @@ followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
   events become lines and the packets records. A mode is a row of `kBusModes`: how to make and set up its receiver,
   its hub channel, whether it needs `--freq`, and what its lines need that the bus lacks. A mode whose lines come
   from its hub packets (AIS) names the lines' event and a function that turns a packet into a line; its hub channel
-  then runs with or without a pcap port. A row with `flushAtEnd` has its feed called once more at the end of input
-  with no samples (which its feed takes as "flush"), and what that gives is drained at the last block's first sample.
-  Another receiver on the bus is one more row.
-- `src/frames.cpp`: the `packetLines` of `zigbee`, `thread`, `zwave` and `wifi` (declared in `src/frames.h`), each turning
-  a hub packet into the members of a line with OnAir's own parser (`zigbee::parse`, `thread::analyse`, `zwave::parse`,
-  `wifi::parseFrame`), and Z-Wave's region choice. Z-Wave's lines need to know where the input is (its packets carry no
-  channel): `openZwave` tells `zwaveWhere` before the run, a file-level state, since `packetLines` takes no argument.
+  then runs with or without a pcap port. The row's `packetLines` makes that function once per run, after `open`, from the
+  run's options and the feed `open` made: Z-Wave's lines need to know where the input is (its packets carry no channel),
+  Wi-SUN's need the receiver's frame log, which they reach through its feed (a `WisunFeed`, `std::function::target`).
+  A row with `flushAtEnd` has its feed called once more at the end of input with no samples (which its feed takes as
+  "flush"), and what that gives is drained at the last block's first sample. Another receiver on the bus is one more row.
+- `src/frames.cpp`: the `packetLines` of `zigbee`, `thread`, `zwave`, `wifi` and `wisun` (declared in `src/frames.h`), each
+  turning a hub packet into the members of a line with OnAir's own parser (`zigbee::parse`, `thread::analyse`,
+  `zwave::parse`, `wifi::parseFrame`, `wisun::parse`), and Z-Wave's region choice.
 - `src/hub_tap.cpp`: `HubTap`, the hub's packets of one channel: it configures the hub (no file, no live capture, no
   GSMTAP), puts its sink on it (`patches/0001`) and enables the channel; the sink collects under a lock, so a receiver
   may publish from a thread of its own, and the read loop drains it after each block. `hubRecord` makes a packet a

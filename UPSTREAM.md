@@ -1,6 +1,6 @@
 # What to offer upstream
 
-Three changes to OnAir, as the operator would send them. Nothing here has been sent. OnAir takes focused pull requests
+Four changes to OnAir, as the operator would send them. Nothing here has been sent. OnAir takes focused pull requests
 with a test and a DCO sign-off (`git commit -s`), from the operator's account, one change to a request.
 
 Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
@@ -68,6 +68,22 @@ Described only; not written here.
 - **No speech switch is asked for:** the voice receivers decode a voice frame only for a call their voice monitor
   plays, and a monitor whose allow list is on and empty refuses every call (`src/poll_voice.cpp`). A program that
   wants the events without the speech therefore already has a way, with no change to OnAir.
+
+## 4. Wi-SUN: the frame's channel and bit rate on the hub, and handing over decoded frames without a report
+
+Described only; not written here.
+
+- **Change:** `WisunReceiver` (`wisun/wisun_rx.cpp`, `accept()`) publishes the MPDU alone (link type 230), so a program
+  reading the hub learns neither the channel nor the bit rate of a frame. They could go with it as an IEEE 802.15.4 TAP
+  header (link type 283, its channel and PHY fields), as the LoRaWAN receiver's LoRaTap header carries its frequency. And
+  `flush()` is the only way to have the decoder thread's frames handed over at a chosen point: it also makes a whole report
+  (a copy of every table, sorted), so a caller that wants the frames after every block pays for a report after every block.
+  A `takeDecoded()` that waits for the decoder and hands its frames over, without the report, would do.
+- **Why:** `onair-rx`'s `wisun` mode reads the channel and the bit rate from the receiver's frame log in its report, and
+  flushes after every block so that a frame's line does not depend on when the decoder thread ran (README, `wisun`).
+  With `--drop` (no flush per block) a frame can reach the hub before the report that has it, and its line then has no
+  channel or bit rate.
+- **Test:** the receiver's own test (`tests/wisun/test_wisun_rx.cpp`), reading the header's channel off a hub sink.
 
 ## Dropped
 

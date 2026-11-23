@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 #
-# End-to-end check of the modes only OnAir decodes (so far ble, lorawan, zigbee, thread, zwave and wifi) on OnAir's own test
-# signals: _build/onair-gen makes the scene of OnAir's generator for the mode (makeBleSynth, makeLorawanSynth, makeZigbeeSynth,
-# the frames of OnAir's Thread test, makeZwaveSynth, makeWifiSynth) with a second of noise either side (Wi-Fi: a tenth of a
-# second, at 20 Msps), onair-rx decodes it. The four modes whose lines come from their Wireshark hub packets (zigbee, thread,
+# End-to-end check of the modes only OnAir decodes (so far ble, lorawan, zigbee, thread, zwave, wifi and wisun) on OnAir's own
+# test signals: _build/onair-gen makes the scene of OnAir's generator for the mode (makeBleSynth, makeLorawanSynth,
+# makeZigbeeSynth, the frames of OnAir's Thread test, makeZwaveSynth, makeWifiSynth, makeWisunSynth) with a second of noise either
+# side (Wi-Fi: a tenth of a second, at 20 Msps), onair-rx decodes it. Wi-SUN, whose frames come out of a decoder thread, is also
+# checked for the frames the end of input holds (the flush), runs that give the same bytes, on one CPU or two, and input that
+# ends in the middle of a frame. The four modes whose lines come from their Wireshark hub packets (zigbee, thread,
 # zwave, wifi) are also checked against what OnAir's generator put in the scene, their pcap link types, --freq missing, and
 # noise alone (8 s of /dev/urandom: no line, exit 0); the script prints each mode's user CPU over its seconds of input. The signals are synthesised; no capture is used. Also: the options a mode does not take (--width, --plan,
 # --region, --drop) are refused by every mode that does not take them, lorawan without --freq and at a --freq no channel plan covers, the frames on the
@@ -37,6 +39,11 @@ for row in "zigbee 4000000 $zb_hz" "thread 4000000 $zb_hz" "zwave 2000000 $zw_hz
   [ ! -s "$d/$m.empty" ] || fail "$m: a line on empty input"
 done
 echo "ok: onair-rx has zigbee, thread, zwave and wifi"
+ws_hz=921500000      # the centre of OnAir's Wi-SUN scene (wisunTuning().defMhz), between two ANZ channels
+"$bin" --mode wisun --rate 2000000 --freq "$ws_hz" </dev/null >"$d/wisun.empty" 2>"$d/wisun.empty.err" ||
+  fail "wisun: $(cat "$d/wisun.empty.err")"
+[ ! -s "$d/wisun.empty" ] || fail "wisun: a line on empty input"
+echo "ok: onair-rx has wisun"
 
 # --- refuses <stderr> <onair-rx args...>: exit 2 with exactly that one line on stderr, before reading any input (stdin stays
 # open and is never written), and nothing on stdout
@@ -80,26 +87,35 @@ refuses "onair-rx: 2000000 Hz is too low for zigbee (at least 4000000 Hz)" --mod
   fail "zigbee at 2 MHz"
 refuses "onair-rx: 4000000 Hz is too low for wifi (at least 20000000 Hz)" --mode wifi --rate 4000000 --freq "$wf_hz" ||
   fail "wifi at 4 MHz"
+refuses "onair-rx: wisun needs --freq HZ" --mode wisun --rate 2000000 || fail "wisun without --freq"
+refuses "onair-rx: 1000000 Hz is too low for wisun (at least 2000000 Hz)" --mode wisun --rate 1000000 --freq "$ws_hz" ||
+  fail "wisun at 1 MHz"
+refuses "onair-rx: wisun: no region XX (ANZ, NA, MX, BZ, JP, KR, PH, MY, HK, SG, SG866, TH, VN, EU863, EU870, IN, CN470, CN779, CN920, WW)" \
+  --mode wisun --rate 2000000 --freq "$ws_hz" --region XX || fail "wisun with an unknown --region"
+refuses "onair-rx: wisun: region EU863 has no channel within 920.600-922.400 MHz" --mode wisun --rate 2000000 --freq "$ws_hz" \
+  --region EU863 || fail "wisun with a --region that has no channel in the input"
+refuses "onair-rx: wisun: region ANZ (OnAir's pick for 100.000 MHz) has no channel within 99.100-100.900 MHz" --mode wisun \
+  --rate 2000000 --freq 100000000 || fail "wisun at a --freq whose region has no channel in the input"
 
 # --- the options a mode does not take: every mode before this plan refuses all four; ble, zigbee, thread and wifi all four;
-# lorawan all but --plan; zwave all but --region.
+# lorawan all but --plan; zwave all but --region; wisun --width and --plan.
 # Each mode gets the rate and the --freq it needs, so that the option is the only thing wrong
 for row in "adsb 2400000" "pocsag 1000000" "flex 1000000" "acars 1000000 131525000" "aprs 240000" "ais 250000 162000000" \
   "vdl2 250000 136975000" "hfdl 24000 8927000" "rs41 2000000" "dfm 2000000" "m20 2000000" "rds 500000" "dmr 48000" \
   "p25 250000" "m17 250000" "dvbt 10000000" "video 8000000" "ble 4000000" "lorawan 2000000 $lora_hz" \
-  "zigbee 4000000 $zb_hz" "thread 4000000 $zb_hz" "zwave 2000000 $zw_hz" "wifi 20000000 $wf_hz"; do
+  "zigbee 4000000 $zb_hz" "thread 4000000 $zb_hz" "zwave 2000000 $zw_hz" "wifi 20000000 $wf_hz" "wisun 2000000 $ws_hz"; do
   read -r m rate hz <<<"$row"
   f=(--mode "$m" --rate "$rate")
   [ -z "${hz:-}" ] || f+=(--freq "$hz")
   for opt in "width 2000000" "plan EU868" "region EU" "drop"; do
     read -r o v <<<"$opt"
-    case "$m/$o" in lorawan/plan | zwave/region) continue ;; esac
+    case "$m/$o" in lorawan/plan | zwave/region | wisun/region | wisun/drop) continue ;; esac
     a=(--"$o")
     [ -z "${v:-}" ] || a+=("$v")
     refuses "onair-rx: $m takes no --$o" "${f[@]}" "${a[@]}" >/dev/null || fail "$m with --$o"
   done
 done
-echo "ok: every mode refuses the options it does not take (lorawan takes --plan, zwave --region)"
+echo "ok: every mode refuses the options it does not take (lorawan takes --plan, zwave --region, wisun --region and --drop)"
 
 [ -x "$gen" ] || fail "no test signal generator at $gen (run ./build.sh)"
 
@@ -247,6 +263,9 @@ elif tag == "wifi":               # a radiotap header (version 0, its length, th
     for r in recs:
         hl, present = struct.unpack("<HI", r[2:8])
         assert r[0] == 0 and 8 <= hl < len(r) and present & 2, "not a radiotap header"
+elif tag == "wisun":              # the MPDU without its FCS (link type 230), one per line: the line's len is the record's
+    lens = [json.loads(l)["len"] for l in out.splitlines()]
+    assert [len(r) for r in recs] == lens, f"records of {[len(r) for r in recs]} octets for lines of len {lens}"
 elif tag == "ble":   # BLUETOOTH_LE_LL: the advertising access address 0x8E89BED6, little endian, then the PDU
     assert all(r[:4] == bytes.fromhex("d6be898e") for r in recs), "a record without the advertising access address"
 else:              # LoRaTap version 0, its 15-byte header, the channel's frequency inside the input
@@ -384,8 +403,127 @@ pcap thread 195 --mode thread --rate 4000000 --freq "$zb_hz" || fail "thread on 
 pcap zwave 148 --mode zwave --rate 2000000 --freq "$zw_hz" || fail "zwave on the pcap port"
 pcap wifi 127 --mode wifi --rate 20000000 --freq "$wf_hz" || fail "wifi on the pcap port"
 
+# --- Wi-SUN: OnAir's FAN scene (makeWisunSynth) at 2 MHz around 921.5 MHz, between two of its ANZ channels: the frames come out
+# of the receiver's decoder thread, and those it still holds when the input ends only through its flush.
+# wscheck <jsonl> <tag of the generator's run> <rate> <samples>: a line per frame of the scene, in its order, each with the
+# frame's channel and bit rate and the scene's addresses; t_sample next to the frame's end. Prints how far t_sample trails it.
+wscheck() {
+  python3 -I - "$1" "$d/$2.gen" "$3" "$4" <<'EOF'
+import json, re, sys
+path, genlog, rate, nsamp = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4])
+raw = open(path, "rb").read()
+assert raw.endswith(b"\n"), "the last line is not ended"
+ls = [json.loads(l) for l in raw.splitlines()]
+log = open(genlog).read()
+t0, t1 = map(float, re.search(r"message from ([0-9.]+) s to ([0-9.]+) s", log).groups())
+frames = [(float(a), float(b), int(br), int(hz)) for a, b, br, hz in
+          re.findall(r"frame \d+ from ([0-9.]+) s to ([0-9.]+) s, (\d+) bit/s on (\d+) Hz", log)]
+assert frames, "the generator did not say where the frames are"
+assert len(ls) == len(frames), f"{len(ls)} line(s) for the scene's {len(frames)} frames"
+hex_re = lambda n: re.compile(rf"[0-9a-f]{{{n}}}")
+types = {"pan_advert", "pan_advert_solicit", "pan_config", "pan_config_solicit", "data", "ack", "eapol"}
+last, trail = 0, []
+for n, (o, (a, b, br, hz)) in enumerate(zip(ls, frames)):
+    assert o.get("event") == "wisun.frame", f"line {n}: event {o.get('event')!r}"
+    t = o.get("t_sample")
+    assert type(t) is int and 0 <= t < nsamp and t >= last, f"line {n}: t_sample {t!r} (of {nsamp}, after {last})"
+    last = t
+    assert t0 - 0.5 <= t / rate <= t1 + 0.5, f"line {n}: at {t / rate:.3f} s, the message is at {t0:.3f} s to {t1:.3f} s"
+    assert all(v is not None for v in o.values()), f"line {n}: a null member"
+    assert not any(type(v) is float for v in o.values()), f"line {n}: a decimal number {o!r}"
+    assert o.get("frame_type") in types, f"line {n}: frame_type {o.get('frame_type')!r}"
+    assert "seq" not in o or type(o["seq"]) is int and 0 <= o["seq"] <= 255, f"line {n}: seq {o.get('seq')!r}"
+    assert "pan" not in o or hex_re(4).fullmatch(o["pan"]), f"line {n}: pan {o.get('pan')!r}"
+    assert all(k not in o or hex_re(16).fullmatch(o[k]) for k in ("src", "dst")), f"line {n}: addresses {o!r}"
+    assert type(o.get("len")) is int and o["len"] > 0, f"line {n}: len {o.get('len')!r}"
+    assert o.get("freq_hz") == hz and o.get("rate_bps") == br, f"line {n}: {o.get('freq_hz')!r} Hz, {o.get('rate_bps')!r} bit/s; the frame was on {hz} Hz at {br} bit/s"
+    trail.append(t / rate - b)
+by = lambda f: [o for o in ls if f(o)]
+br, router, meter = "00124bfffe1a2b3c", "000d6ffffe445566", "02a1b2fffec3d4e5"
+# OnAir's scene (wisun_gen.cpp, wisunTestSchedule): PAN 7A31; the border router's and the router's PAN adverts, the meter's
+# solicit and its EAPOL exchange through the router, a PAN configuration solicit and two PAN configurations, three data frames
+# meter > router (seq 10 to 12) and the router's acks, the border router's broadcast data (seq 0x55), a solicit at 50 kbit/s
+assert {o["src"] for o in ls if "src" in o} == {br, router, meter}, f"sources {sorted({o.get('src') for o in ls})}"
+assert {o["frame_type"] for o in ls} == types, f"frame types {sorted({o['frame_type'] for o in ls})}"
+assert {o["src"] for o in by(lambda o: o["frame_type"] == "pan_advert" and o.get("pan") == "7a31")} == {br, router}, "the two PAN adverts"
+assert by(lambda o: o["frame_type"] == "pan_advert_solicit" and o.get("src") == meter), "the meter's PAN advert solicit"
+assert by(lambda o: o["frame_type"] == "eapol" and o.get("src") == meter and o.get("dst") == router), "the meter's EAPOL"
+assert by(lambda o: o["frame_type"] == "eapol" and o.get("src") == router and o.get("dst") == meter), "the router's EAPOL"
+data = by(lambda o: o["frame_type"] == "data" and o.get("src") == meter and o.get("dst") == router)
+assert sorted(o.get("seq") for o in data) == [10, 11, 12], f"the meter's data: {data!r}"
+acks = by(lambda o: o["frame_type"] == "ack" and o.get("src") == router and o.get("dst") == meter)
+assert sorted(o.get("seq") for o in acks) == [10, 11, 12], f"the router's acks: {acks!r}"
+assert by(lambda o: o["frame_type"] == "data" and o.get("src") == br and o.get("seq") == 0x55 and "dst" not in o), "the broadcast data"
+assert {o["rate_bps"] for o in ls} == {50000, 150000}, f"bit rates {sorted({o['rate_bps'] for o in ls})}"
+assert by(lambda o: o["rate_bps"] == 50000 and o["frame_type"] == "pan_config_solicit" and o.get("src") == router), "the 50 kbit/s solicit"
+print(f"ok: {len(ls)} wisun.frame line(s), one per frame of the scene, on {len({o['freq_hz'] for o in ls})} channel(s); "
+      f"t_sample from {min(trail) * 1e3:.1f} ms to {max(trail) * 1e3:.1f} ms after the frame's end")
+# the bound the README gives: within one input block (16384 samples) and 2 ms of the frame's end
+blk = 16384 / rate + 0.002
+assert all(-blk <= x <= blk for x in trail), f"t_sample {min(trail) * 1e3:.1f} to {max(trail) * 1e3:.1f} ms from the frame's end"
+EOF
+}
+frames wisun 2000000 "$ws_hz"
+wscheck "$d/wisun.jsonl" wisun 2000000 "$(samples wisun)" || fail wisun
+# the same input again, and on one CPU and on two: the same bytes (no line depends on when the decoder thread ran)
+rx wisun --mode wisun --rate 2000000 --freq "$ws_hz"
+cp "$d/wisun.jsonl" "$d/wisun-1.jsonl"
+rx wisun --mode wisun --rate 2000000 --freq "$ws_hz"
+cmp -s "$d/wisun-1.jsonl" "$d/wisun.jsonl" || fail "wisun: a second run gives other bytes"
+for cpus in 0 0,1; do
+  taskset -c "$cpus" "$bin" --format cf32 --mode wisun --rate 2000000 --freq "$ws_hz" <"$d/wisun.iq" >"$d/wisun-cpu.jsonl" \
+    2>"$d/wisun-cpu.err" || fail "wisun on CPU $cpus: $(tail -n 3 "$d/wisun-cpu.err")"
+  cmp -s "$d/wisun-1.jsonl" "$d/wisun-cpu.jsonl" || fail "wisun on CPU $cpus gives other bytes"
+done
+echo "ok: wisun: two runs, and runs on CPU 0 and on CPUs 0 and 1, give the same bytes"
+# --region ANZ is the region found from --freq: the same bytes
+"$bin" --mode wisun --rate 2000000 --freq "$ws_hz" --region ANZ <"$d/wisun.iq" >"$d/wisun-anz.jsonl" 2>/dev/null ||
+  fail "wisun with --region ANZ"
+cmp -s "$d/wisun-1.jsonl" "$d/wisun-anz.jsonl" || fail "wisun --region ANZ gives other lines than the region found"
+echo "ok: --region ANZ gives the lines of the region found from --freq"
+# cutiq <tag> <seconds>: the first seconds of $d/wisun.iq into $d/<tag>.iq
+cutiq() { head -c "$(python3 -I -c 'import sys; print(round(float(sys.argv[1]) * 2000000) * 8)' "$2")" "$d/wisun.iq" >"$d/$1.iq"; }
+ws_end=$(sed -n 's/.*message from [0-9.]* s to \([0-9.]*\) s.*/\1/p' "$d/wisun.gen")
+# the input cut 0.2 s after the message's end: the last frame still comes (the flush), the same bytes
+cutiq wisun-end "$(python3 -I -c 'import sys; print(float(sys.argv[1]) + 0.2)' "$ws_end")"
+rx wisun-end --mode wisun --rate 2000000 --freq "$ws_hz"
+cmp -s "$d/wisun-1.jsonl" "$d/wisun-end.jsonl" || fail "wisun: the input cut 0.2 s after the message gives other lines"
+echo "ok: wisun: the input cut 0.2 s after the message's end gives every line"
+# with --drop the decoder thread is not waited for while the input comes: the last frame, 1 ms before the input ends, comes only
+# from the flush; the same frames (t_sample, freq_hz and rate_bps aside: frames handed over between two of the receiver's
+# reports are not in its report yet)
+ws_last_end=$(sed -n 's/.*frame [0-9]* from [0-9.]* s to \([0-9.]*\) s.*/\1/p' "$d/wisun.gen" | tail -n 1)
+cutiq wisun-drop "$(python3 -I -c 'import sys; print(float(sys.argv[1]) + 0.001)' "$ws_last_end")"
+rx wisun-drop --mode wisun --rate 2000000 --freq "$ws_hz" --drop
+python3 -I -c '
+import json, sys
+strip = lambda p: [{k: v for k, v in json.loads(l).items() if k not in ("t_sample", "freq_hz", "rate_bps")} for l in open(p, "rb")]
+a, b = strip(sys.argv[1]), strip(sys.argv[2])
+assert a == b, f"{len(b)} line(s) with --drop, {len(a)} without; or other members"
+print(f"ok: wisun --drop, the input cut 1 ms after the last frame: the {len(b)} frames, the last from the flush")' \
+  "$d/wisun-1.jsonl" "$d/wisun-drop.jsonl" || fail "wisun with --drop"
+# the input cut in the middle of a frame (the middle one of the scene): exit 0 within 5 s, the lines of the frames before it
+ws_mid=$(python3 -I -c '
+import re, sys
+f = re.findall(r"frame \d+ from ([0-9.]+) s to ([0-9.]+) s", open(sys.argv[1]).read())
+a, b = map(float, f[len(f) // 2])
+print((a + b) / 2)' "$d/wisun.gen")
+cutiq wisun-mid "$ws_mid"
+st=0
+timeout 5 "$bin" --format cf32 --mode wisun --rate 2000000 --freq "$ws_hz" <"$d/wisun-mid.iq" >"$d/wisun-mid.jsonl" \
+  2>"$d/wisun-mid.err" || st=$?
+[ "$st" = 0 ] || fail "wisun on input cut in the middle of a frame: exit $st (124: not within 5 s): $(tail -n 3 "$d/wisun-mid.err")"
+python3 -I -c '
+import sys
+a, b = open(sys.argv[1], "rb").read().splitlines(), open(sys.argv[2], "rb").read().splitlines()
+assert b == a[:len(a) // 2], f"{len(b)} line(s); want the first {len(a) // 2} of {len(a)}"
+print(f"ok: wisun on input cut in the middle of frame {len(a) // 2 + 1}: exit 0 within 5 s, the {len(b)} lines before it")' \
+  "$d/wisun-1.jsonl" "$d/wisun-mid.jsonl" || fail "wisun on input cut in the middle of a frame"
+pcap wisun 230 --mode wisun --rate 2000000 --freq "$ws_hz" || fail "wisun on the pcap port"
+
 # --- noise alone: 8 s (Wi-Fi: 2 s) of /dev/urandom as cs16 gives no line and exit 0
-for row in "zigbee 4000000 $zb_hz 8" "thread 4000000 $zb_hz 8" "zwave 2000000 $zw_hz 8" "wifi 20000000 $wf_hz 2"; do
+for row in "zigbee 4000000 $zb_hz 8" "thread 4000000 $zb_hz 8" "zwave 2000000 $zw_hz 8" "wifi 20000000 $wf_hz 2" \
+  "wisun 2000000 $ws_hz 8"; do
   read -r m rate hz secs <<<"$row"
   head -c $((rate * secs * 4)) /dev/urandom >"$d/noise.cs16"
   /usr/bin/time -f %U -o "$d/noise.cpu" "$bin" --mode "$m" --rate "$rate" --freq "$hz" --format cs16 <"$d/noise.cs16" \

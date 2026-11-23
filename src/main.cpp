@@ -47,8 +47,8 @@ struct OnlySome {
 static const OnlySome kOnlySome[] = {
     {"width", "", [](const Options& o) { return o.width > 0; }},
     {"plan", "lorawan", [](const Options& o) { return !o.plan.empty(); }},
-    {"region", "zwave", [](const Options& o) { return !o.region.empty(); }},
-    {"drop", "", [](const Options& o) { return o.drop; }},
+    {"region", "zwave wisun", [](const Options& o) { return !o.region.empty(); }},
+    {"drop", "wisun", [](const Options& o) { return o.drop; }},
 };
 static bool takes(const char* modes, const std::string& mode) {
     const std::string list = std::string(" ") + modes + " ";
@@ -105,8 +105,9 @@ static void usage(FILE* f) {
                "per decode on stdout; with --pcap-port, a classic pcap stream of the frames for one client at a time on\n"
                "127.0.0.1:PORT; --bandwidth (dvbt: 8, 7, 6 or 5) fixes the channel width, which is otherwise found; --plan\n"
                "(lorawan) names the channel plan, which is otherwise the one with most channels in the input; --region (zwave)\n"
-               "the Z-Wave region, which is otherwise the one with most channels in the input. --width and --drop are taken\n"
-               "by no mode yet. Modes:");
+               "the Z-Wave region, which is otherwise the one with most channels in the input, and (wisun) the Wi-SUN band\n"
+               "plan, which is otherwise the one for --freq; --drop (wisun) lets the receiver drop bursts its decoder has no\n"
+               "time for, as it does live, instead of waiting for it. --width is taken by no mode yet. Modes:");
     for (const Mode& m : kModes) fprintf(f, " %s", m.name);
     for (size_t i = 0; i < kBusModeCount; i++) fprintf(f, " %s", kBusModes[i].name);
     for (size_t i = 0; i < kPollModeCount; i++) fprintf(f, " %s", kPollModes[i].name);

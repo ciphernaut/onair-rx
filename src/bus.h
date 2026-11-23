@@ -2,7 +2,8 @@
 // onair-rx: the bus modes. Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 //
 // A bus mode is one OnAir receiver whose decodes are taken from OnAir's automation bus and whose frames are taken from OnAir's
-// Wireshark hub, both on this thread inside the receiver's feed(). One generic run serves every row of the table.
+// Wireshark hub, both on this thread inside the receiver's feed() (Wi-SUN: inside the flush() its feed calls). One generic run
+// serves every row of the table.
 #pragma once
 #include "rx.h"
 #include "dect2/automation/event.h"
@@ -10,6 +11,11 @@
 #include <string>
 
 namespace onair_rx {
+
+// A receiver's feed: one block of the input; (nullptr, 0), for a mode with flushAtEnd, the end of input
+using Feed = std::function<void(const cf32*, size_t)>;
+// What adds a hub packet's members to its line (false: no line for this packet)
+using PacketLine = std::function<bool(const uint8_t* p, size_t n, Json& j)>;
 
 struct BusMode {
     const char* name;                 // "pocsag"
@@ -19,12 +25,13 @@ struct BusMode {
     int chan;                         // a dect2::wire::Chan, or -1: no packets
     bool needsFreq;                   // the receiver places its channels by frequency: --freq is required
     // makes the receiver, sets it up for o, and returns its feed; false with *err set when o does not suit the mode
-    bool (*open)(const Options& o, std::function<void(const cf32*, size_t)>* feed, std::string* err);
+    bool (*open)(const Options& o, Feed* feed, std::string* err);
     // adds the members the row needs and the bus lacks to a line of the row's event; false drops the event. nullptr: none
     bool (*shape)(const dect2::automation::Event& e, Json& j);
-    // a mode whose lines come from its hub packets (the hub then runs with or without a pcap port): what makes, once per run,
-    // the function that adds a packet's members to its line (false: no line for this packet). nullptr: none
-    std::function<bool(const uint8_t* p, size_t n, Json& j)> (*packetLines)();
+    // a mode whose lines come from its hub packets (the hub then runs with or without a pcap port): what makes, once per run and
+    // after open, the function that adds a packet's members to its line, from the run's options and the feed open made (where
+    // a receiver whose packets lack what its line needs is reached). nullptr: none
+    PacketLine (*packetLines)(const Options& o, const Feed& feed);
     // the receiver holds frames until told the input has ended: runBus then calls its feed once with (nullptr, 0), which the
     // mode's feed takes as "flush", and drains the events and packets one more time
     bool flushAtEnd = false;

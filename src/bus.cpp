@@ -5,8 +5,10 @@
 // hand the frames they receive to OnAir's Wireshark hub, both from inside feed(), on the thread that calls it, with no engine
 // started. So one run serves every mode that has a receiver on the bus: a tap on the bus (every family) collects the events of
 // a block's feed(), a tap on the hub (HubTap, hub_tap.h, locked: a receiver may publish from a thread of its own) collects its
-// packets, and after the feed() the events become JSON lines and the packets pcap records. A mode is a row: its event (the only
-// bus event it writes), how to make and set up its receiver, its hub channel, and what its lines need that the bus lacks.
+// packets, and after the feed() the events become JSON lines and the packets pcap records. (Wi-SUN demodulates on a thread of
+// its own, but hands its frames to the hub on the feeding thread, inside feed() or flush(); it puts nothing on the bus.) A mode
+// is a row: its event (the only bus event it writes), how to make and set up its receiver, its hub channel, and what its lines
+// need that the bus lacks.
 #include "bus.h"
 #include "ais.h"
 #include "frames.h"
@@ -25,6 +27,9 @@
 #include "dect2/sonde/sonde_rx.h"
 #include "dect2/vdl2/vdl2_rx.h"
 #include "dect2/wifi/wifi_rx.h"
+#include "dect2/wisun/wisun_proto.h"
+#include "dect2/wisun/wisun_rx.h"
+#include "dect2/wisun/wisun_tel.h"
 #include "dect2/zigbee/zigbee_rx.h"
 #include "dect2/zwave/zwave_rx.h"
 #include "dect2/wirecap/wire.h"
@@ -39,7 +44,6 @@
 namespace onair_rx {
 
 using namespace dect2;
-using Feed = std::function<void(const cf32*, size_t)>;
 
 namespace {
 
@@ -155,7 +159,7 @@ bool openAis(const Options& o, Feed* feed, std::string* err) {
     return true;
 }
 bool shapeAis(const automation::Event&, Json&) { return false; }
-std::function<bool(const uint8_t*, size_t, Json&)> aisPackets() {
+PacketLine aisPackets() {
     auto joiner = std::make_shared<AisJoiner>();
     return [joiner](const uint8_t* p, size_t n, Json& j) {
         const auto sentences = joiner->add(std::string((const char*)p, n));
@@ -322,7 +326,6 @@ bool openZwave(const Options& o, Feed* feed, std::string* err) {
     if (!zwaveRegion(o.freq, o.rate, o.region, &region, err)) return false;
     if (!o.region.empty()) rx->setRegion(region);
     rx->setCenterHz(o.freq);
-    zwaveWhere(o.freq, o.rate, region);
     return true;
 }
 // Wi-Fi: the band is the --freq's (2.4 GHz: the DSSS frames of the channel at 0 Hz; 5 and 6 GHz: the 20 MHz channels inside a
@@ -332,6 +335,71 @@ bool openWifi(const Options& o, Feed* feed, std::string* err) {
     rx->setCenterHz(o.freq);
     return start(rx, o, "wifi", wifiTuning().minSampleRate, feed, err);
 }
+
+// Wi-SUN: OnAir's WisunReceiver listens on every channel of the band plan inside 0.45 of the rate around --freq, at the bit
+// rates its channel plans carry there (50, 100 and 150 kbit/s). --region names the band plan (OnAir's ids, case does not matter);
+// without it the receiver picks the plan by --freq. A plan with no channel inside the input is refused (the receiver would never
+// hear a frame): open asks the receiver itself, from its first report.
+// It demodulates the bursts on a thread of its own, and hands each frame over (to the hub and its frame log) at the start of a
+// later feed() or in a report. So that a frame's line comes at the same block whatever the threads did, each block is followed by
+// flush(): the decoder has finished every burst that ended in it, and its frames are handed over before the block is drained.
+// The receiver then waits for the decoder instead of dropping bursts (setOffline). With --drop it does neither, as it runs live:
+// bursts that come while the decoder is busy are dropped, a frame's line comes with the block in which it was handed over, and the
+// report a line takes its channel and bit rate from may not have it yet. At the end of input the flush hands over the last frames
+// either way. It waits only for the bursts already queued (a burst the input cuts off is never queued), at most kQueueMax
+// (wisun_rx.cpp) of them with --drop, one block's without.
+struct WisunFeed {
+    std::shared_ptr<WisunReceiver> rx;
+    bool eachBlock;   // flush after each block (no --drop)
+    void operator()(const cf32* x, size_t n) const {
+        if (x) rx->feed(x, n);
+        if (eachBlock || !x) rx->flush();
+    }
+};
+bool openWisun(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<WisunReceiver>();
+    if (!start(rx, o, "wisun", wisunTuning().minSampleRate, feed, err)) return false;
+    std::string region;
+    if (!o.region.empty()) {
+        std::string names;
+        for (const wisun::BandPlan& b : wisun::bandPlans()) {
+            if (strcasecmp(o.region.c_str(), b.id) == 0) region = b.id;
+            names += std::string(names.empty() ? "" : ", ") + b.id;
+        }
+        if (region.empty()) { *err = "wisun: no region " + o.region + " (" + names + ")"; return false; }
+        rx->setRegion(region);
+    }
+    rx->setCenterHz(o.freq);
+    rx->setDialHz(o.freq);
+    rx->setOffline(!o.drop);
+    // the receiver sets itself up on its first feed; its first report says the plan it took and the channels inside the input
+    rx->feed(nullptr, 0);
+    rx->flush();
+    WisunTelemetry t;
+    rx->telemetry(t, 0);
+    if (t.channelsCovered == 0) {
+        char b[160];
+        if (!region.empty())
+            snprintf(b, sizeof b, "wisun: region %s has no channel within %.3f-%.3f MHz", t.region.c_str(),
+                     (o.freq - 0.45 * o.rate) * 1e-6, (o.freq + 0.45 * o.rate) * 1e-6);
+        else
+            snprintf(b, sizeof b, "wisun: region %s (OnAir's pick for %.3f MHz) has no channel within %.3f-%.3f MHz", t.region.c_str(),
+                     o.freq * 1e-6, (o.freq - 0.45 * o.rate) * 1e-6, (o.freq + 0.45 * o.rate) * 1e-6);
+        *err = b;
+        return false;
+    }
+    *feed = WisunFeed{rx, !o.drop};
+    return true;
+}
+// its lines (frames.h) read the frame log of the receiver open made
+PacketLine wisunLines(const Options&, const Feed& feed) {
+    const WisunFeed* f = feed.target<WisunFeed>();
+    return f ? wisunPackets(f->rx) : nullptr;
+}
+
+// a mode's packetLines that needs neither the options nor the feed
+template <PacketLine (*Make)()>
+PacketLine plain(const Options&, const Feed&) { return Make(); }
 
 // a bus value as a member: whole numbers without a decimal point, a non-finite number or a null left out
 void member(Json& j, const std::string& k, const automation::Value& v) {
@@ -354,7 +422,7 @@ const BusMode kBusModes[] = {
     {"flex", "pager.message", -1, false, openFlex, shapeFlex, nullptr},
     {"acars", "acars.message", -1, true, openAcars, nullptr, nullptr},
     {"aprs", "aprs.packet", wire::Aprs, false, openAprs, shapeAprs, nullptr},
-    {"ais", "ais.message", wire::Ais, true, openAis, shapeAis, aisPackets},
+    {"ais", "ais.message", wire::Ais, true, openAis, shapeAis, plain<aisPackets>},
     {"vdl2", "vdl2.message", -1, true, openVdl2, shapeVdl2, nullptr},
     {"hfdl", "hfdl.message", -1, true, openHfdl, shapeHfdl, nullptr},
     {"rs41", "sonde.update", -1, false, openRs41, shapeRs41, nullptr},
@@ -362,10 +430,11 @@ const BusMode kBusModes[] = {
     {"m20", "sonde.update", -1, false, openM20, shapeM20, nullptr},
     {"ble", "ble.device", wire::Ble, false, openBle, shapeBle, nullptr},
     {"lorawan", "lora.packet", wire::LoRaWan, true, openLorawan, shapeLorawan, nullptr},
-    {"zigbee", "zigbee.frame", wire::Zigbee, true, openZigbee, nullptr, zigbeePackets},
-    {"thread", "thread.frame", wire::Thread, true, openThread, nullptr, threadPackets},
+    {"zigbee", "zigbee.frame", wire::Zigbee, true, openZigbee, nullptr, plain<zigbeePackets>},
+    {"thread", "thread.frame", wire::Thread, true, openThread, nullptr, plain<threadPackets>},
     {"zwave", "zwave.frame", wire::Zwave, true, openZwave, nullptr, zwavePackets},
-    {"wifi", "wifi.frame", wire::Wifi, true, openWifi, nullptr, wifiPackets},
+    {"wifi", "wifi.frame", wire::Wifi, true, openWifi, nullptr, plain<wifiPackets>},
+    {"wisun", "wisun.frame", wire::WiSun, true, openWisun, nullptr, wisunLines, true},
 };
 const size_t kBusModeCount = sizeof kBusModes / sizeof kBusModes[0];
 
@@ -377,7 +446,7 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
     // called on this thread, inside feed(): it only collects
     std::vector<automation::Event> events;
     automation::global().setTap([&events](const automation::Event& e) { events.push_back(e); }, automation::kAllFamilies);
-    const auto packetLine = m.packetLines ? m.packetLines() : nullptr;
+    const PacketLine packetLine = m.packetLines ? m.packetLines(o, feed) : nullptr;
     const bool records = m.chan >= 0 && o.pcapPort;
     std::unique_ptr<HubTap> tap;   // collects from any thread, under its own lock
     if (records || (m.chan >= 0 && packetLine)) tap = std::make_unique<HubTap>(m.chan);
