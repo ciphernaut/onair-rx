@@ -4,26 +4,33 @@
 // OnAir's receivers report what they decode on OnAir's automation bus (one event per message: a type and named fields) and
 // hand the frames they receive to OnAir's Wireshark hub, both from inside feed(), on the thread that calls it, with no engine
 // started. So one run serves every mode that has a receiver on the bus: a tap on the bus (every family) collects the events of
-// a block's feed(), a sink on the hub (patches/0001) collects its packets, and after the feed() the events become JSON lines and
-// the packets pcap records. A mode is a row: its event (the only bus event it writes), how to make and set up its receiver, its
-// hub channel, and what its lines need that the bus lacks.
+// a block's feed(), a tap on the hub (HubTap, hub_tap.h, locked: a receiver may publish from a thread of its own) collects its
+// packets, and after the feed() the events become JSON lines and the packets pcap records. A mode is a row: its event (the only
+// bus event it writes), how to make and set up its receiver, its hub channel, and what its lines need that the bus lacks.
 #include "bus.h"
 #include "ais.h"
+#include "hub_tap.h"
 #include "dect2/acars/acars_rx.h"
 #include "dect2/ais/ais_longrange.h"
 #include "dect2/ais/ais_rx.h"
 #include "dect2/automation/engine.h"
+#include "dect2/ble/ble_rx.h"
 #include "dect2/hfdl/hfdl_rx.h"
+#include "dect2/lorawan/lora_bank.h"
+#include "dect2/lorawan/lorawan_plan.h"
+#include "dect2/lorawan/lorawan_rx.h"
 #include "dect2/packet/packet_rx.h"
 #include "dect2/pager/pager_rx.h"
 #include "dect2/sonde/sonde_rx.h"
 #include "dect2/vdl2/vdl2_rx.h"
 #include "dect2/wirecap/wire.h"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <strings.h>
 
 namespace onair_rx {
 
@@ -212,6 +219,81 @@ bool shapeRs41(const automation::Event& e, Json& j) { return shapeSonde(e, j, "R
 bool shapeDfm(const automation::Event& e, Json& j) { return shapeSonde(e, j, "DFM"); }
 bool shapeM20(const automation::Event& e, Json& j) { return shapeSonde(e, j, "M20"); }
 
+// an address as the lines spell one: lower-case hex digits without separators ("C0:FF:EE:12:34:56" is "c0ffee123456")
+std::string address(const std::string& s) {
+    std::string a;
+    for (const char c : s)
+        if (isxdigit((unsigned char)c)) a += (char)tolower((unsigned char)c);
+    return a;
+}
+
+// --- Bluetooth LE: OnAir's BleReceiver, the advertising channel at 0 Hz of the input. It dewhitens a packet for each of the three
+// advertising channels in turn and keeps the one whose CRC passes, so it needs no channel; --freq, when given, only says which
+// it tries first. ble.device comes per good packet with an address (the advertiser's; the scanner's for a scan or connection
+// request): mac in the lines' spelling, name left out when the packet had none
+bool openBle(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<BleReceiver>();
+    if (o.freq > 0) rx->setCenterHz(o.freq);
+    return start(rx, o, "ble", bleTuning().minSampleRate, feed, err);
+}
+bool shapeBle(const automation::Event& e, Json& j) {
+    const std::string mac = address(text(e, "mac"));
+    if (mac.size() != 12) return false;
+    j.str("mac", mac);
+    if (text(e, "name").empty()) j.omit("name");
+    return true;
+}
+
+// --- LoRaWAN: OnAir's LorawanReceiver on every channel of one regional plan inside the input, at the spreading factors the
+// plan's data rates use, normal and inverted IQ, and the plan's FSK channel. The receiver does not choose a plan: --plan names
+// it, or it is the plan of OnAir's table with the most channels inside the input around --freq (the receiver's own test:
+// lorabank::Bank::fits), a tie going to the table's order. No plan with a channel inside the input, or a named plan without
+// one, is refused. freq_hz is the channel's centre, from the bus event's frequency; devaddr in the lines' spelling
+int lorawanChannelsInside(const Options& o, int plan) {   // the channels the receiver searches with OnAir's default settings
+    int n = 0;
+    for (const lorawan::PlanChannel& c : lorawan::selectChannels(plan, 0, true)) {
+        lorabank::Channel probe;
+        probe.offsetHz = c.mhz * 1e6 - o.freq;
+        probe.bwHz = c.bwKhz * 1e3;
+        if (lorabank::Bank::fits(o.rate, probe)) n++;
+    }
+    return n;
+}
+bool openLorawan(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<LorawanReceiver>();
+    if (!start(rx, o, "lorawan", lorawanTuning().minSampleRate, feed, err)) return false;
+    char band[64];
+    snprintf(band, sizeof band, "%.3f-%.3f MHz", (o.freq - o.rate / 2) * 1e-6, (o.freq + o.rate / 2) * 1e-6);
+    int plan = -1;
+    if (!o.plan.empty()) {
+        std::string names;
+        for (int p = 0; p < lorawan::kPlans; p++) {
+            if (strcasecmp(o.plan.c_str(), lorawan::planName(p)) == 0) plan = p;
+            names += std::string(p ? ", " : "") + lorawan::planName(p);
+        }
+        if (plan < 0) { *err = "lorawan: no plan " + o.plan + " (" + names + ")"; return false; }
+        if (!lorawanChannelsInside(o, plan)) {
+            *err = std::string("lorawan: plan ") + lorawan::planName(plan) + " has no channel within " + band;
+            return false;
+        }
+    } else {
+        for (int p = 0, best = 0; p < lorawan::kPlans; p++)
+            if (const int n = lorawanChannelsInside(o, p); n > best) { best = n; plan = p; }
+        if (plan < 0) { *err = std::string("lorawan: no channel plan has a channel within ") + band; return false; }
+    }
+    LorawanSettings s;   // OnAir's defaults otherwise: every sub-band, the downlinks, at most 24 channels (the nearest the centre)
+    s.plan = plan;
+    rx->setSettings(s);
+    rx->setCenterHz(o.freq);
+    return true;
+}
+bool shapeLorawan(const automation::Event& e, Json& j) {
+    if (std::isfinite(e.freqHz) && e.freqHz > 0) j.num("freq_hz", (long long)std::llround(e.freqHz));
+    const std::string a = address(text(e, "devaddr"));
+    if (!a.empty()) j.str("devaddr", a);
+    return true;
+}
+
 // a bus value as a member: whole numbers without a decimal point, a non-finite number or a null left out
 void member(Json& j, const std::string& k, const automation::Value& v) {
     switch (v.t) {
@@ -239,6 +321,8 @@ const BusMode kBusModes[] = {
     {"rs41", "sonde.update", -1, false, openRs41, shapeRs41, nullptr},
     {"dfm", "sonde.update", -1, false, openDfm, shapeDfm, nullptr},
     {"m20", "sonde.update", -1, false, openM20, shapeM20, nullptr},
+    {"ble", "ble.device", wire::Ble, false, openBle, shapeBle, nullptr},
+    {"lorawan", "lora.packet", wire::LoRaWan, true, openLorawan, shapeLorawan, nullptr},
 };
 const size_t kBusModeCount = sizeof kBusModes / sizeof kBusModes[0];
 
@@ -247,30 +331,20 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
     std::string err;
     if (!m.open(o, &feed, &err)) { fprintf(stderr, "onair-rx: %s\n", err.c_str()); return 2; }
 
-    // both are called on this thread, inside feed(): they only collect
+    // called on this thread, inside feed(): it only collects
     std::vector<automation::Event> events;
     automation::global().setTap([&events](const automation::Event& e) { events.push_back(e); }, automation::kAllFamilies);
-    std::vector<std::vector<uint8_t>> packets;
     const auto packetLine = m.packetLines ? m.packetLines() : nullptr;
     const bool records = m.chan >= 0 && o.pcapPort;
-    const bool hub = records || (m.chan >= 0 && packetLine);
-    if (hub) {
-        wire::Config c;   // no file, no live capture, no GSMTAP: the sink is the hub's only output
-        c.dir.clear();
-        c.files = c.live = c.gsmtap = false;
-        wire::Hub::get().configure(c);
-        wire::Hub::get().setSink([&packets, &m](wire::Chan c, int64_t, const uint8_t* p, size_t n) {
-            if (c == m.chan) packets.emplace_back(p, p + n);
-        });
-        wire::Hub::get().setEnabled((wire::Chan)m.chan, true);
-    }
+    std::unique_ptr<HubTap> tap;   // collects from any thread, under its own lock
+    if (records || (m.chan >= 0 && packetLine)) tap = std::make_unique<HubTap>(m.chan);
 
     RecordClock clock;
     uint64_t lines = 0, sent = 0;
-    std::vector<cf32> iq(1 << 14);
-    for (size_t n; (n = in.read(iq)) > 0;) {
-        const uint64_t first = in.samples() - n;
-        feed(iq.data(), n);
+    std::vector<std::vector<uint8_t>> packets;
+    // what has come since the last drain: the events become lines, the packets lines (packetLine) and records, all at first, the
+    // first sample of the block after which they were drained
+    auto drain = [&](uint64_t first) {
         for (const automation::Event& e : events) {
             if (e.type != m.event) continue;   // not the row's event
             Json j;
@@ -281,6 +355,7 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
             lines++;
         }
         events.clear();
+        if (tap) tap->drain(packets);
         if (packetLine)
             for (const auto& p : packets) {
                 Json j;
@@ -290,24 +365,28 @@ int runBus(const BusMode& m, const Options& o, IqInput& in, Output& out) {
                 lines++;
             }
         if (records && !packets.empty()) {
-            // at the block's first sample. A packet the channel has as application data is wrapped as OnAir's capture files
-            // have it (wire.cpp): in IPv4 + UDP to the channel's port, so that the port's dissector reads it
-            const wire::ChanInfo& ci = wire::kChans[m.chan];
             const int64_t t = clock.at(in, (double)first / o.rate);
             for (const auto& p : packets) {
-                if (ci.encap == wire::Encap::Direct) { out.packet(t, p.data(), p.size()); continue; }
-                const wire::Bytes w = wire::udpInIpv4(ci.udpPort, p.data(), p.size());
-                out.packet(t, w.data(), w.size());
+                const std::vector<uint8_t> r = hubRecord(m.chan, p.data(), p.size());
+                out.packet(t, r.data(), r.size());
             }
             sent += packets.size();
         }
         packets.clear();
+    };
+    std::vector<cf32> iq(1 << 14);
+    uint64_t first = 0;
+    for (size_t n; (n = in.read(iq)) > 0;) {
+        first = in.samples() - n;
+        feed(iq.data(), n);
+        drain(first);
+    }
+    if (m.flushAtEnd) {   // what the receiver still holds, at the last block's first sample
+        feed(nullptr, 0);
+        drain(first);
     }
     automation::global().setTap({}, 0);
-    if (hub) {
-        wire::Hub::get().setSink({});
-        wire::Hub::get().shutdown();
-    }
+    tap.reset();
     fprintf(stderr, "onair-rx: %s: %llu lines", m.name, (unsigned long long)lines);
     if (records) fprintf(stderr, ", %llu packets", (unsigned long long)sent);
     fprintf(stderr, "\n");

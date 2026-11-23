@@ -37,6 +37,24 @@ static const Mode kModes[] = {
     {"adsb", wire::kChans[wire::AdsB].linktype, runAdsb},
 };
 
+// The options only some modes take, and the modes that take each (space separated). A mode not named refuses the option with
+// "onair-rx: <mode> takes no --<option>", before reading any input.
+struct OnlySome {
+    const char* option;
+    const char* modes;
+    bool (*given)(const Options& o);
+};
+static const OnlySome kOnlySome[] = {
+    {"width", "", [](const Options& o) { return o.width > 0; }},
+    {"plan", "lorawan", [](const Options& o) { return !o.plan.empty(); }},
+    {"region", "", [](const Options& o) { return !o.region.empty(); }},
+    {"drop", "", [](const Options& o) { return o.drop; }},
+};
+static bool takes(const char* modes, const std::string& mode) {
+    const std::string list = std::string(" ") + modes + " ";
+    return list.find(" " + mode + " ") != std::string::npos;
+}
+
 size_t IqInput::read(std::vector<cf32>& out) {
     const size_t per = cs16_ ? 4 : 8;
     buf_.resize(out.size() * per);
@@ -79,12 +97,15 @@ void Output::line(const std::string& json) {
 using namespace onair_rx;
 
 static void usage(FILE* f) {
-    fprintf(f, "usage: onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] [--bandwidth MHZ] < iq\n"
+    fprintf(f, "usage: onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] [--bandwidth MHZ]\n"
+               "                [--width HZ] [--plan NAME] [--region NAME] [--drop] < iq\n"
                "       onair-rx --lua      OnAir's Wireshark Lua dissector (USER0 is Mode S)\n"
                "       onair-rx --version\n"
                "IQ on stdin, interleaved little endian; --freq is the radio frequency at 0 Hz of the input; one JSON object\n"
                "per decode on stdout; with --pcap-port, a classic pcap stream of the frames for one client at a time on\n"
-               "127.0.0.1:PORT; --bandwidth (dvbt: 8, 7, 6 or 5) fixes the channel width, which is otherwise found. Modes:");
+               "127.0.0.1:PORT; --bandwidth (dvbt: 8, 7, 6 or 5) fixes the channel width, which is otherwise found; --plan\n"
+               "(lorawan) names the channel plan, which is otherwise the one with most channels in the input. --width, --region\n"
+               "and --drop are taken by no mode yet. Modes:");
     for (const Mode& m : kModes) fprintf(f, " %s", m.name);
     for (size_t i = 0; i < kBusModeCount; i++) fprintf(f, " %s", kBusModes[i].name);
     for (size_t i = 0; i < kPollModeCount; i++) fprintf(f, " %s", kPollModes[i].name);
@@ -118,6 +139,21 @@ int main(int argc, char** argv) {
             if (!*argv[i] || *end || w < 5 || w > 8) { fprintf(stderr, "onair-rx: bad --bandwidth %s (8, 7, 6 or 5)\n", argv[i]); return 2; }
             o.bandwidthMhz = (int)w;
         }
+        else if (a == "--width" && val) {
+            char* end = nullptr;
+            const double hz = strtod(argv[++i], &end);
+            if (!*argv[i] || *end || !std::isfinite(hz) || hz <= 0) { fprintf(stderr, "onair-rx: bad --width %s\n", argv[i]); return 2; }
+            o.width = hz;
+        }
+        else if (a == "--plan" && val) {
+            o.plan = argv[++i];
+            if (o.plan.empty()) { fprintf(stderr, "onair-rx: bad --plan (empty)\n"); return 2; }
+        }
+        else if (a == "--region" && val) {
+            o.region = argv[++i];
+            if (o.region.empty()) { fprintf(stderr, "onair-rx: bad --region (empty)\n"); return 2; }
+        }
+        else if (a == "--drop") o.drop = true;
         else if (a == "--lua") { fputs(wire::luaDissectors(), stdout); return 0; }
         else if (a == "--version") {
             printf("onair-rx %s\nOnAir %s\nLicence: GPL-3.0-or-later\n"
@@ -136,6 +172,8 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < kBusModeCount; i++) if (o.mode == kBusModes[i].name) bus = &kBusModes[i];
     for (size_t i = 0; i < kPollModeCount; i++) if (o.mode == kPollModes[i].name) polled = &kPollModes[i];
     if (!mode && !bus && !polled) { fprintf(stderr, "onair-rx: no mode %s\n", o.mode.c_str()); return 2; }
+    for (const OnlySome& s : kOnlySome)
+        if (s.given(o) && !takes(s.modes, o.mode)) { fprintf(stderr, "onair-rx: %s takes no --%s\n", o.mode.c_str(), s.option); return 2; }
     if (o.rate <= 0) { fprintf(stderr, "onair-rx: --rate HZ is needed\n"); return 2; }
     if (o.format != "cf32" && o.format != "cs16") { fprintf(stderr, "onair-rx: no format %s (cf32 or cs16)\n", o.format.c_str()); return 2; }
     // before any sample is read: a mode that places its channels by frequency never runs without one

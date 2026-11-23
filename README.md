@@ -14,13 +14,15 @@ attribution term (its `ADDITIONAL-TERMS.md`), which the two lines above and `ona
 ## Use
 
 ```
-onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] [--bandwidth MHZ] < iq
+onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] [--bandwidth MHZ]
+         [--width HZ] [--plan NAME] [--region NAME] [--drop] < iq
 onair-rx --lua > onair.lua     # OnAir's Wireshark Lua dissector (USER0 is Mode S)
 onair-rx --version
 ```
 
-Modes: `adsb`, the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm` and `m20`, and
-the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
+Modes: `adsb`, the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm`, `m20`, `ble` and
+`lorawan`, and the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below). `ble` and `lorawan` are modes
+ZetaSDR has no decoder of its own for: their point is their packets, which Wireshark reads.
 
 - **stdin:** interleaved little-endian IQ at `--rate` Hz, `cf32` (the default) or `cs16`, the signal's channel at
   0 Hz (HFDL: its dial frequency at 0 Hz). The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); the bus
@@ -34,6 +36,13 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
 - **`--bandwidth MHZ`:** `dvbt` only: the channel width, 8, 7, 6 or 5 MHz; without it each is tried in turn (below).
   Another value exits 2 with `onair-rx: bad --bandwidth <v> (8, 7, 6 or 5)`, and the option with another mode with
   `onair-rx: <mode> has no --bandwidth (dvbt only)`, before reading any input.
+- **`--width HZ`, `--plan NAME`, `--region NAME`, `--drop`:** options only some modes take (`kOnlySome`, `src/main.cpp`);
+  with any other mode each exits 2, before reading any input, with `onair-rx: <mode> takes no --<option>`. A `--width`
+  that is not a number above 0 exits 2 with `onair-rx: bad --width <v>`. Today:
+  - `--plan` (`lorawan`): the LoRaWAN regional plan, one of OnAir's `EU868`, `US915`, `AU915`, `AS923-1`, `AS923-2`,
+    `AS923-3`, `AS923-4`, `EU433` (in any case). Without it the plan is found (below).
+  - `--width` (the job's band, Hz), `--region` (a receiver's region table) and `--drop` (a receiver with a worker skips
+    the input that comes while it is busy, as it does live) are taken by no mode yet: every mode refuses them.
 - **stdout, adsb:** one JSON object per decoded Mode S frame, flushed per line. A line carries only what its own frame
   established, as an SBS (BaseStation) line does, never a value remembered from an earlier frame. A member whose value
   is not known is absent, never null.
@@ -61,6 +70,8 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
   | `vdl2` | `Vdl2Receiver` | 250 kHz | yes: the channel | `vdl2.message` (`src`, `dst`, `from_air`, `proto`, `summary`, `frame`) | `icao`, `addr_type` |
   | `hfdl` | `HfdlReceiver` | 24 kHz | yes: the dial frequency | `hfdl.message` (`kind`, `summary`, `icao`, `uplink`, `snr_db`) | `icao` left out when the bus has none |
   | `rs41`, `dfm`, `m20` | `SondeReceiver` | 2 MHz (1 MHz with an L-band `--freq`) | no (taken) | `sonde.update` (`serial`, `type`, `lat`, `lon`, `alt_m`, `vspeed_ms`, `hspeed_ms`, `temp_c`, `batt_v`, `sats`) | `id` (the serial as rs1729 spells it); that type's sondes only |
+  | `ble` | `BleReceiver` | 4 MHz | no (taken: the channel tried first) | `ble.device` (`mac`, `name`, `rssi_db`) | `mac` lower-case without separators; `name` left out when empty |
+  | `lorawan` | `LorawanReceiver` | 1 MHz | yes: places the plan's channels | `lora.packet` (`kind`, `hex`, `snr_db`, `sf`, `modulation`, `devaddr`) | `freq_hz`; `devaddr` lower-case |
 
   Every mode writes only the event of its row: any other event its receiver puts on the bus is dropped. In more
   detail:
@@ -115,6 +126,34 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
       six characters, and at most nine (`DFM-17012345`; a DFM-09's `12345` and a DFM-06's `012345` are `DFM- 12345`).
     The receiver runs inside `feed()` (OnAir's synchronous mode), so that nothing is dropped when the input comes
     faster than real time.
+  - `ble`: OnAir's Bluetooth LE advertising monitor (LE 1M PHY) on the one advertising channel at 0 Hz of the input: it
+    dewhitens each packet for channels 37, 38 and 39 in turn and keeps the one whose CRC passes, so it needs no channel
+    setting; `--freq`, when given, only says which channel it tries first. Advertising only: connections are not followed
+    (a `CONNECT_IND` is a line of its sender, nothing more), nothing is decrypted. A line per good packet that carries an
+    address: the advertiser's, or the scanner's for a scan or connection request (an extended advertisement, which
+    names none, has a packet and no line). `mac` is the address in lower-case hex without separators (OnAir's
+    `C0:FF:EE:12:34:56` is `c0ffee123456`), `name` the packet's own name (absent when it has none: a device's name comes
+    in some of its packets only), `rssi_db` the packet's level in dB below full scale (not calibrated). OnAir's minimum
+    rate, 4 MHz, is its own decimation to 4 samples a bit.
+  - `lorawan`: OnAir's LoRaWAN monitor on every channel of one regional plan inside the input, at the spreading factors
+    the plan's data rates use, the gateways' inverted-IQ frames too, and the plan's FSK channel (EU868 868.8 MHz, AS923-1
+    924.8 MHz). OnAir's other settings are its defaults: every sub-band, the downlinks, at most 24 channels (those nearest
+    the centre: a wide US915 or AU915 input has more). Nothing is decrypted and no MIC is checked: frames are given as
+    received. The plan: `--plan` when given; otherwise the plan of OnAir's table (in its order: EU868, US915, AU915,
+    AS923-1 to 4, EU433) with the most channels inside the input around `--freq`, a tie going to the earlier, where a
+    channel is inside as OnAir's own channel bank has it (`lorabank::Bank::fits`: its edge plus 25 kHz within 0.45 of the
+    rate from the centre). With no plan having a channel inside, it exits 2, before reading input, with
+    `onair-rx: lorawan: no channel plan has a channel within <lo>-<hi> MHz` (`--freq` plus or minus half the rate); a
+    `--plan` with no channel inside with `onair-rx: lorawan: plan <plan> has no channel within <lo>-<hi> MHz`, and an
+    unknown one with `onair-rx: lorawan: no plan <name> (EU868, US915, ...)`. A line per frame whose CRC passed, or that has
+    none (a downlink) and that OnAir reads as LoRaWAN: `kind` is always `lorawan`, `hex` the PHY payload as OnAir's bus has it
+    (upper-case byte pairs, a space between), `snr_db` in the LoRa bandwidth, `sf` the spreading factor (0 for an FSK
+    frame), `modulation` `lora` or `fsk`, `devaddr` (eight lower-case hex digits) on a data frame, and `freq_hz` the
+    channel's centre in Hz, from the bus event's frequency. A join request has no `devaddr`: its EUIs are in `hex`.
+
+  Measured on the build host (12 cores, x86-64), OnAir `a63c3a8`, user CPU per second of input (`/usr/bin/time -f %U`)
+  on `onair-gen`'s scenes: `ble` at 4 MHz, 0.09 to 0.10 s a second; `lorawan` at 2 MHz around 868.3 MHz (EU868: seven
+  channels, SF7 to SF12, both IQ senses, and the FSK channel), 0.17 to 0.18 s a second. Both run inside `feed()`.
 
   Not on the generic path: none of the modes so far. A receiver that needs more than a channel, a centre and a type
   filter (a second channel, an engine of its own) gets a line here saying what it needed.
@@ -259,8 +298,10 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
   pcap stream: the file header, then one record per frame. ADS-B: 7 or 14 bytes, link type 147 (USER0), and every
   JSON line has exactly one record. APRS: the AX.25 frame as OnAir's Wireshark hub gets it (link type 3), also a
   digipeater's copy, which has no line. AIS: each sentence with its line end in IPv4 + UDP to port 10110 (NMEA 0183),
-  link type 101 (raw IP), as OnAir's capture files have it. The other bus modes and the polled modes have no packets
-  and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that
+  link type 101 (raw IP), as OnAir's capture files have it. Bluetooth LE: every good packet, the advertising access
+  address and the dewhitened PDU and CRC (link type 251, BLUETOOTH_LE_LL), also an extended advertisement, which has no
+  line. LoRaWAN: the PHY payload of every frame that has a line, behind a LoRaTap header (frequency, bandwidth, spreading
+  factor, SNR; link type 270). The other bus modes and the polled modes have no packets and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that
   connects a few seconds late still gets them; a client that hangs up is dropped, and the next one gets a new header.
   Record times are the frame's sample time (bus modes: its block's first sample) on the wall clock of the first sample,
   moved on when the input falls more than 100 ms behind real time. What is still queued at the end with no client is
@@ -268,7 +309,8 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
 - **stderr:** diagnostics, one line each. An unknown mode exits 2 with `onair-rx: no mode <m>`; a port that
   cannot be opened, or a failed read of stdin (`onair-rx: stdin: <reason>`), exits 1.
 - **EOF** on stdin: what was decoded is written (the queued records to a connected client), then exit 0.
-  There is no flush at the end of input: a decode a receiver still holds when stdin closes is not written. A short
+  No mode so far flushes its receiver at the end of input (a bus row's `flushAtEnd`, below, is for one that holds frames
+  until told): a decode a receiver still holds when stdin closes is not written. A short
   replay (ZetaSDR's `capture_decode`) can lose its last message this way. A polled mode polls once more at EOF, so
   what its receiver's snapshot has by then is written.
   SIGTERM ends it at once.
@@ -284,6 +326,8 @@ test/bus.sh                               # the bus modes on OnAir's own test si
 test/poll.sh                              # the polled modes on OnAir's own test signals (_build/onair-gen), the voice
                                           # modes also with mbelib and Codec 2 hidden, the status modes also on noise
                                           # (about 40 s; it prints each status run's user CPU)
+test/only.sh                              # the modes only OnAir decodes (ble, lorawan) on OnAir's own scenes, their
+                                          # packets, the options each mode refuses, and onair-gen's --sigmf pair
 ```
 
 The wrapper's headers are on the quoted include path only (`-iquote`), so that `src/poll.h` does not stand in for the
@@ -312,6 +356,20 @@ width's 2 s). `onair-gen --mode video --rate HZ
 [--deviation HZ]` is 3 s of a PAL test card on FM from OnAir's FPV generator with the swing of ZetaSDR's check (white
 1.05 MHz above blanking) and no sound subcarrier; `--deviation` is white's offset instead (OnAir's FPV link: 8000000).
 Both are broadcasts: the whole output is the signal, with nothing around it.
+`onair-gen --mode ble|lorawan --rate HZ [--freq HZ]` is the generator's own scene, with a second of noise either side
+(25 dB carrier to noise in 1 MHz for Bluetooth LE, in 125 kHz for LoRaWAN): Bluetooth LE, 0.25 s of OnAir's
+advertisers (`makeBleSynth`: a phone `C0:FF:EE:12:34:56` named `OnAir`, an iBeacon `00:0B:A1:5E:00:01`, an Eddystone
+`3A:55:44:33:22:02`, a resolvable address `5B:12:34:56:78:9A`, a scanner `66:55:44:33:22:11` sending a scan request and
+a connection request, and an extended advertisement), whitened for channels 37, 38 and 39 in turn, at 0 Hz; LoRaWAN,
+OnAir's EU868 scene once (`makeLorawanSynth`: data uplinks from DevAddr 26011A2B, 26014C01, 2701AAAA (250 kHz) and
+27023C00, a join request and its join accept, a confirmed uplink from 260B1234 and its answer, a proprietary frame, and
+the FSK channel's frames), on its channels around `--freq` (default 868.3 MHz, the scene's centre; the frames stay on
+their channels). `--freq` of `ble` (default 2402 MHz) only goes into a `--sigmf` pair.
+`onair-gen ... --sigmf STEM`, with any mode, writes `STEM.sigmf-data` (ci16_le: each value times 32768, rounded and
+clipped) and `STEM.sigmf-meta` instead of stdout, the meta in the shape of `iq/adsb1090.sigmf-meta`: the sample rate,
+the datatype, the centre frequency (`--freq`, or the mode's own: ACARS 131.525 MHz, AIS 162 MHz, Bluetooth LE 2402 MHz,
+LoRaWAN 868.3 MHz; left out for a mode with neither) and an annotation (`message`) per message: where the stderr line
+says it is.
 `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links,
 `onair-gen --selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`)
 on serials the test signals do not have, `onair-gen --selftest json-utf8` the UTF-8 text writer (`Json::utf8`,
@@ -339,11 +397,17 @@ followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
   type and the function that runs it) and the IQ input. `src/json.cpp`: the JSON writer.
 - `src/bus.cpp`: the bus modes. OnAir's receivers put each decoded message on OnAir's automation bus and each frame
   on OnAir's Wireshark hub, both inside `feed()` on the calling thread, with no engine started. One run serves them
-  all: a tap on the bus and a sink on the hub (`patches/0001`) collect what a block's `feed()` produced, then the
+  all: a tap on the bus and a tap on the hub (`HubTap`, below) collect what a block's `feed()` produced, then the
   events become lines and the packets records. A mode is a row of `kBusModes`: how to make and set up its receiver,
   its hub channel, whether it needs `--freq`, and what its lines need that the bus lacks. A mode whose lines come
   from its hub packets (AIS) names the lines' event and a function that turns a packet into a line; its hub channel
-  then runs with or without a pcap port. Another receiver on the bus is one more row.
+  then runs with or without a pcap port. A row with `flushAtEnd` has its feed called once more at the end of input
+  with no samples (which its feed takes as "flush"), and what that gives is drained at the last block's first sample.
+  Another receiver on the bus is one more row.
+- `src/hub_tap.cpp`: `HubTap`, the hub's packets of one channel: it configures the hub (no file, no live capture, no
+  GSMTAP), puts its sink on it (`patches/0001`) and enables the channel; the sink collects under a lock, so a receiver
+  may publish from a thread of its own, and the read loop drains it after each block. `hubRecord` makes a packet a
+  pcap record body: as it is on a Direct channel, in IPv4 + UDP to the channel's port otherwise.
 - `src/poll.cpp`: the polled modes. A mode is a row of `kPollModes`: its name, its event, its poll interval and the
   function that makes its session (`src/poll_<mode>.cpp`), a `PollSession` that feeds the receiver and, at each poll,
   hands over the lines for what is new or changed in its snapshot; `runPolled` adds `event` and `t_sample`. RDS

@@ -9,6 +9,8 @@
 //   onair-gen --mode dmr|p25|m17 --rate HZ [--channel]
 //   onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC]
 //   onair-gen --mode video --rate HZ [--deviation HZ]
+//   onair-gen --mode ble|lorawan --rate HZ [--freq HZ]
+//   onair-gen ... --sigmf STEM        any of the above into STEM.sigmf-data (ci16_le) and STEM.sigmf-meta instead of stdout
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
 //   onair-gen --selftest json-utf8    onair-rx's UTF-8 text writer (src/json.cpp, Json::utf8) on valid and broken UTF-8
@@ -40,6 +42,17 @@
 // noise 30 dB down; --lead puts that many seconds of the noise alone before it. Video: 3 s of a PAL test card on FM, OnAir's
 // FPV transmitter with the node's check swing (white 1.05 MHz above blanking: 1.5 MHz a volt) and no sound subcarrier, 30 dB
 // carrier to noise; --deviation replaces the 1.05 MHz (OnAir's own FPV link is 8 MHz).
+// The modes only OnAir decodes, each its generator's own scene (none of it is ZetaSDR's): Bluetooth LE, kBleSec of OnAir's
+// advertisers (makeBleSynth, bleTestSchedule: a phone C0:FF:EE:12:34:56 named OnAir, an iBeacon, an Eddystone, a resolvable
+// address, a scanner's scan request and connection request, an extended advertisement), the packets whitened for channels 37,
+// 38 and 39 in turn, all at 0 Hz (--freq, default 2402 MHz, channel 37, is the centre the --sigmf pair records); LoRaWAN, OnAir's
+// EU868 scene (makeLorawanSynth, lorawanTestSchedule and its FSK frames: uplinks, a join request and accept, a confirmed uplink
+// and its answer, a 250 kHz frame, a proprietary frame) once, on its channels around --freq (default 868.3 MHz, the scene's own
+// centre: the frames stay on their channels, so another --freq moves them in the band). Noise as for the messages above, its
+// carrier to noise in 1 MHz for Bluetooth LE and in 125 kHz for LoRaWAN, their channels' widths.
+// --sigmf STEM writes the output as a SigMF pair instead of stdout: STEM.sigmf-data, ci16_le (each value times 32768, rounded and
+// clipped), and STEM.sigmf-meta, its sample rate, the centre frequency (--freq, or the mode's default above; left out for a mode
+// with neither) and an annotation per message, in the shape of iq/adsb1090.sigmf-meta.
 // The channel is at 0 Hz of the output, as onair-rx expects it: the pager and packet generators put it at their mode's tune
 // offset, which is cancelled here; ACARS is generated for one channel at --freq (default 131.525 MHz) with the centre there;
 // AIS 1 and 2 are placed by their frequencies (161.975 and 162.025 MHz) around --freq (default 162 MHz, between the two).
@@ -58,6 +71,8 @@
 #include "dect2/acars/acars_gen.h"
 #include "dect2/ais/ais_gen.h"
 #include "dect2/ais/ais_proto.h"
+#include "dect2/ble/ble_gen.h"
+#include "dect2/ble/ble_rx.h"
 #include "dect2/dmr/dmr_gen.h"
 #include "dect2/dsp/exact_resampler.h"
 #include "dect2/dsp/gen_util.h"
@@ -66,6 +81,9 @@
 #include "dect2/fpv/fpv_gen.h"
 #include "dect2/hfdl/hfdl_gen.h"
 #include "dect2/hfdl/hfdl_proto.h"
+#include "dect2/lorawan/lorawan_gen.h"
+#include "dect2/lorawan/lorawan_plan.h"
+#include "dect2/lorawan/lorawan_rx.h"
 #include "dect2/m17/m17_gen.h"
 #include "dect2/p25/p25_gen.h"
 #include "dect2/packet/packet_gen.h"
@@ -94,7 +112,7 @@ namespace {
 
 constexpr double kPadSec = 1.0;
 constexpr double kRepeatGapSec = 2.0;   // a voice mode's call is sent twice, this much silence between
-constexpr double kSnrDb = 25;   // carrier to noise in 25 kHz
+constexpr double kSnrDb = 25;   // carrier to noise in 25 kHz (Bluetooth LE: in 1 MHz; LoRaWAN: in 125 kHz)
 constexpr size_t kChunk = 1 << 14;
 
 int usage() {
@@ -103,6 +121,8 @@ int usage() {
                     "       onair-gen --mode dmr|p25|m17 --rate HZ [--channel] > iq\n"
                     "       onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC] > iq\n"
                     "       onair-gen --mode video --rate HZ [--deviation HZ] > iq\n"
+                    "       onair-gen --mode ble|lorawan --rate HZ [--freq HZ] > iq\n"
+                    "       onair-gen ... --sigmf STEM     (STEM.sigmf-data, ci16_le, and STEM.sigmf-meta instead of stdout)\n"
                     "       onair-gen --selftest ais-join|sonde-id|json-utf8|calls\n");
     return 2;
 }
@@ -458,6 +478,91 @@ std::vector<cf32> m17Signal(double rate) {
     return voiceCut(g, rate);
 }
 
+// --- Bluetooth LE: kBleSec of OnAir's advertising scene (ble_gen.h, makeBleSynth), without noise. The scene puts the channel
+// tuneOffsetHz below 0 Hz (the radio sits that far above it); the offset is cancelled, so the channel is at 0 Hz
+constexpr double kBleSec = 0.25;   // about six rounds of the scene's eleven packets
+std::vector<cf32> bleSignal(double rate) {
+    SynthConfig c;
+    c.snrDb = 200;                        // no noise of its own (99 and up)
+    c.cfoHz = bleTuning().tuneOffsetHz;
+    auto s = makeBleSynth(c, rate);
+    if (!s) return {};
+    std::vector<cf32> all((size_t)std::llround(kBleSec * rate));
+    s->generate(all.data(), all.size());
+    return trim(all);
+}
+
+// --- LoRaWAN: OnAir's EU868 scene (lorawan_gen.h, makeLorawanSynth) once, without noise, freq at 0 Hz. The scene centres its
+// dial (lorawanPlanCentreMhz, 868.3 MHz) tuneOffsetHz below 0 Hz; the carrier offset moves it to freq - 868.3 MHz instead. It is
+// made for as long as its frames last (the LoRa frames' and the FSK frames' own lengths), before the scene would loop
+std::vector<cf32> lorawanSignal(double rate, double freq) {
+    SynthConfig c;
+    c.snrDb = 200;                        // no noise of its own (99 and up)
+    c.modeOpt[0] = lorawan::EU868;
+    c.cfoHz = lorawanTuning().tuneOffsetHz + (lorawanPlanCentreMhz(lorawan::EU868) * 1e6 - freq);
+    auto s = makeLorawanSynth(c, rate);
+    if (!s) return {};
+    const double sec = std::max(lorawanSceneSeconds(lorawanTestSchedule(lorawan::EU868)),
+                                lorawanFskSceneSeconds(lorawanFskTestSchedule(lorawan::EU868)));
+    std::vector<cf32> all((size_t)std::llround(sec * rate));
+    s->generate(all.data(), all.size());
+    return trim(all);
+}
+
+// --- the output: cf32 on stdout, or with a stem the SigMF pair: <stem>.sigmf-data in ci16_le (each value times 32768, rounded and
+// clipped) and <stem>.sigmf-meta (the rate, the centre when known, one annotation per message: its first sample and its length).
+// false with the reason on stderr when it could not be written
+struct Span { size_t start, count; };
+std::string number(double v) {   // a whole number without a decimal point, as the SigMF files of OnAir and ZetaSDR have it
+    char b[40];
+    if (v == std::floor(v) && std::fabs(v) < 1e15) snprintf(b, sizeof b, "%.0f", v);
+    else snprintf(b, sizeof b, "%.17g", v);
+    return b;
+}
+bool writeOut(const std::vector<cf32>& x, const std::string& stem, double rate, double centre, const std::vector<Span>& msgs) {
+    if (stem.empty()) {
+        if (fwrite(x.data(), sizeof(cf32), x.size(), stdout) != x.size() || fflush(stdout) != 0) {
+            fprintf(stderr, "onair-gen: stdout: %s\n", strerror(errno));
+            return false;
+        }
+        return true;
+    }
+    const std::string data = stem + ".sigmf-data", meta = stem + ".sigmf-meta";
+    FILE* f = fopen(data.c_str(), "wb");
+    if (!f) { fprintf(stderr, "onair-gen: %s: %s\n", data.c_str(), strerror(errno)); return false; }
+    std::vector<int16_t> buf;
+    bool ok = true;
+    for (size_t at = 0; at < x.size() && ok; at += kChunk) {
+        const size_t n = std::min(kChunk, x.size() - at);
+        buf.resize(2 * n);
+        for (size_t i = 0; i < n; i++) {
+            const cf32 v = x[at + i];
+            buf[2 * i] = (int16_t)std::clamp<long>(std::lround(v.real() * 32768.0), -32768, 32767);
+            buf[2 * i + 1] = (int16_t)std::clamp<long>(std::lround(v.imag() * 32768.0), -32768, 32767);
+        }
+        ok = fwrite(buf.data(), sizeof(int16_t), buf.size(), f) == buf.size();
+    }
+    if (fclose(f) != 0) ok = false;
+    if (!ok) { fprintf(stderr, "onair-gen: %s: %s\n", data.c_str(), strerror(errno)); return false; }
+    std::string m = "{\n  \"annotations\": [";
+    for (size_t i = 0; i < msgs.size(); i++)
+        m += std::string(i ? "," : "") + "\n    {\n      \"core:label\": \"message\",\n      \"core:sample_count\": " +
+             std::to_string(msgs[i].count) + ",\n      \"core:sample_start\": " + std::to_string(msgs[i].start) + "\n    }";
+    m += msgs.empty() ? "],\n" : "\n  ],\n";
+    m += "  \"captures\": [\n    {\n";
+    if (centre > 0) m += "      \"core:frequency\": " + number(centre) + ",\n";
+    m += "      \"core:sample_start\": 0\n    }\n  ],\n";
+    m += "  \"global\": {\n    \"core:datatype\": \"ci16_le\",\n    \"core:sample_rate\": " + number(rate) +
+         ",\n    \"core:version\": \"1.0.0\"\n  }\n}\n";
+    f = fopen(meta.c_str(), "wb");
+    const bool wrote = f && fwrite(m.data(), 1, m.size(), f) == m.size();
+    if (!f || fclose(f) != 0 || !wrote) {
+        fprintf(stderr, "onair-gen: %s: %s\n", meta.c_str(), strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 // --- the joiner's own test: sentences in as the hub has them (with their line ends), messages out
 int selftestAisJoin() {
     int fails = 0;
@@ -638,6 +743,7 @@ int main(int argc, char** argv) {
     std::string mode, text = "HELLO ZETA", info, ps = "ZETA FM ", rt = "HELLO FROM ZETASDR";
     std::string service = "ZETA TEST";
     bool haveText = false, haveInfo = false, haveStation = false, channel = false, haveService = false;
+    std::string sigmf;   // --sigmf STEM: the SigMF pair instead of stdout
     double rate = 0, freq = 0, deviation = 0, lead = 0;
     int bandwidth = 0;
     for (int i = 1; i < argc; i++) {
@@ -655,25 +761,30 @@ int main(int argc, char** argv) {
         else if (a == "--service" && val) { service = argv[++i]; haveService = true; }
         else if (a == "--lead" && val) { lead = atof(argv[++i]); if (lead <= 0) return usage(); }
         else if (a == "--deviation" && val) { deviation = atof(argv[++i]); if (deviation <= 0) return usage(); }
+        else if (a == "--sigmf" && val) { sigmf = argv[++i]; if (sigmf.empty()) return usage(); }
         else return usage();
     }
     if (rate <= 0) return usage();
     // each option belongs to its modes: one another mode would ignore is refused
     const bool voice = mode == "dmr" || mode == "p25" || mode == "m17";
     const bool tv = mode == "dvbt" || mode == "video";
+    const bool scene = mode == "ble" || mode == "lorawan";   // a scene of OnAir's own: only --freq
     if (mode == "rds" ? freq || haveText || haveInfo : voice || tv ? freq || haveText || haveInfo || haveStation : haveStation) return usage();
+    if (scene && (haveText || haveInfo)) return usage();
     if (channel && mode != "dmr" && mode != "p25") return usage();
     if ((bandwidth || haveService || lead) && mode != "dvbt") return usage();
     if (deviation && mode != "video") return usage();
-    if (!freq) freq = mode == "ais" ? 162e6 : 131.525e6;
+    // the centre the pair records: --freq, or the mode's own (ACARS's channel, the middle of AIS 1 and 2, Bluetooth LE's channel
+    // 37, the LoRaWAN scene's centre); 0 for a mode with neither. ACARS's default is also every other mode's freq, which they ignore
+    const bool ownCentre = mode == "acars" || mode == "ais" || scene;
+    const double centre = freq ? freq : !ownCentre ? 0 : mode == "ais" ? 162e6 : mode == "ble" ? 2402e6
+                                      : mode == "lorawan" ? lorawanPlanCentreMhz(lorawan::EU868) * 1e6 : 131.525e6;
+    if (!freq) freq = centre ? centre : 131.525e6;
     if (mode == "rds" || tv) {   // a broadcast is written as it is made: no cut and no silence (rds's and video's noise are the generator's own)
         const std::vector<cf32> x = mode == "rds" ? rdsSignal(rate, ps, rt) : mode == "dvbt" ? dvbtSignal(rate, bandwidth ? bandwidth : 8, service, lead)
                                                                              : videoSignal(rate, deviation);
         if (x.empty()) { fprintf(stderr, "onair-gen: no %s signal at %.0f Hz\n", mode.c_str(), rate); return 1; }
-        if (fwrite(x.data(), sizeof(cf32), x.size(), stdout) != x.size() || fflush(stdout) != 0) {
-            fprintf(stderr, "onair-gen: stdout: %s\n", strerror(errno));
-            return 1;
-        }
+        if (!writeOut(x, sigmf, rate, centre, {{0, x.size()}})) return 1;
         fprintf(stderr, "onair-gen: %s message from 0.000 s to %.3f s, %zu samples at %.0f Hz\n", mode.c_str(),
                 (double)x.size() / rate, x.size(), rate);
         return 0;
@@ -689,6 +800,8 @@ int main(int argc, char** argv) {
     else if (mode == "dmr") msg = dmrSignal(rate, channel);
     else if (mode == "p25") msg = p25Signal(rate, channel);
     else if (mode == "m17") msg = m17Signal(rate);
+    else if (mode == "ble") msg = bleSignal(rate);
+    else if (mode == "lorawan") msg = lorawanSignal(rate, freq);
     else return usage();
     if (msg.empty()) { fprintf(stderr, "onair-gen: no %s signal at %.0f Hz\n", mode.c_str(), rate); return 1; }
 
@@ -702,12 +815,13 @@ int main(int argc, char** argv) {
     std::vector<cf32> out((voice ? again : pad) + msg.size() + pad, cf32(0.f, 0.f));
     std::copy(msg.begin(), msg.end(), out.begin() + (long)pad);
     if (voice) std::copy(msg.begin(), msg.end(), out.begin() + (long)again);
+    // kSnrDb in the mode's channel: 25 kHz, Bluetooth LE's 1 MHz, a LoRaWAN channel's 125 kHz
+    const double noiseBw = mode == "ble" ? 1e6 : mode == "lorawan" ? 125e3 : 25000.0;
     genutil::NoiseSource noise(7);
-    noise.add(out.data(), out.size(), (float)(carrier * std::sqrt(rate / (2 * 25000.0 * std::pow(10.0, kSnrDb / 10)))));
-    if (fwrite(out.data(), sizeof(cf32), out.size(), stdout) != out.size() || fflush(stdout) != 0) {
-        fprintf(stderr, "onair-gen: stdout: %s\n", strerror(errno));
-        return 1;
-    }
+    noise.add(out.data(), out.size(), (float)(carrier * std::sqrt(rate / (2 * noiseBw * std::pow(10.0, kSnrDb / 10)))));
+    std::vector<Span> spans = {{pad, msg.size()}};
+    if (voice) spans.push_back({again, msg.size()});
+    if (!writeOut(out, sigmf, rate, centre, spans)) return 1;
     char twice[96] = "";
     if (voice) snprintf(twice, sizeof twice, " and again from %.3f s to %.3f s", (double)again / rate, (double)(again + msg.size()) / rate);
     fprintf(stderr, "onair-gen: %s message from %.3f s to %.3f s%s, %zu samples at %.0f Hz\n", mode.c_str(), (double)pad / rate,

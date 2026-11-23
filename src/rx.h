@@ -26,6 +26,11 @@ struct Options {
     double freq = 0;               // --freq: the radio frequency at 0 Hz of the input, Hz (0 when not given)
     int bandwidthMhz = 0;          // --bandwidth: dvbt's channel width, MHz (8, 7, 6 or 5; 0 when not given: each is tried)
     int pcapPort = 0;              // 0: no pcap port
+    // the options only some modes take (main.cpp's kOnlySome says which; another mode refuses each)
+    double width = 0;              // --width HZ: the job's band, Hz (0 when not given)
+    std::string plan;              // --plan NAME: lorawan's channel plan (empty: the one with most channels in the input)
+    std::string region;            // --region NAME: the receiver's region table (empty: the receiver's own choice)
+    bool drop = false;             // --drop: a receiver with a worker skips the input that comes while it is busy, as it does live
 };
 
 // Reads stdin in blocks and converts to complex float; a sample cut by EOF is dropped.
