@@ -126,9 +126,8 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
   the last block completed is written. Every line has `event` (the mode's) and `t_sample` (the index of the first
   sample of the block after which the poll ran), a member only when its value is known, whole numbers without a
   decimal point. Text the receiver hands over in UTF-8 (`ps`, `rt`, `alias`, a DVB-T service's `name`) is written as
-  UTF-8, escaping only a
-  quote, a backslash and a control character; text that is not valid UTF-8 is written byte by byte as above, so a line
-  is always valid JSON. None of them has packets: `--pcap-port` exits 2 with
+  UTF-8, escaping only a quote, a backslash and a control character; text that is not valid UTF-8 is written byte by
+  byte as above, so a line is always valid JSON. None of them has packets: `--pcap-port` exits 2 with
   `onair-rx: <mode> has no packets (no --pcap-port)`, before reading any input. The modes:
 
   | mode | OnAir receiver | minimum rate | poll | event | members |
@@ -186,8 +185,9 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
       (a conventional channel sends nothing between calls, so it gives no channel line). It is written when it first
       holds, and again only when what it says changes, not after every call.
   - `dvbt`, `video` (the status modes): a line says the receiver's state, what it has locked to and what the signal
-    says about itself. The first line comes at first lock or after 2 s of input, whichever is first; then a line
-    comes when any member of the state changes, and one at least every 2 s of input, so a watcher always has a
+    says about itself. The first line comes at first lock or at 2 s of input (the poll of the block that reaches 2 s),
+    whichever is first, so a signal that locks by then has a locked first line; then a line comes when any member of
+    the state changes, and one at least every 2 s of input, so a watcher always has a
     current one. A measured value (`snr_db`, `line_hz`) is written on each line but makes no line of its own: it moves
     at every poll. A poll is every 0.25 s, so the 2 s line is written at the last poll before the gap could pass 2 s:
     lines are 1.75 s apart on a signal that does not change, never more than 2 s. On a signal that never locks (noise,
@@ -195,8 +195,11 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
     searching. `locked` and `lock` are on every line; the values are spelled as ZetaSDR's rows spell them:
     - `dvbt`: OnAir's DVB-T receiver on one channel width at a time, the multiplex at 0 Hz of the input. Without
       `--bandwidth` it tries 8, 7, 6 and 5 MHz in turn (those the rate takes: 7.9 MHz of input for 8 MHz, scaled with
-      the width, OnAir's floor), each for 2 s of input, until the TPS is decoded, and stays on that width while it is;
-      once the lock is lost the width has 2 s more before the next is tried. `--bandwidth` fixes the width. `lock` is
+      the width, OnAir's floor), each for 2 s of input (eight polls, so the widths change on the 2 s marks), until the
+      TPS is decoded. The width is decided at each poll from the same snapshot as the line, after it: a poll whose
+      line says `locked` holds the width, and eight polls in a row that say `searching` (counted again from a lost
+      lock) move to the next. So a line never carries one width's signalling with another's `bandwidth_hz`, and a lock
+      that comes just before a width's 2 s are up keeps it. `--bandwidth` fixes the width. `lock` is
       `locked` (the TPS decoded) or `searching`, as the row's own program, dvbt-rx, has them; everything else is
       written only while locked, spelled as dvbt-rx (SDRangel's names) spells it: `bandwidth_hz` (the width the lock
       is on, in Hz), `mode` (`2K`, `8K`, or DVB-H's `4K`), `guard` (`1/32`, `1/16`, `1/8`, `1/4`), `constellation`
@@ -206,8 +209,9 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
       decoder does not read the cell id bits. `services` is the transport stream's services as OnAir's
       demultiplexer (`TsDemux`) has read them from its tables: an array of `{"id": <service id>, "name": "<name>",
       "kind": "tv"|"radio"|"data"}`, the name once the SDT gave it (UTF-8: OnAir reads it from the broadcast's
-      character table), the kind once the service type is known (a teletext or other service is `data`); the member
-      is absent until the PAT has named a service. The decoded packets go to the demultiplexer only. The receiver runs
+      character table), the kind once the service type is known (a teletext or other service is `data`). A service is
+      listed once any of the PAT, its PMT or the SDT has named it, in OnAir's order (by logical channel number, then
+      id); the member is absent while none has. The decoded packets go to the demultiplexer only. The receiver runs
       inside `feed()` (OnAir's default, not its error correction thread), so the packets of a block are read before
       its poll. It opens no sound device. The Viterbi decoder runs on the CPU (`setComputeMode(0)`; OnAir has no GPU
       decoder on Linux anyway).
@@ -226,9 +230,8 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
     part of it over its worker pool, so the wall time is 0.61 s a second on all cores, 0.69 on two and 0.79 on one:
     it keeps real time on one core. With the receiver's error correction on its own thread (`setPipelined(true,
     true)`): the same user CPU (0.75 to 0.81), 0.40 s of wall time a second on all cores, 0.43 to 0.46 on two, 0.79 to
-    0.81 on one. The synchronous
-    receiver is kept, since it keeps real time either way and its lines do not depend on thread timing. On noise,
-    searching every width in turn: 0.58 s a second.
+    0.81 on one. The synchronous receiver is kept, since it keeps real time either way and its lines do not depend on
+    thread timing. On noise, searching every width in turn: 0.58 s a second.
   - `video`, `onair-gen`'s PAL test card with the swing of ZetaSDR's check (white 1.05 MHz above blanking: 1.5 MHz a
     volt, no sound subcarrier), and an FPV link's full swing (white 8 MHz above blanking, the generator's own; its
     sound subcarrier off), 3 s each, then 3 s of noise:
@@ -293,10 +296,12 @@ code 5, from 9990001 to talkgroup 9990, three superframes; P25, a group call of 
 65000; M17, a voice stream from `VK4ZET` to `ALL` on CAN 0, 25 frames. `--channel` is a channel instead (DMR: 4 s of a
 repeater's downlink, its traffic quiet; P25: 4 s of a control channel of the same NAC). An option the mode does not
 take is refused with the usage line.
-`onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME]` is 6 s of one multiplex of OnAir's DVB-T
-generator, 8 MHz wide (or the width given), 8K, guard 1/8, 64-QAM, code rate 3/4, with one television service, id 4660,
-named `ZETA TEST` (or the name's bytes as the SDT carries them: a first byte below 0x20 names the character table),
-made at the width's native rate, resampled to the rate and with noise 30 dB down. `onair-gen --mode video --rate HZ
+`onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC]` is 6 s of one multiplex of
+OnAir's DVB-T generator, 8 MHz wide (or the width given), 8K, guard 1/8, 64-QAM, code rate 3/4, with one television
+service, id 4660, named `ZETA TEST` (or the name's bytes as the SDT carries them: a first byte below 0x20 names the
+character table), made at the width's native rate, resampled to the rate and with noise 30 dB down; `--lead` puts that
+many seconds of the noise alone before it (`test/poll.sh` uses it to have the lock land at the end of the 8 MHz
+width's 2 s). `onair-gen --mode video --rate HZ
 [--deviation HZ]` is 3 s of a PAL test card on FM from OnAir's FPV generator with the swing of ZetaSDR's check (white
 1.05 MHz above blanking) and no sound subcarrier; `--deviation` is white's offset instead (OnAir's FPV link: 8000000).
 Both are broadcasts: the whole output is the signal, with nothing around it.

@@ -289,9 +289,11 @@ timed() {
 # object of the row's members only, each of its type and each enumerated one spelled as the row's own decoder spells it
 # (dvbt: dvbt-rx; video: the node's composite decoder), no null, t_sample never decreasing, locked and lock on every line and
 # saying the same, dvbt's signalling only while locked; the output is UTF-8 with no control byte inside a line. The first line
-# comes within 2 s of input, successive lines are never more than 2 s of input apart, and the last is less than 2 s from the
-# end. Wanted: "locked", the members some locked line has (and every locked line with signalling has them); "service", an
-# object some line's services holds; "never", no line is locked; "lines", at least that many lines
+# waits for first lock or 2 s of input: a locked one comes from a poll whose block starts before 2 s, an unlocked one from the
+# poll of the block that reaches 2 s and no earlier. Successive lines are never more than 2 s of input apart, and the last is
+# less than 2 s from the end. Wanted: "first", the members the first line has; "locked", the members some locked line has
+# (and every locked line with signalling has them); "service", an object some line's services holds; "never", no line is
+# locked; "lines", at least that many lines
 status() {
   python3 -I - "$d/$1.jsonl" "$4" "$3" "$2" "$5" <<'EOF'
 import json, sys
@@ -323,7 +325,8 @@ for n, o in enumerate(lines):
     t = o.get("t_sample")
     assert type(t) is int and 0 <= t < nsamp, f"line {n}: t_sample {t!r} (of {nsamp} samples)"
     if last is None:
-        assert t + block <= 2 * rate, f"the first line after {(t + block) / rate:.3f} s of input, not within 2 s"
+        assert t < 2 * rate, f"the first line after the block from {t / rate:.3f} s, not within 2 s of input"
+        assert o.get("locked") or t + block >= 2 * rate, f"an unlocked first line after {(t + block) / rate:.3f} s of input, before 2 s"
     else:
         assert t >= last, f"line {n}: t_sample {t} before {last}"
         assert t - last <= 2 * rate, f"line {n}: {(t - last) / rate:.3f} s of input after the line before it"
@@ -346,6 +349,8 @@ assert nsamp - last <= 2 * rate, f"the last line {(nsamp - last) / rate:.3f} s o
 assert len(lines) >= want.get("lines", 1), f"{len(lines)} lines, want at least {want.get('lines', 1)}"
 locked = [o for o in lines if o["locked"]]
 everything = "the lines:\n  " + "\n  ".join(map(json.dumps, lines))
+if "first" in want:
+    assert all(lines[0].get(k) == v for k, v in want["first"].items()), f"the first line is not {want['first']}; {everything}"
 if want.get("never"):
     assert not locked, f"a locked line on a signal that has none: {json.dumps(locked[0])}"
 if "locked" in want:
@@ -370,9 +375,17 @@ samples() { echo $(($(stat -c %s "$d/$1.iq") / 8)); }
 dvbt_locked='{"locked":true,"lock":"locked","bandwidth_hz":8000000,"mode":"8K","guard":"1/8","constellation":"64-QAM","code_rate":"3/4"}'
 gen dvbt --mode dvbt --rate 10000000
 timed dvbt --format cf32 --mode dvbt --rate 10000000
-status dvbt dvbt 10000000 "$(samples dvbt)" "{\"locked\":$dvbt_locked,\"service\":{\"id\":4660,\"name\":\"ZETA TEST\",\"kind\":\"tv\"}}" ||
-  fail "dvbt"
+status dvbt dvbt 10000000 "$(samples dvbt)" \
+  "{\"first\":$dvbt_locked,\"locked\":$dvbt_locked,\"service\":{\"id\":4660,\"name\":\"ZETA TEST\",\"kind\":\"tv\"}}" || fail "dvbt"
 rm -f "$d/dvbt.iq"
+# the same multiplex after 1.855 s of noise: OnAir's receiver decodes its TPS a few blocks before the 8 MHz width's 2 s end
+# (found by trying leads; it is the same on every run), so the first line, at 2 s, is locked at 8 MHz, and the width is
+# held from the lock the line reports: no line says 7 MHz, nor another width's signalling
+gen dvbt-late --mode dvbt --rate 10000000 --lead 1.855
+timed dvbt-late --format cf32 --mode dvbt --rate 10000000
+status dvbt-late dvbt 10000000 "$(samples dvbt-late)" "{\"first\":$dvbt_locked,\"locked\":$dvbt_locked}" ||
+  fail "dvbt, a multiplex that locks at the end of the 8 MHz window"
+rm -f "$d/dvbt-late.iq"
 # a 7 MHz multiplex: 8 MHz gives no lock in its 2 s, then 7 does
 gen dvbt7 --mode dvbt --rate 10000000 --bandwidth 7
 timed dvbt7 --format cf32 --mode dvbt --rate 10000000
@@ -395,21 +408,23 @@ for rate in 16000000 8000000; do
   gen "video-$rate" --mode video --rate "$rate"
   timed "video-$rate" --format cf32 --mode video --rate "$rate"
   status "video-$rate" video "$rate" "$(samples "video-$rate")" \
-    '{"locked":{"locked":true,"lock":"locked","standard":"pal","system":"PAL 625/50"}}' || fail "video at $rate Hz"
+    '{"first":{"locked":true,"standard":"pal"},"locked":{"locked":true,"lock":"locked","standard":"pal","system":"PAL 625/50"}}' ||
+    fail "video at $rate Hz"
   rm -f "$d/video-$rate.iq"
 done
 # noise only, 4 s of random bytes read as cs16 at the floor: never locked, a line at least every 2 s
 head -c $((4 * 8000000 * 4)) /dev/urandom | timed video-noise --format cs16 --mode video --rate 8000000
 status video-noise video 8000000 32000000 '{"never":true,"lines":2}' || fail "video on noise"
 
-# --- onair-gen's rds takes --ps and --rt only, a voice mode none of the options, dvbt --bandwidth (8, 7, 6 or 5) and
-# --service only, video --deviation only; another mode does not take them
+# --- onair-gen's rds takes --ps and --rt only, a voice mode none of the options, dvbt --bandwidth (8, 7, 6 or 5), --service
+# and --lead only, video --deviation only; another mode does not take them
 for a in "--mode rds --rate 500000 --freq 100000000" "--mode rds --rate 500000 --text X" "--mode rds --rate 500000 --info X" \
   "--mode pocsag --rate 1000000 --ps X" "--mode pocsag --rate 1000000 --rt X" "--mode dmr --rate 48000 --freq 100000000" \
   "--mode p25 --rate 250000 --text X" "--mode m17 --rate 250000 --ps X" "--mode m17 --rate 250000 --channel" \
   "--mode rds --rate 500000 --channel" "--mode dvbt --rate 10000000 --ps X" "--mode dvbt --rate 10000000 --deviation 1000000" \
   "--mode video --rate 16000000 --service X" "--mode video --rate 16000000 --bandwidth 7" "--mode rds --rate 500000 --bandwidth 8" \
-  "--mode dvbt --rate 10000000 --bandwidth 9" "--mode pocsag --rate 1000000 --deviation 1000000"; do
+  "--mode dvbt --rate 10000000 --bandwidth 9" "--mode pocsag --rate 1000000 --deviation 1000000" \
+  "--mode video --rate 8000000 --lead 1"; do
   st=0
   # shellcheck disable=SC2086
   "$gen" $a >/dev/null 2>"$d/gen-refuse.err" || st=$?

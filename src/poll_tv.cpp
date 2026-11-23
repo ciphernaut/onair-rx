@@ -26,19 +26,21 @@ namespace {
 
 constexpr double kStatusMostSec = 2;   // a status line at least this often, seconds of input
 
-// When a status line is due. A poll comes every kStatusPollSec of input, after the block of kPollBlock that reaches it; so a
-// line is written at the last poll before the gap since the one before could pass kStatusMostSec, and lines are never further
-// apart than that, whatever block a poll lands on.
+// When a status line is due. The first waits for first lock or kStatusMostSec of input, whichever comes first (the poll of
+// the block that reaches it), as the row's own decoders' first event does: the node judges a job by its first event, so a
+// signal that locks by then is reported locked. After it, a poll comes every kStatusPollSec of input, after the block of
+// kPollBlock that reaches it; so a line is written at the last poll before the gap since the one before could pass
+// kStatusMostSec, and lines are never further apart than that, whatever block a poll lands on.
 class Cadence {
 public:
     explicit Cadence(double rate)
         : most_((uint64_t)std::llround(kStatusMostSec * rate)), slack_((uint64_t)std::llround(kStatusPollSec * rate) + kPollBlock) {}
     void fed(size_t n) { now_ += n; }
-    // j, the line, is added to lines when it is due: the first once locked or late, then on a change of key (the state: the
-    // line's members without the measured ones) or when late
+    // j, the line, is added to lines when it is due: the first once locked or at kStatusMostSec, then on a change of key (the
+    // state: the line's members without the measured ones) or when late
     void offer(bool locked, const std::string& key, Json&& j, std::vector<Json>& lines) {
         const bool late = now_ + slack_ > at_ + most_;   // the next poll could come more than kStatusMostSec after the last line
-        if (written_ ? key == key_ && !late : !locked && !late) return;
+        if (written_ ? key == key_ && !late : !locked && now_ < most_) return;
         at_ = now_;
         key_ = key;
         written_ = true;
@@ -54,6 +56,7 @@ private:
 
 constexpr int kDvbtWidths[] = {8, 7, 6, 5};   // MHz, in the order they are tried (as the row's own program does)
 constexpr double kDvbtTrySec = 2;            // seconds of input on a width that does not lock before the next is tried
+constexpr int kDvbtTryPolls = (int)(kDvbtTrySec / kStatusPollSec + 0.5);   // the same in polls (from sample 0, so on the 2 s marks)
 // the lowest rate DvbtReceiver takes for a width (dvbt_rx.cpp, configure: 7.9 MHz for 8 MHz)
 double dvbtFloor(int mhz) { return 7.9e6 * mhz / 8.0; }
 
@@ -98,13 +101,14 @@ public:
     void feed(const cf32* x, size_t n) override {
         rx_.feed(x, n);
         cad_.fed(n);
-        onWidth_ += n;
-        // the TPS decoded (2, or 3 with the transport stream flowing): this is the width; its 2 s start again when it is lost
-        if (rx_.detectLevel() >= 2) onWidth_ = 0;
-        else if (widths_.size() > 1 && onWidth_ >= (uint64_t)std::llround(kDvbtTrySec * rate_)) use((at_ + 1) % widths_.size());
     }
-    void poll(bool, std::vector<Json>& lines) override {
-        rx_.telemetry(tel_, 0);   // published after every block: the newest is the state now
+    // The line and the width are decided here, from the same snapshot: the width is held while the line says locked, and
+    // left after kDvbtTryPolls polls (2 s of input) on it without, counted again from a lost lock; the switch comes after the
+    // line, so a line never mixes one width's signalling with another's bandwidth_hz.
+    void poll(bool last, std::vector<Json>& lines) override {
+        // Published after every block; after a change of width only a snapshot published since counts (configure does not
+        // publish: until the next feed the receiver still has the old width's), so seq_ is kept across it.
+        if (rx_.telemetry(tel_, seq_)) seq_ = tel_.seq;
         const RxTelemetry::Dvbt& t = tel_.dvbt;
         const bool locked = t.tpsOk;
         const std::string services = locked ? serviceList() : std::string();
@@ -129,14 +133,17 @@ public:
             return j;
         };
         cad_.offer(locked, line(false).done(), line(true), lines);
+        if (locked) pollsOnWidth_ = 0;
+        else if (++pollsOnWidth_ >= kDvbtTryPolls && widths_.size() > 1 && !last) use((at_ + 1) % widths_.size());
     }
 
 private:
-    // to width widths_[i], from its start: the receiver and the demultiplexer forget the last one
+    // to width widths_[i], from its start: the receiver, its snapshot and the demultiplexer forget the last one
     void use(size_t i) {
         at_ = i;
-        onWidth_ = 0;
+        pollsOnWidth_ = 0;
         rx_.configure(rate_, widths_[i]);
+        tel_ = RxTelemetry();
         ts_.reset();
     }
     // the services as the tables have them so far, a JSON array ("" when there is none): the id, the name when the SDT gave
@@ -158,10 +165,11 @@ private:
     TsDemux ts_;
     DvbtReceiver rx_;
     RxTelemetry tel_;
+    uint64_t seq_ = 0;          // the snapshot tel_ is (OnAir's seq never restarts, not on configure either)
     double rate_ = 0;
     std::vector<int> widths_;   // the widths to try, MHz
     size_t at_ = 0;             // the one in use
-    uint64_t onWidth_ = 0;      // samples fed on it since it was taken or last locked
+    int pollsOnWidth_ = 0;      // polls on it since it was taken or last locked
     Cadence cad_;
 };
 

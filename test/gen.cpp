@@ -7,7 +7,7 @@
 //   onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO]
 //   onair-gen --mode rds --rate HZ [--ps PS] [--rt RT]
 //   onair-gen --mode dmr|p25|m17 --rate HZ [--channel]
-//   onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME]
+//   onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC]
 //   onair-gen --mode video --rate HZ [--deviation HZ]
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
@@ -37,9 +37,9 @@
 // no text messages) or of a P25 control channel of NAC 0x123. A voice mode takes none of the other options.
 // DVB-T: 6 s of one multiplex, 8 MHz wide (--bandwidth: 7, 6 or 5 MHz), 8K, guard 1/8, 64-QAM, code rate 3/4, with one
 // television service, id 4660, named ZETA TEST (--service: the name's bytes as the SDT carries them, EN 300 468's text), and
-// noise 30 dB down. Video: 3 s of a PAL test card on FM, OnAir's FPV transmitter with the node's check swing (white 1.05 MHz
-// above blanking: 1.5 MHz a volt) and no sound subcarrier, 30 dB carrier to noise; --deviation replaces the 1.05 MHz (OnAir's
-// own FPV link is 8 MHz).
+// noise 30 dB down; --lead puts that many seconds of the noise alone before it. Video: 3 s of a PAL test card on FM, OnAir's
+// FPV transmitter with the node's check swing (white 1.05 MHz above blanking: 1.5 MHz a volt) and no sound subcarrier, 30 dB
+// carrier to noise; --deviation replaces the 1.05 MHz (OnAir's own FPV link is 8 MHz).
 // The channel is at 0 Hz of the output, as onair-rx expects it: the pager and packet generators put it at their mode's tune
 // offset, which is cancelled here; ACARS is generated for one channel at --freq (default 131.525 MHz) with the centre there;
 // AIS 1 and 2 are placed by their frequencies (161.975 and 162.025 MHz) around --freq (default 162 MHz, between the two).
@@ -101,7 +101,7 @@ int usage() {
     fprintf(stderr, "usage: onair-gen --mode pocsag|flex|acars|aprs|ais|vdl2|hfdl|rs41|dfm|m20 --rate HZ [--freq HZ] [--text TEXT] [--info INFO] > iq\n"
                     "       onair-gen --mode rds --rate HZ [--ps PS] [--rt RT] > iq\n"
                     "       onair-gen --mode dmr|p25|m17 --rate HZ [--channel] > iq\n"
-                    "       onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] > iq\n"
+                    "       onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC] > iq\n"
                     "       onair-gen --mode video --rate HZ [--deviation HZ] > iq\n"
                     "       onair-gen --selftest ais-join|sonde-id|json-utf8|calls\n");
     return 2;
@@ -332,11 +332,13 @@ std::vector<cf32> rdsSignal(double rate, const std::string& ps, const std::strin
 // hierarchical, its transport stream testTsSourceNamed's (the PAT, PMT and SDT of one television service, kDvbtService, and
 // some private data). It is made at the width's native rate (64/7 MHz for 8 MHz) and resampled to the rate, with noise 30 dB
 // below the multiplex in its 7.6 MHz (scaled with the width). service: the service name as the SDT carries it (EN 300 468's
-// text: a first byte below 0x20 names the character table). A broadcast never stops: the whole output is the message
+// text: a first byte below 0x20 names the character table). leadSec: that much of the noise alone first, so that the
+// multiplex comes on the air there (the receiver's lock then lands where a test wants it). A broadcast never stops: the
+// whole output is the message
 constexpr double kDvbtSec = 6;
 constexpr int kDvbtService = 4660;
 constexpr double kDvbtSnrDb = 30;
-std::vector<cf32> dvbtSignal(double rate, int bwMhz, const std::string& service) {
+std::vector<cf32> dvbtSignal(double rate, int bwMhz, const std::string& service, double leadSec) {
     dvbt::Params p;
     p.mode = dvbt::k8K;
     p.guard = dvbt::kGi8;
@@ -354,6 +356,7 @@ std::vector<cf32> dvbtSignal(double rate, int bwMhz, const std::string& service)
     out.resize(want);
     double power = 0;
     for (const cf32& v : out) power += std::norm(v);
+    out.insert(out.begin(), (size_t)std::llround(leadSec * rate), cf32(0.f, 0.f));
     const double band = 7.61e6 * bwMhz / 8;   // the 6817 carriers of 8K
     genutil::NoiseSource noise(7);
     noise.add(out.data(), out.size(), (float)std::sqrt(power / (double)want * rate / (2 * band * std::pow(10.0, kDvbtSnrDb / 10))));
@@ -635,7 +638,7 @@ int main(int argc, char** argv) {
     std::string mode, text = "HELLO ZETA", info, ps = "ZETA FM ", rt = "HELLO FROM ZETASDR";
     std::string service = "ZETA TEST";
     bool haveText = false, haveInfo = false, haveStation = false, channel = false, haveService = false;
-    double rate = 0, freq = 0, deviation = 0;
+    double rate = 0, freq = 0, deviation = 0, lead = 0;
     int bandwidth = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -650,6 +653,7 @@ int main(int argc, char** argv) {
         else if (a == "--rt" && val) { rt = argv[++i]; haveStation = true; }
         else if (a == "--bandwidth" && val) { bandwidth = atoi(argv[++i]); if (bandwidth < 5 || bandwidth > 8) return usage(); }
         else if (a == "--service" && val) { service = argv[++i]; haveService = true; }
+        else if (a == "--lead" && val) { lead = atof(argv[++i]); if (lead <= 0) return usage(); }
         else if (a == "--deviation" && val) { deviation = atof(argv[++i]); if (deviation <= 0) return usage(); }
         else return usage();
     }
@@ -659,11 +663,11 @@ int main(int argc, char** argv) {
     const bool tv = mode == "dvbt" || mode == "video";
     if (mode == "rds" ? freq || haveText || haveInfo : voice || tv ? freq || haveText || haveInfo || haveStation : haveStation) return usage();
     if (channel && mode != "dmr" && mode != "p25") return usage();
-    if ((bandwidth || haveService) && mode != "dvbt") return usage();
+    if ((bandwidth || haveService || lead) && mode != "dvbt") return usage();
     if (deviation && mode != "video") return usage();
     if (!freq) freq = mode == "ais" ? 162e6 : 131.525e6;
     if (mode == "rds" || tv) {   // a broadcast is written as it is made: no cut and no silence (rds's and video's noise are the generator's own)
-        const std::vector<cf32> x = mode == "rds" ? rdsSignal(rate, ps, rt) : mode == "dvbt" ? dvbtSignal(rate, bandwidth ? bandwidth : 8, service)
+        const std::vector<cf32> x = mode == "rds" ? rdsSignal(rate, ps, rt) : mode == "dvbt" ? dvbtSignal(rate, bandwidth ? bandwidth : 8, service, lead)
                                                                              : videoSignal(rate, deviation);
         if (x.empty()) { fprintf(stderr, "onair-gen: no %s signal at %.0f Hz\n", mode.c_str(), rate); return 1; }
         if (fwrite(x.data(), sizeof(cf32), x.size(), stdout) != x.size() || fflush(stdout) != 0) {
