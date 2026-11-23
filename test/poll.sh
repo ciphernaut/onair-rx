@@ -6,13 +6,14 @@
 # a known station, call or picture (RDS: PI 2AB1, PS "ZETA FM ", RT "HELLO FROM ZETASDR", 6 s of OnAir's FM generator; DMR,
 # P25, M17: one call sent twice, with the node's check values; DVB-T: 6 s of an 8 MHz 8K multiplex with one service, ZETA
 # TEST; video: 3 s of a PAL test card on FM), onair-rx decodes it. The signals are synthesised; no capture is used.
-# Also: a rate below the receiver's minimum and --pcap-port are refused before any input is read; the programme service name
+# Also: a rate below the receiver's minimum (dvbt: or one OnAir's resampler has no ratio for) and --pcap-port are refused
+# before any input is read; the programme service name
 # and the radiotext are absent until complete, also on input that ends before the name is; a name and a text beyond ASCII are
 # written in UTF-8, one valid line each (and the UTF-8 writer on its own); the input through a pipe in uneven chunks gives the
 # same lines as from a file; each pass of a call gives one first line and one last line, the same with the speech codecs
 # hidden (and the call keying on its own); a status mode (dvbt, video) writes its first line within 2 s of input and then one
-# at least every 2 s, also on noise that never locks (dvbt: while trying every channel width), a DVB-T service name beyond
-# ASCII in UTF-8; the user CPU of each status run is printed; onair-gen refuses an option its mode does not take.
+# at least every 2 s, also on noise that never locks (dvbt: while trying every channel width), and one line at the end of
+# input shorter than 2 s that never locks, a DVB-T service name beyond ASCII in UTF-8; the user CPU of each status run is printed; onair-gen refuses an option its mode does not take.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -61,6 +62,10 @@ done
 # the narrowest it tries (5 MHz); video: OnAir's analog TV receiver's floor
 refuses "onair-rx: 7000000 Hz is too low for dvbt (at least 7900000 Hz)" --mode dvbt --rate 7000000 --bandwidth 8 || fail "dvbt 8 MHz at 7 MHz"
 refuses "onair-rx: 4000000 Hz is too low for dvbt (at least 4937500 Hz)" --mode dvbt --rate 4000000 || fail "dvbt at 4 MHz"
+# and OnAir's resampler must find a ratio from the rate to the width's own (9142857 Hz for 8 MHz: 1.0005 needs more than
+# 1024 phases); a width it cannot is not tried, and with none left the rate is refused
+refuses "onair-rx: 9138287 Hz cannot be resampled for dvbt at 8 MHz (OnAir's resampler finds no ratio)" \
+  --mode dvbt --rate 9138287 --bandwidth 8 || fail "dvbt 8 MHz at a rate with no resampling ratio"
 refuses "onair-rx: dvbt has no packets (no --pcap-port)" --mode dvbt --rate 10000000 --pcap-port 5000 || fail "dvbt with --pcap-port"
 refuses "onair-rx: bad --bandwidth 9 (8, 7, 6 or 5)" --mode dvbt --rate 10000000 --bandwidth 9 || fail "dvbt at 9 MHz"
 refuses "onair-rx: video has no --bandwidth (dvbt only)" --mode video --rate 16000000 --bandwidth 8 || fail "video with --bandwidth"
@@ -419,6 +424,27 @@ done
 # noise only, 4 s of random bytes read as cs16 at the floor: never locked, a line at least every 2 s
 head -c $((4 * 8000000 * 4)) /dev/urandom | timed video-noise --format cs16 --mode video --rate 8000000
 status video-noise video 8000000 32000000 '{"never":true,"lines":2}' || fail "video on noise"
+
+# input shorter than 2 s that never locks: 1 s of noise gives exactly one line, at its end (the poll at EOF), saying so
+# short <tag> <mode> <rate> <lock word>: $d/<tag>.jsonl is that one line, of the members event, t_sample, locked and lock
+short() {
+  python3 -I - "$d/$1.jsonl" "$2" "$3" "$4" <<'EOF'
+import json, sys
+path, mode, rate, word = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+lines = [json.loads(l) for l in open(path, "rb").read().splitlines()]
+assert len(lines) == 1, f"{len(lines)} lines on 1 s of noise, want exactly one: {lines}"
+o = lines[0]
+want = {"event": f"{mode}.status", "locked": False, "lock": word}
+assert set(o) == set(want) | {"t_sample"} and all(o[k] == v for k, v in want.items()), f"the line {json.dumps(o)}"
+block = 16384
+assert rate - block < o["t_sample"] < rate, f"t_sample {o['t_sample']}: not the last block's of {rate} samples"
+print(f"ok: 1 s of noise, one {mode}.status line at its end: {json.dumps(o)}")
+EOF
+}
+head -c $((10000000 * 4)) /dev/urandom | timed dvbt-short --format cs16 --mode dvbt --rate 10000000
+short dvbt-short dvbt 10000000 searching || fail "dvbt on 1 s of noise"
+head -c $((8000000 * 4)) /dev/urandom | timed video-short --format cs16 --mode video --rate 8000000
+short video-short video 8000000 "no lock" || fail "video on 1 s of noise"
 
 # --- onair-gen's rds takes --ps and --rt only, a voice mode none of the options, dvbt --bandwidth (8, 7, 6 or 5), --service
 # and --lead only, video --deviation only; another mode does not take them

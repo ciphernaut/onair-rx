@@ -121,7 +121,9 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
 - **stdout, polled modes:** some OnAir receivers put nothing on the bus and offer only a snapshot of their state
   (`telemetry()`). A polled mode feeds its receiver blocks of 16384 samples, each one whole however the input arrives
   (only the last may be short), and polls at the multiples of the mode's poll interval from sample 0, each after the
-  block that reaches one, so a replay gives the same lines as a live run, byte for byte. A poll writes one JSON object
+  block that reaches one, so a replay gives the same lines as a live run, byte for byte. An interval shorter than a
+  block is a poll after every block: `dmr` at 48 kHz (0.25 s is 12000 samples) is polled every block, each 0.34 s
+  of input. A poll writes one JSON object
   per line for what is new or has changed since the last poll; one more poll runs at the end of input, so that what
   the last block completed is written. Every line has `event` (the mode's) and `t_sample` (the index of the first
   sample of the block after which the poll ran), a member only when its value is known, whole numbers without a
@@ -133,7 +135,7 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
   | mode | OnAir receiver | minimum rate | poll | event | members |
   |---|---|---|---|---|---|
   | `rds` | `FmReceiver` | 500 kHz | every block | `rds.group` | `pi`, `group`, `pty`, `tp`, `ps`, `rt` |
-  | `dmr` | `DmrReceiver` (`configureChannel`) | 48 kHz | 0.25 s | `voice.call` | a call: `type`, `src`, `dst`, `call`, `color_code`, `slot`, `encrypted`, `emergency`, `silent`, `alias`, `eot`; a channel: `type`, `color_code`, `control`, `network` |
+  | `dmr` | `DmrReceiver` (`configureChannel`) | 48 kHz | 0.25 s (every block, 0.34 s, at 48 kHz) | `voice.call` | a call: `type`, `src`, `dst`, `call`, `color_code`, `slot`, `encrypted`, `emergency`, `silent`, `alias`, `eot`; a channel: `type`, `color_code`, `control`, `network` |
   | `p25` | `P25Receiver` (phase 1) | 250 kHz | 0.25 s | `voice.call` | a call: `type`, `src`, `dst`, `call`, `nac`, `encrypted`, `emergency`, `silent`, `algid`, `kid`, `eot`; a channel: `type`, `nac`, `control`, `network` |
   | `m17` | `M17Receiver` | 250 kHz | 0.25 s | `voice.call` | `src`, `dst`, `can`, `type`, `encryption`, `lat`, `lon`, `eot` |
   | `dvbt` | `DvbtReceiver`, `TsDemux` | 7.9 MHz for 8 MHz (4.9375 MHz for 5) | 0.25 s | `dvbt.status` | `locked`, `lock`, `bandwidth_hz`, `mode`, `guard`, `constellation`, `code_rate`, `hierarchy`, `lp_code_rate`, `snr_db`, `services` |
@@ -186,7 +188,8 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
       holds, and again only when what it says changes, not after every call.
   - `dvbt`, `video` (the status modes): a line says the receiver's state, what it has locked to and what the signal
     says about itself. The first line comes at first lock or at 2 s of input (the poll of the block that reaches 2 s),
-    whichever is first, so a signal that locks by then has a locked first line; then a line comes when any member of
+    whichever is first, so a signal that locks by then has a locked first line; input that ends sooner without a lock
+    has its one line from the poll at the end (`locked` false), and empty input none; then a line comes when any member of
     the state changes, and one at least every 2 s of input, so a watcher always has a
     current one. A measured value (`snr_db`, `line_hz`) is written on each line but makes no line of its own: it moves
     at every poll. A poll is every 0.25 s, so the 2 s line is written at the last poll before the gap could pass 2 s:
@@ -195,7 +198,10 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
     searching. `locked` and `lock` are on every line; the values are spelled as ZetaSDR's rows spell them:
     - `dvbt`: OnAir's DVB-T receiver on one channel width at a time, the multiplex at 0 Hz of the input. Without
       `--bandwidth` it tries 8, 7, 6 and 5 MHz in turn (those the rate takes: 7.9 MHz of input for 8 MHz, scaled with
-      the width, OnAir's floor), each for 2 s of input (eight polls, so the widths change on the 2 s marks), until the
+      the width, OnAir's floor, and that OnAir's resampler can bring the rate to: a width whose own rate it finds no
+      ratio to, within 1e-4 and 1024 phases, is not tried, as the receiver would search on it for ever; 9138287 Hz is
+      such a rate for 8 MHz. With no width left the rate exits 2, before reading input, with `onair-rx: <rate> Hz
+      cannot be resampled for dvbt at <widths> MHz (OnAir's resampler finds no ratio)`), each for 2 s of input (eight polls, so the widths change on the 2 s marks), until the
       TPS is decoded. The width is decided at each poll from the same snapshot as the line, after it: a poll whose
       line says `locked` holds the width, and eight polls in a row that say `searching` (counted again from a lost
       lock) move to the next. So a line never carries one width's signalling with another's `bandwidth_hz`, and a lock
@@ -342,7 +348,7 @@ followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
   function that makes its session (`src/poll_<mode>.cpp`), a `PollSession` that feeds the receiver and, at each poll,
   hands over the lines for what is new or changed in its snapshot; `runPolled` adds `event` and `t_sample`. RDS
   (`src/poll_rds.cpp`) queues a line per group from the receiver's group tap and is polled after every block. The
-  voice modes (`src/poll_voice.cpp`) are polled every 0.25 s: each turns its receiver's call log into what it says
+  voice modes (`src/poll_voice.cpp`) are polled every 0.25 s (or after every block, when that is longer): each turns its receiver's call log into what it says
   about each call (a key and the members) and hands that to a `CallLog` (`src/calls.h`), which writes the first, the
   changed and the last line of each call. The status modes (`src/poll_tv.cpp`) are polled every 0.25 s and write
   their receiver's state on a change and at least every 2 s; DVB-T's session also steps through the channel widths

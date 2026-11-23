@@ -3,8 +3,8 @@
 //
 // Neither receiver has a decode to hand over one by one: what it knows is a state (locked or not, and what the signal says
 // about itself), in its snapshot. A status mode writes that state as one line: the first at first lock or after 2 s of input,
-// whichever comes first; then one whenever the state changes, and one at least every 2 s, so that a watcher always has a
-// current one. A measured value (an SNR, a line rate) is written with the state but makes no line of its own: it moves at every
+// whichever comes first, or at the end of input when that is sooner; then one whenever the state changes, and one at least
+// every 2 s, so that a watcher always has a current one. A measured value (an SNR, a line rate) is written with the state but makes no line of its own: it moves at every
 // poll. All of it is counted in samples of input, so a replay gives the same lines as a live run.
 //
 // dvbt: OnAir's DvbtReceiver, on one channel width at a time. Without --bandwidth it tries 8, 7, 6 and 5 MHz (those the rate
@@ -13,10 +13,13 @@
 // video: OnAir's AtvReceiver in its FM video mode (analog FPV links, what the node's video row decodes). No picture is taken.
 #include "poll.h"
 #include "dect2/atv/atv_rx.h"
+#include "dect2/dsp/resampler.h"
 #include "dect2/dvbt/dvbt_rx.h"
+#include "dect2/t2/t2.h"
 #include "dect2/tv/ts.h"
 #include <cmath>
 #include <cstdio>
+#include <string>
 
 namespace onair_rx {
 
@@ -28,7 +31,8 @@ constexpr double kStatusMostSec = 2;   // a status line at least this often, sec
 
 // When a status line is due. The first waits for first lock or kStatusMostSec of input, whichever comes first (the poll of
 // the block that reaches it), as the row's own decoders' first event does: the node judges a job by its first event, so a
-// signal that locks by then is reported locked. After it, a poll comes every kStatusPollSec of input, after the block of
+// signal that locks by then is reported locked. Input that ends before either has its first line from the poll at the end.
+// After it, a poll comes every kStatusPollSec of input, after the block of
 // kPollBlock that reaches it; so a line is written at the last poll before the gap since the one before could pass
 // kStatusMostSec, and lines are never further apart than that, whatever block a poll lands on.
 class Cadence {
@@ -36,11 +40,13 @@ public:
     explicit Cadence(double rate)
         : most_((uint64_t)std::llround(kStatusMostSec * rate)), slack_((uint64_t)std::llround(kStatusPollSec * rate) + kPollBlock) {}
     void fed(size_t n) { now_ += n; }
-    // j, the line, is added to lines when it is due: the first once locked or at kStatusMostSec, then on a change of key (the
-    // state: the line's members without the measured ones) or when late
-    void offer(bool locked, const std::string& key, Json&& j, std::vector<Json>& lines) {
+    // j, the line, is added to lines when it is due: the first once locked, at kStatusMostSec or at the end of input (last),
+    // so input that ends sooner without a lock still gives its one line (empty input gives none); then on a change of key
+    // (the state: the line's members without the measured ones) or when late
+    void offer(bool locked, bool last, const std::string& key, Json&& j, std::vector<Json>& lines) {
         const bool late = now_ + slack_ > at_ + most_;   // the next poll could come more than kStatusMostSec after the last line
-        if (written_ ? key == key_ && !late : !locked && now_ < most_) return;
+        const bool ended = last && now_ > 0;
+        if (written_ ? key == key_ && !late : !locked && !ended && now_ < most_) return;
         at_ = now_;
         key_ = key;
         written_ = true;
@@ -74,14 +80,29 @@ public:
     bool open(const Options& o, std::string* err) {
         rate_ = o.rate;
         int narrowest = 0;
+        std::string refused;   // the widths the rate is high enough for but that cannot be resampled to, "8, 7 or 6"
         for (int w : kDvbtWidths) {
             if (o.bandwidthMhz && w != o.bandwidthMhz) continue;
             narrowest = w;
-            if (o.rate >= dvbtFloor(w)) widths_.push_back(w);
+            if (o.rate < dvbtFloor(w)) continue;
+            // configure() takes a width only when OnAir's resampler finds a ratio from the rate to the width's own rate
+            // (within 1e-4, at most 1024 phases); one it cannot would read searching for ever, so it is not tried
+            if (!RationalResampler().configure(o.rate, nativeRateHz(w))) {
+                refused += (refused.empty() ? "" : ", ") + std::to_string(w);
+                continue;
+            }
+            widths_.push_back(w);
         }
         if (widths_.empty()) {
-            char b[160];
-            snprintf(b, sizeof b, "%.0f Hz is too low for dvbt (at least %.0f Hz)", o.rate, dvbtFloor(narrowest));
+            char b[200];
+            if (refused.empty()) {
+                snprintf(b, sizeof b, "%.0f Hz is too low for dvbt (at least %.0f Hz)", o.rate, dvbtFloor(narrowest));
+            } else {
+                const size_t comma = refused.rfind(", ");
+                if (comma != std::string::npos) refused.replace(comma, 2, " or ");
+                snprintf(b, sizeof b, "%.0f Hz cannot be resampled for dvbt at %s MHz (OnAir's resampler finds no ratio)", o.rate,
+                         refused.c_str());
+            }
             *err = b;
             return false;
         }
@@ -134,7 +155,7 @@ public:
             }
             return j;
         };
-        cad_.offer(locked, line(false).done(), line(true), lines);
+        cad_.offer(locked, last, line(false).done(), line(true), lines);
         if (locked) pollsOnWidth_ = 0;
         else if (++pollsOnWidth_ >= kDvbtTryPolls && widths_.size() > 1 && !last) use((at_ + 1) % widths_.size());
     }
@@ -210,7 +231,7 @@ public:
         rx_.feed(x, n);
         cad_.fed(n);
     }
-    void poll(bool, std::vector<Json>& lines) override {
+    void poll(bool last, std::vector<Json>& lines) override {
         if (rx_.telemetry(tel_, seq_)) seq_ = tel_.seq;   // published every 0.25 s of signal
         const bool locked = tel_.state == 2;           // line and field sync
         const bool lineSync = tel_.state >= 1;         // line sync at least: the line rate and the SNR are measured
@@ -225,7 +246,7 @@ public:
             }
             return j;
         };
-        cad_.offer(locked, line(false).done(), line(true), lines);
+        cad_.offer(locked, last, line(false).done(), line(true), lines);
     }
 
 private:
