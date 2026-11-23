@@ -28,7 +28,7 @@ namespace onair_rx {
 
 namespace wire = dect2::wire;
 
-static const char* kVersion = "0.2.0";
+static const char* kVersion = "0.3.0";
 
 // The modes with a run function of their own: each is one OnAir receiver. The modes read from OnAir's automation bus are
 // rows of the bus mode table (bus.cpp) instead, and the modes that poll their receiver's state rows of the polled mode table
@@ -79,12 +79,12 @@ void Output::line(const std::string& json) {
 using namespace onair_rx;
 
 static void usage(FILE* f) {
-    fprintf(f, "usage: onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] < iq\n"
+    fprintf(f, "usage: onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] [--bandwidth MHZ] < iq\n"
                "       onair-rx --lua      OnAir's Wireshark Lua dissector (USER0 is Mode S)\n"
                "       onair-rx --version\n"
                "IQ on stdin, interleaved little endian; --freq is the radio frequency at 0 Hz of the input; one JSON object\n"
                "per decode on stdout; with --pcap-port, a classic pcap stream of the frames for one client at a time on\n"
-               "127.0.0.1:PORT. Modes:");
+               "127.0.0.1:PORT; --bandwidth (dvbt: 8, 7, 6 or 5) fixes the channel width, which is otherwise found. Modes:");
     for (const Mode& m : kModes) fprintf(f, " %s", m.name);
     for (size_t i = 0; i < kBusModeCount; i++) fprintf(f, " %s", kBusModes[i].name);
     for (size_t i = 0; i < kPollModeCount; i++) fprintf(f, " %s", kPollModes[i].name);
@@ -112,6 +112,12 @@ int main(int argc, char** argv) {
             if (!*argv[i] || *end || p < 1 || p > 65535) { fprintf(stderr, "onair-rx: bad --pcap-port %s\n", argv[i]); return 2; }
             o.pcapPort = (int)p;
         }
+        else if (a == "--bandwidth" && val) {
+            char* end = nullptr;
+            const long w = strtol(argv[++i], &end, 10);
+            if (!*argv[i] || *end || w < 5 || w > 8) { fprintf(stderr, "onair-rx: bad --bandwidth %s (8, 7, 6 or 5)\n", argv[i]); return 2; }
+            o.bandwidthMhz = (int)w;
+        }
         else if (a == "--lua") { fputs(wire::luaDissectors(), stdout); return 0; }
         else if (a == "--version") {
             printf("onair-rx %s\nOnAir %s\nLicence: GPL-3.0-or-later\n"
@@ -135,6 +141,7 @@ int main(int argc, char** argv) {
     // before any sample is read: a mode that places its channels by frequency never runs without one
     if (bus && bus->needsFreq && o.freq <= 0) { fprintf(stderr, "onair-rx: %s needs --freq HZ\n", bus->name); return 2; }
     if (bus && bus->chan < 0 && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", bus->name); return 2; }
+    if (o.bandwidthMhz && o.mode != "dvbt") { fprintf(stderr, "onair-rx: %s has no --bandwidth (dvbt only)\n", o.mode.c_str()); return 2; }
     if (polled && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", polled->name); return 2; }   // no polled mode has packets
 
     PcapPort pcap;

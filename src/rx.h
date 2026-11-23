@@ -24,6 +24,7 @@ struct Options {
     std::string format = "cf32";   // cf32 or cs16, interleaved little endian
     double rate = 0;               // input sample rate, Hz
     double freq = 0;               // --freq: the radio frequency at 0 Hz of the input, Hz (0 when not given)
+    int bandwidthMhz = 0;          // --bandwidth: dvbt's channel width, MHz (8, 7, 6 or 5; 0 when not given: each is tried)
     int pcapPort = 0;              // 0: no pcap port
 };
 

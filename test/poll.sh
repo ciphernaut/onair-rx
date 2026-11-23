@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 #
-# End-to-end check of the polled modes (rds, dmr, p25, m17) on OnAir's own test signals: _build/onair-gen makes a known
-# station or call (RDS: PI 2AB1, PS "ZETA FM ", RT "HELLO FROM ZETASDR", 6 s of OnAir's FM generator; DMR, P25, M17: one
-# call sent twice, with the node's check values), onair-rx decodes it. The signals are synthesised; no capture is used.
+# End-to-end check of the polled modes (rds, dmr, p25, m17, dvbt, video) on OnAir's own test signals: _build/onair-gen makes
+# a known station, call or picture (RDS: PI 2AB1, PS "ZETA FM ", RT "HELLO FROM ZETASDR", 6 s of OnAir's FM generator; DMR,
+# P25, M17: one call sent twice, with the node's check values; DVB-T: 6 s of an 8 MHz 8K multiplex with one service, ZETA
+# TEST; video: 3 s of a PAL test card on FM), onair-rx decodes it. The signals are synthesised; no capture is used.
 # Also: a rate below the receiver's minimum and --pcap-port are refused before any input is read; the programme service name
 # and the radiotext are absent until complete, also on input that ends before the name is; a name and a text beyond ASCII are
 # written in UTF-8, one valid line each (and the UTF-8 writer on its own); the input through a pipe in uneven chunks gives the
 # same lines as from a file; each pass of a call gives one first line and one last line, the same with the speech codecs
-# hidden (and the call keying on its own); onair-gen refuses an option its mode does not take.
+# hidden (and the call keying on its own); a status mode (dvbt, video) writes its first line within 2 s of input and then one
+# at least every 2 s, also on noise that never locks (dvbt: while trying every channel width), a DVB-T service name beyond
+# ASCII in UTF-8; the user CPU of each status run is printed; onair-gen refuses an option its mode does not take.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -20,13 +23,13 @@ d=$(mktemp -d)
 trap 'rm -rf "$d"' EXIT
 
 # --- onair-rx has each mode: on empty input it ends with exit 0 and no line
-for mr in rds:500000 dmr:48000 p25:250000 m17:250000; do
+for mr in rds:500000 dmr:48000 p25:250000 m17:250000 dvbt:10000000 video:16000000; do
   m=${mr%:*} rate=${mr#*:}
   "$bin" --mode "$m" --rate "$rate" --format cf32 </dev/null >"$d/$m.empty" 2>"$d/$m.empty.err" ||
     fail "$m: $(cat "$d/$m.empty.err")"
   [ ! -s "$d/$m.empty" ] || fail "$m: a line on empty input"
 done
-echo "ok: onair-rx has rds, dmr, p25 and m17"
+echo "ok: onair-rx has rds, dmr, p25, m17, dvbt and video"
 
 # --- refuses <stderr> <onair-rx args...>: exit 2 with exactly that one line on stderr, before reading any input (stdin stays
 # open and is never written), and nothing on stdout
@@ -54,6 +57,15 @@ for mr in dmr:48000 p25:250000 m17:250000; do
   refuses "onair-rx: $((rate / 2)) Hz is too low for $m (at least $rate Hz)" --mode "$m" --rate $((rate / 2)) || fail "$m at half its rate"
   refuses "onair-rx: $m has no packets (no --pcap-port)" --mode "$m" --rate "$rate" --pcap-port 5000 || fail "$m with --pcap-port"
 done
+# dvbt: the rate must take the channel width asked for (7.9 MHz for 8 MHz, OnAir's receiver's floor), or without one at least
+# the narrowest it tries (5 MHz); video: OnAir's analog TV receiver's floor
+refuses "onair-rx: 7000000 Hz is too low for dvbt (at least 7900000 Hz)" --mode dvbt --rate 7000000 --bandwidth 8 || fail "dvbt 8 MHz at 7 MHz"
+refuses "onair-rx: 4000000 Hz is too low for dvbt (at least 4937500 Hz)" --mode dvbt --rate 4000000 || fail "dvbt at 4 MHz"
+refuses "onair-rx: dvbt has no packets (no --pcap-port)" --mode dvbt --rate 10000000 --pcap-port 5000 || fail "dvbt with --pcap-port"
+refuses "onair-rx: bad --bandwidth 9 (8, 7, 6 or 5)" --mode dvbt --rate 10000000 --bandwidth 9 || fail "dvbt at 9 MHz"
+refuses "onair-rx: video has no --bandwidth (dvbt only)" --mode video --rate 16000000 --bandwidth 8 || fail "video with --bandwidth"
+refuses "onair-rx: 4000000 Hz is too low for video (at least 8000000 Hz)" --mode video --rate 4000000 || fail "video at 4 MHz"
+refuses "onair-rx: video has no packets (no --pcap-port)" --mode video --rate 16000000 --pcap-port 5000 || fail "video with --pcap-port"
 
 [ -x "$gen" ] || fail "no test signal generator at $gen (run ./build.sh)"
 
@@ -259,11 +271,145 @@ rx p25-channel --mode p25 --rate 250000
 channel p25-channel 250000 '{"type":"channel","nac":291,"control":true,"network":"control channel, NAC 291"}' ||
   fail "a P25 control channel"
 
-# --- onair-gen's rds takes --ps and --rt only, a voice mode none of the options; another mode does not take them
+# --- the status modes (dvbt, video): a line on lock, on a change of what the signal says, and at least every 2 s
+
+# timed <tag> <onair-rx args...>: as rx, from $d/<tag>.iq or, when there is none, stdin; prints onair-rx's user CPU over the
+# seconds of input it read
+timed() {
+  local tag=$1 st=0 in=$d/$1.iq secs
+  shift
+  [ -f "$in" ] || in=/dev/stdin
+  /usr/bin/time -f %U -o "$d/$tag.cpu" "$bin" "$@" <"$in" >"$d/$tag.jsonl" 2>"$d/$tag.err" || st=$?
+  [ "$st" = 0 ] || fail "$tag: onair-rx exited $st: $(tail -n 3 "$d/$tag.err")"
+  secs=$(sed -n 's/^onair-rx: [0-9]* samples (\([0-9.]*\) s)$/\1/p' "$d/$tag.err")
+  echo "ok: $tag: user CPU $(tail -n 1 "$d/$tag.cpu") s for $secs s of input"
+}
+
+# status <tag> <mode> <rate> <input samples> <what is wanted, JSON>: every line of $d/<tag>.jsonl is one <mode>.status
+# object of the row's members only, each of its type and each enumerated one spelled as the row's own decoder spells it
+# (dvbt: dvbt-rx; video: the node's composite decoder), no null, t_sample never decreasing, locked and lock on every line and
+# saying the same, dvbt's signalling only while locked; the output is UTF-8 with no control byte inside a line. The first line
+# comes within 2 s of input, successive lines are never more than 2 s of input apart, and the last is less than 2 s from the
+# end. Wanted: "locked", the members some locked line has (and every locked line with signalling has them); "service", an
+# object some line's services holds; "never", no line is locked; "lines", at least that many lines
+status() {
+  python3 -I - "$d/$1.jsonl" "$4" "$3" "$2" "$5" <<'EOF'
+import json, sys
+path, nsamp, rate, mode, want = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], json.loads(sys.argv[5])
+block = 16384   # runPolled's: t_sample is the first sample of the block after which the poll ran
+raw = open(path, "rb").read()
+assert raw.endswith(b"\n"), "no line, or the last line is not ended"
+raw.decode("utf-8")   # strict: text is UTF-8, not a byte per character
+bad = [b for b in set(raw) if b < 0x20 and b != 0x0A]
+assert not bad, f"control bytes {sorted(bad)} in the output"
+lines = [json.loads(l) for l in raw.splitlines()]
+if mode == "dvbt":
+    rates = {"1/2", "2/3", "3/4", "5/6", "7/8"}
+    types = {"locked": bool, "lock": str, "bandwidth_hz": int, "mode": str, "guard": str, "constellation": str, "code_rate": str,
+             "hierarchy": str, "lp_code_rate": str, "cell_id": int, "snr_db": (int, float), "services": list}
+    enums = {"lock": {"locked", "searching"}, "bandwidth_hz": {8000000, 7000000, 6000000, 5000000}, "mode": {"2K", "8K", "4K"},
+             "guard": {"1/32", "1/16", "1/8", "1/4"}, "constellation": {"QPSK", "16-QAM", "64-QAM"}, "code_rate": rates,
+             "hierarchy": {"a=1", "a=2", "a=4"}, "lp_code_rate": rates}
+    signalling = {"bandwidth_hz", "mode", "guard", "constellation", "code_rate"}
+else:
+    types = {"system": str, "standard": str, "locked": bool, "lock": str, "line_hz": int, "snr_db": int}
+    enums = {"lock": {"locked", "no lock"}, "standard": {"pal", "ntsc", "secam"}, "system": {"PAL 625/50", "NTSC 525/60", "SECAM 625/50"}}
+    signalling = {"system", "standard"}
+assert lines, "no line"
+last = None
+for n, o in enumerate(lines):
+    assert isinstance(o, dict), f"line {n}: not an object"
+    assert o.get("event") == f"{mode}.status", f"line {n}: event {o.get('event')!r}"
+    t = o.get("t_sample")
+    assert type(t) is int and 0 <= t < nsamp, f"line {n}: t_sample {t!r} (of {nsamp} samples)"
+    if last is None:
+        assert t + block <= 2 * rate, f"the first line after {(t + block) / rate:.3f} s of input, not within 2 s"
+    else:
+        assert t >= last, f"line {n}: t_sample {t} before {last}"
+        assert t - last <= 2 * rate, f"line {n}: {(t - last) / rate:.3f} s of input after the line before it"
+    last = t
+    for k, v in o.items():
+        if k in ("event", "t_sample"): continue
+        assert k in types, f"line {n}: a member {k!r} the row does not have"
+        assert v is not None, f"line {n}: {k} is null"
+        ok = types[k] if isinstance(types[k], tuple) else (types[k],)
+        assert type(v) in ok, f"line {n}: {k} {v!r} is not {' or '.join(t.__name__ for t in ok)}"
+        if k in enums: assert v in enums[k], f"line {n}: {k} {v!r}, not one of {sorted(enums[k], key=str)}"
+    assert "locked" in o and "lock" in o, f"line {n}: no locked or no lock: {o}"
+    assert (o["lock"] == "locked") == o["locked"], f"line {n}: lock {o['lock']!r} with locked {o['locked']}"
+    if mode == "dvbt" and not o["locked"]:
+        assert set(o) == {"event", "t_sample", "locked", "lock"}, f"line {n}: signalling while not locked: {o}"
+    for s in o.get("services", []):
+        assert type(s.get("id")) is int and set(s) <= {"id", "name", "kind"}, f"line {n}: service {s}"
+        assert s.get("kind", "tv") in ("tv", "radio", "data"), f"line {n}: service kind {s.get('kind')!r}"
+assert nsamp - last <= 2 * rate, f"the last line {(nsamp - last) / rate:.3f} s of input before the end"
+assert len(lines) >= want.get("lines", 1), f"{len(lines)} lines, want at least {want.get('lines', 1)}"
+locked = [o for o in lines if o["locked"]]
+everything = "the lines:\n  " + "\n  ".join(map(json.dumps, lines))
+if want.get("never"):
+    assert not locked, f"a locked line on a signal that has none: {json.dumps(locked[0])}"
+if "locked" in want:
+    w = want["locked"]
+    assert any(all(o.get(k) == v for k, v in w.items()) for o in locked), f"no locked line with {w}; {everything}"
+    for o in locked:
+        if signalling & set(o):
+            assert all(o.get(k) == v for k, v in w.items()), f"a locked line that is not {w}: {json.dumps(o)}"
+if "service" in want:
+    assert any(want["service"] in o.get("services", []) for o in lines), f"no line's services hold {want['service']}; {everything}"
+first = next((o["t_sample"] for o in locked), None)
+gap = max([b["t_sample"] - a["t_sample"] for a, b in zip(lines, lines[1:])] or [0])
+print(f"ok: {len(lines)} {mode}.status lines, the first at {lines[0]['t_sample'] / rate:.3f} s, "
+      + (f"locked from {first / rate:.3f} s" if first is not None else "never locked")
+      + f", at most {gap / rate:.3f} s apart: {json.dumps(locked[-1] if locked else lines[-1], ensure_ascii=False)}")
+EOF
+}
+samples() { echo $(($(stat -c %s "$d/$1.iq") / 8)); }
+
+# DVB-T: OnAir's generator's 8 MHz multiplex (8K, guard 1/8, 64-QAM, rate 3/4) with one television service, ZETA TEST, at
+# 10 MHz; the width is found (8 MHz is tried first) and the service list read from the transport stream
+dvbt_locked='{"locked":true,"lock":"locked","bandwidth_hz":8000000,"mode":"8K","guard":"1/8","constellation":"64-QAM","code_rate":"3/4"}'
+gen dvbt --mode dvbt --rate 10000000
+timed dvbt --format cf32 --mode dvbt --rate 10000000
+status dvbt dvbt 10000000 "$(samples dvbt)" "{\"locked\":$dvbt_locked,\"service\":{\"id\":4660,\"name\":\"ZETA TEST\",\"kind\":\"tv\"}}" ||
+  fail "dvbt"
+rm -f "$d/dvbt.iq"
+# a 7 MHz multiplex: 8 MHz gives no lock in its 2 s, then 7 does
+gen dvbt7 --mode dvbt --rate 10000000 --bandwidth 7
+timed dvbt7 --format cf32 --mode dvbt --rate 10000000
+status dvbt7 dvbt 10000000 "$(samples dvbt7)" "{\"locked\":${dvbt_locked/8000000/7000000}}" || fail "dvbt, a 7 MHz multiplex"
+rm -f "$d/dvbt7.iq"
+# a service name beyond ASCII, in ISO 8859-5's Cyrillic (EN 300 468's first byte 0x01), with a quote and a backslash: one
+# valid line each, the name in UTF-8
+gen dvbt-cyr --mode dvbt --rate 10000000 --service $'\x01ZETA "\xc2\xd5\xe1\xe2" \\'
+timed dvbt-cyr --format cf32 --mode dvbt --rate 10000000 --bandwidth 8
+status dvbt-cyr dvbt 10000000 "$(samples dvbt-cyr)" '{"service":{"id":4660,"name":"ZETA \"Тест\" \\","kind":"tv"}}' ||
+  fail "dvbt, a service name beyond ASCII"
+rm -f "$d/dvbt-cyr.iq"
+# noise only, 8 s of random bytes read as cs16: it never locks, every width is tried in turn, a line at least every 2 s
+head -c $((8 * 10000000 * 4)) /dev/urandom | timed dvbt-noise --format cs16 --mode dvbt --rate 10000000
+status dvbt-noise dvbt 10000000 80000000 '{"never":true,"lines":3}' || fail "dvbt on noise"
+
+# analog video: OnAir's FPV generator's PAL test card on FM with the swing of the node's check, at 16 MHz and at the
+# receiver's floor, 8 MHz (the node's check capture's rate)
+for rate in 16000000 8000000; do
+  gen "video-$rate" --mode video --rate "$rate"
+  timed "video-$rate" --format cf32 --mode video --rate "$rate"
+  status "video-$rate" video "$rate" "$(samples "video-$rate")" \
+    '{"locked":{"locked":true,"lock":"locked","standard":"pal","system":"PAL 625/50"}}' || fail "video at $rate Hz"
+  rm -f "$d/video-$rate.iq"
+done
+# noise only, 4 s of random bytes read as cs16 at the floor: never locked, a line at least every 2 s
+head -c $((4 * 8000000 * 4)) /dev/urandom | timed video-noise --format cs16 --mode video --rate 8000000
+status video-noise video 8000000 32000000 '{"never":true,"lines":2}' || fail "video on noise"
+
+# --- onair-gen's rds takes --ps and --rt only, a voice mode none of the options, dvbt --bandwidth (8, 7, 6 or 5) and
+# --service only, video --deviation only; another mode does not take them
 for a in "--mode rds --rate 500000 --freq 100000000" "--mode rds --rate 500000 --text X" "--mode rds --rate 500000 --info X" \
   "--mode pocsag --rate 1000000 --ps X" "--mode pocsag --rate 1000000 --rt X" "--mode dmr --rate 48000 --freq 100000000" \
   "--mode p25 --rate 250000 --text X" "--mode m17 --rate 250000 --ps X" "--mode m17 --rate 250000 --channel" \
-  "--mode rds --rate 500000 --channel"; do
+  "--mode rds --rate 500000 --channel" "--mode dvbt --rate 10000000 --ps X" "--mode dvbt --rate 10000000 --deviation 1000000" \
+  "--mode video --rate 16000000 --service X" "--mode video --rate 16000000 --bandwidth 7" "--mode rds --rate 500000 --bandwidth 8" \
+  "--mode dvbt --rate 10000000 --bandwidth 9" "--mode pocsag --rate 1000000 --deviation 1000000"; do
   st=0
   # shellcheck disable=SC2086
   "$gen" $a >/dev/null 2>"$d/gen-refuse.err" || st=$?

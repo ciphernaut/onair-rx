@@ -32,17 +32,23 @@ struct PollMode {
 extern const PollMode kPollModes[];
 extern const size_t kPollModeCount;
 
-// Runs a polled mode to EOF: blocks of 16384 are fed, each one whole however stdin delivers it (only the last may be short); a
+constexpr size_t kPollBlock = 1 << 14;    // runPolled's block, samples
+constexpr double kStatusPollSec = 0.25;   // the status modes' (dvbt, video) poll interval
+
+// Runs a polled mode to EOF: blocks of kPollBlock are fed, each one whole however stdin delivers it (only the last may be short); a
 // poll runs after each block that reaches a multiple of pollSec * o.rate samples from sample 0 (every block when 0), and once
 // more, with last true, at EOF. Each line is written with "event" (the mode's) and
 // "t_sample" (the first sample of the block after which its poll ran) in front. The exit status: 2 with "onair-rx: <err>"
 // when open fails, before any sample is read.
 int runPolled(const PollMode& m, const Options& o, IqInput& in, Output& out);   // the exit status
 
-// the session of each polled mode (poll_<mode>.cpp; the voice modes dmr, p25 and m17 in poll_voice.cpp)
+// the session of each polled mode (poll_<mode>.cpp; the voice modes dmr, p25 and m17 in poll_voice.cpp, the status modes dvbt
+// and video in poll_tv.cpp)
 std::unique_ptr<PollSession> openRds(const Options& o, std::string* err);
 std::unique_ptr<PollSession> openDmr(const Options& o, std::string* err);
 std::unique_ptr<PollSession> openP25(const Options& o, std::string* err);
 std::unique_ptr<PollSession> openM17(const Options& o, std::string* err);
+std::unique_ptr<PollSession> openDvbt(const Options& o, std::string* err);    // poll_tv.cpp, as video
+std::unique_ptr<PollSession> openVideo(const Options& o, std::string* err);
 
 } // namespace onair_rx

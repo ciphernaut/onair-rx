@@ -1,6 +1,6 @@
 # What to offer upstream
 
-Two changes to OnAir, as the operator would send them. Nothing here has been sent. OnAir takes focused pull requests
+Three changes to OnAir, as the operator would send them. Nothing here has been sent. OnAir takes focused pull requests
 with a test and a DCO sign-off (`git commit -s`), from the operator's account, one change to a request.
 
 Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
@@ -45,6 +45,29 @@ Described only; not written here.
 - **Test:** one per receiver touched would be wanted, each feeding a known signal and reading the stamped time. A
   receiver that has no sample clock of its own at the call site needs the count of samples fed so far carried to it.
   Offer it a receiver at a time, starting with ADS-B and APRS, whose call sites are one line each.
+
+## 3. Bus emitters for the voice, broadcast and television receivers
+
+Described only; not written here.
+
+- **Change:** the receivers behind `onair-rx`'s polled modes put their decodes on the automation bus, as the pager,
+  ACARS, APRS, VDL2, HFDL and sonde receivers already do inside `feed()`. OnAir defines the families for two of them
+  and its core never emits them: `voice.<type>` (`FVoice`, "call events of the digital voice modes") and
+  `broadcast.<type>` (`FBroadcast`, "FM RDS / DAB text"). At `a63c3a8` only the app's DAB view emits
+  `broadcast.text` and `broadcast.now_playing`, not the FM receiver, and only OnAir's tests make a `voice.call`.
+  Television has no family yet; a DVB-T or analog TV lock and its signalling would need one.
+- **Receivers:** `FmReceiver` (RDS: a group, or the programme service name and radiotext when complete),
+  `DmrReceiver`, `P25Receiver` and `M17Receiver` (a call: its start with the ids, a change, its end), `DvbtReceiver`
+  (a lock, a change of the TPS, the service list once read) and `AtvReceiver` (a lock and the system found).
+- **Why:** with these events on the bus, `onair-rx`'s generic bus path (`src/bus.cpp`) would serve all six modes
+  (`rds`, `dmr`, `p25`, `m17`, `dvbt`, `video`) as table rows. Today each has a session that reads the receiver's
+  snapshot at every poll and works out what is new (`src/poll_*.cpp`, `src/calls.h`), which the receiver itself knows
+  at the moment it decodes. Any other program taking OnAir's receivers bare would get the same.
+- **Test:** one per receiver, feeding the signal of the receiver's own generator and reading the events off a bus
+  tap, as `onair-rx`'s `test/poll.sh` reads its lines.
+- **No speech switch is asked for:** the voice receivers decode a voice frame only for a call their voice monitor
+  plays, and a monitor whose allow list is on and empty refuses every call (`src/poll_voice.cpp`). A program that
+  wants the events without the speech therefore already has a way, with no change to OnAir.
 
 ## Dropped
 

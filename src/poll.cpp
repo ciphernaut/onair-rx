@@ -16,6 +16,8 @@ const PollMode kPollModes[] = {
     {"dmr", "voice.call", 0.25, openDmr},   // the voice receivers publish their snapshot every 0.25 s of signal
     {"p25", "voice.call", 0.25, openP25},
     {"m17", "voice.call", 0.25, openM17},
+    {"dvbt", "dvbt.status", kStatusPollSec, openDvbt},   // a status line on a change and at least every 2 s (poll_tv.cpp)
+    {"video", "video.status", kStatusPollSec, openVideo},
 };
 const size_t kPollModeCount = sizeof kPollModes / sizeof kPollModes[0];
 
@@ -46,7 +48,7 @@ int runPolled(const PollMode& m, const Options& o, IqInput& in, Output& out) {
     // what happens to be there. So the blocks, every t_sample and where each poll lands depend on the input alone, and a
     // replay gives the same lines as a live run. The polls are at the multiples of the interval from sample 0, each after the
     // block that reaches one, so they do not drift.
-    constexpr size_t kBlock = 1 << 14;
+    constexpr size_t kBlock = kPollBlock;
     const uint64_t every = (uint64_t)std::llround(m.pollSec * o.rate);   // 0: every block
     uint64_t fed = 0, first = 0, due = every;
     std::vector<cf32> iq(kBlock), part;
