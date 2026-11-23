@@ -20,16 +20,17 @@ onair-rx --lua > onair.lua     # OnAir's Wireshark Lua dissector (USER0 is Mode 
 onair-rx --version
 ```
 
-Modes: `adsb`, the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm`, `m20`, `ble` and
-`lorawan`, and the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below). `ble` and `lorawan` are modes
-ZetaSDR has no decoder of its own for: their point is their packets, which Wireshark reads.
+Modes: `adsb`, the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm`, `m20`, `ble`,
+`lorawan`, `zigbee`, `thread`, `zwave` and `wifi`, and the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video`
+(below). `ble`, `lorawan`, `zigbee`, `thread`, `zwave` and `wifi` are modes ZetaSDR has no decoder of its own for: their
+point is their packets, which Wireshark reads.
 
 - **stdin:** interleaved little-endian IQ at `--rate` Hz, `cf32` (the default) or `cs16`, the signal's channel at
   0 Hz (HFDL: its dial frequency at 0 Hz). The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); the bus
   and polled modes' are in their tables below. A rate below the mode's exits 2 with one line saying so.
 - **`--freq HZ`:** the radio frequency at 0 Hz of the input. Every mode takes it; ACARS, AIS, VDL2 and HFDL need it
-  (they place their channels by frequency) and exit 2 with `onair-rx: <mode> needs --freq HZ` without it, before
-  reading any input.
+  (they place their channels by frequency), as do `lorawan`, `zigbee`, `thread`, `zwave` and `wifi`; they exit 2 with
+  `onair-rx: <mode> needs --freq HZ` without it, before reading any input.
   AIS also exits 2, before reading input, with `onair-rx: ais: no AIS channel within <rate> Hz of <freq> Hz` when the
   input does not hold AIS 1 (161.975 MHz) or AIS 2 (162.025 MHz) as OnAir's receiver needs them: the middle of the two,
   162.000 MHz, 40 kHz inside the edge of the input's band (`--freq` plus or minus 0.49 times `--rate`).
@@ -41,8 +42,10 @@ ZetaSDR has no decoder of its own for: their point is their packets, which Wires
   that is not a number above 0 exits 2 with `onair-rx: bad --width <v>`. Today:
   - `--plan` (`lorawan`): the LoRaWAN regional plan, one of OnAir's `EU868`, `US915`, `AU915`, `AS923-1`, `AS923-2`,
     `AS923-3`, `AS923-4`, `EU433` (in any case). Without it the plan is found (below).
-  - `--width` (the job's band, Hz), `--region` (a receiver's region table) and `--drop` (a receiver with a worker skips
-    the input that comes while it is busy, as it does live) are taken by no mode yet: every mode refuses them.
+  - `--region` (`zwave`): the Z-Wave region, one of OnAir's `EU`, `US`, `ANZ`, `HK`, `IN`, `RU`, `CN`, `IL`, `JP`, `KR`
+    (in any case). Without it the region is found (below).
+  - `--width` (the job's band, Hz) and `--drop` (a receiver with a worker skips the input that comes while it is busy, as
+    it does live) are taken by no mode yet: every mode refuses them.
 - **stdout, adsb:** one JSON object per decoded Mode S frame, flushed per line. A line carries only what its own frame
   established, as an SBS (BaseStation) line does, never a value remembered from an earlier frame. A member whose value
   is not known is absent, never null.
@@ -72,6 +75,10 @@ ZetaSDR has no decoder of its own for: their point is their packets, which Wires
   | `rs41`, `dfm`, `m20` | `SondeReceiver` | 2 MHz (1 MHz with an L-band `--freq`) | no (taken) | `sonde.update` (`serial`, `type`, `lat`, `lon`, `alt_m`, `vspeed_ms`, `hspeed_ms`, `temp_c`, `batt_v`, `sats`) | `id` (the serial as rs1729 spells it); that type's sondes only |
   | `ble` | `BleReceiver` | 4 MHz | no (taken: the channel tried first) | `ble.device` (`mac`, `name`, `rssi_db`) | `mac` lower-case without separators; `name` left out when empty |
   | `lorawan` | `LorawanReceiver` | 1 MHz | yes: places the plan's channels | `lora.packet` (`kind`, `hex`, `snr_db`, `sf`, `modulation`, `devaddr`) | `freq_hz`; `devaddr` lower-case |
+  | `zigbee` | `ZigbeeReceiver` | 4 MHz | yes: the PHY and the channel | none: `zigbee.frame` from the hub's PSDUs | the whole line |
+  | `thread` | `ZigbeeReceiver`, Thread mode | 4 MHz | yes: the channel | none: `thread.frame` from the hub's PSDUs | the whole line |
+  | `zwave` | `ZwaveReceiver` | 1 MHz | yes: places the region's channels | none: `zwave.frame` from the hub's MPDUs | the whole line |
+  | `wifi` | `WifiReceiver` | 20 MHz | yes: the band | none: `wifi.frame` from the hub's frames | the whole line |
 
   Every mode writes only the event of its row: any other event its receiver puts on the bus is dropped. In more
   detail:
@@ -150,10 +157,58 @@ ZetaSDR has no decoder of its own for: their point is their packets, which Wires
     (upper-case byte pairs, a space between), `snr_db` in the LoRa bandwidth, `sf` the spreading factor (0 for an FSK
     frame), `modulation` `lora` or `fsk`, `devaddr` (eight lower-case hex digits) on a data frame, and `freq_hz` the
     channel's centre in Hz, from the bus event's frequency. A join request has no `devaddr`: its EUIs are in `hex`.
+  - `zigbee`, `thread`, `zwave`, `wifi`: OnAir's receivers for 802.15.4 (Zigbee, and Thread, which is the same receiver in
+    `setThreadMode(true)`), Z-Wave and Wi-Fi put nothing on the bus and hand each frame whose check passed to the Wireshark
+    hub, from inside `feed()`. A line is what OnAir's own parser reads from that packet (`src/frames.cpp`, one function
+    for each mode, a `BusMode`'s `packetLines`); a packet the parser cannot read, or that is not what the mode's line is
+    about, gives no line and is still a pcap record. Nothing is decrypted and no key is loaded: frames are given as
+    received. Every member is there only when the frame has it. Addresses are lower-case hex without separators.
+    - `zigbee` (`zigbee.frame`, `zigbee::parse`): `frame_type` (`beacon`, `data`, `ack`, `command`; OnAir's other names for
+      the 2015 types, `multipurpose`, `fragment` and `extended`; a reserved type has no line), `seq`, `pan` (4 hex digits:
+      the destination's PAN, else the source's), `src` and `dst` (4 hex digits for a short address, 16 for an extended one;
+      none for a frame that has none, such as an ack), `nwk_src` and `nwk_dst` (4 hex digits, when the frame has a Zigbee
+      network header in the clear: a secured NWK payload still has its header readable), `secured` (the MAC, NWK or APS
+      layer is secured), `len` (the PSDU's, its FCS included). `--freq` picks the PHY, O-QPSK at 2.4 GHz and the BPSK PHY
+      below 1 GHz, and the channel the frames are noted on. The channel is at 0 Hz of the input. The receiver's minimum
+      rate is 4 MHz. (The sub-GHz BPSK PHY has no test signal here and is not tested.)
+    - `thread` (`thread.frame`, `zigbee::parse` then `thread::analyse`): `frame_type`, `seq`, `pan`, `src`, `dst` and `len`
+      as `zigbee`'s, `secured` (the link layer is: MAC security, or an AES-CCM level OnAir says is encrypted), and `kind`,
+      OnAir's own line for what the frame is, as `thread::analyse` words it (`Thread beacon, network "HomeThread", ...`,
+      `Thread data, link-layer AES-CCM encrypted (...)`, `6LoWPAN IPHC, ... MLE Discovery Request (not secured)`). Thread
+      has no Zigbee network layer, so there is no `nwk_src` or `nwk_dst`. 2.4 GHz channels only (OnAir's Thread tuning).
+    - `zwave` (`zwave.frame`, `zwave::parse`): `home_id` (8 hex digits), `src` and `dst` (node ids as integers; 255 is the
+      broadcast; a multicast has no `dst`), `frame_type` (`singlecast`, `multicast`, `ack`, `routed`), `rate_bps` (9600,
+      40000 or 100000), `freq_hz`, `secured` (an S0 or S2 payload, which stays encrypted) and `len` (the MPDU's, its
+      checksum or CRC included). OnAir's Z-Wave packet carries the data rate and the MPDU and **not the channel**, so
+      `freq_hz` is found: the one channel of the region that the input covers (within 0.45 of the rate of the centre) and
+      that uses the frame's rate, in Hz. A region with two channels of the same rate inside the input (Japan and Korea:
+      R2 on three) gives no `freq_hz`. The region: `--region` when given; otherwise the region of OnAir's table with the
+      most channels inside the input (its order: EU, US, ANZ, HK, IN, RU, CN, IL, JP, KR, the first winning a tie),
+      which is the receiver's own pick; the receiver is told only a region the operator named. With no region having a
+      channel inside, it exits 2, before reading input, with
+      `onair-rx: zwave: no region has a channel within <lo>-<hi> MHz` (`--freq` plus or minus 0.45 of the rate: the
+      receiver's own test); a `--region` with no channel inside with
+      `onair-rx: zwave: region <region> has no channel within <lo>-<hi> MHz`, and an unknown one with
+      `onair-rx: zwave: no region <name> (EU, US, ...)`. OnAir's receiver wants 1 MHz at least; a job runs at 2 MHz so
+      that the EU region's three channels (868.42, 868.40 and 869.85 MHz) fit around 869.13 MHz. At 1 MHz around a
+      channel (868.41 MHz) the receiver decodes the two channels inside it.
+    - `wifi` (`wifi.frame`, `wifi::parseFrame`): a line for a beacon, a probe response or a FILS discovery frame only, the
+      frames OnAir's parser reads an access point from; every FCS-good frame (a data frame too) is a pcap record.
+      `frame_type` (`beacon`, `probe_response`, `fils_discovery`), `bssid` (12 hex digits), `ssid` (absent when the
+      access point is hidden), `channel` (the beacon's own channel element, else the channel of the radiotap frequency),
+      `freq_hz` (the radiotap frequency, from `--freq`), `security` (OnAir's word: `Open`, `WEP`, `WPA`, `WPA/WPA2`,
+      `WPA2`, `WPA2/WPA3`, `WPA3`, `OWE (Enhanced Open)`, an enterprise one with `-Enterprise`; a FILS discovery frame
+      has none) and `len` (the 802.11 frame's, without its FCS). **No `rate_mbps`:** OnAir's radiotap header has the flags,
+      the channel and the signal level, and no data rate, so the rate a frame was received at is not known. The receiver
+      wants 20 MHz at least; `--freq` picks the band and the channel the frames are noted on.
 
   Measured on the build host (12 cores, x86-64), OnAir `a63c3a8`, user CPU per second of input (`/usr/bin/time -f %U`)
   on `onair-gen`'s scenes: `ble` at 4 MHz, 0.09 to 0.10 s a second; `lorawan` at 2 MHz around 868.3 MHz (EU868: seven
-  channels, SF7 to SF12, both IQ senses, and the FSK channel), 0.17 to 0.18 s a second. Both run inside `feed()`.
+  channels, SF7 to SF12, both IQ senses, and the FSK channel), 0.17 to 0.18 s a second. Both run inside `feed()`. The
+  four of the hub packets, on their scenes and (second figure) on noise alone, at the receiver's own minimum rate, which is
+  also the lowest that decodes the scene: `zigbee` at 4 MHz, 0.49 and 0.59 s a second; `thread` at 4 MHz, 0.48 and 0.61;
+  `zwave` at 2 MHz around 869.13 MHz, 0.01 and 0.02 (at 1 MHz around 868.41 MHz it decodes the two channels inside); `wifi` at
+  20 MHz, 0.31 and 0.52. All publish from inside `feed()`.
 
   Not on the generic path: none of the modes so far. A receiver that needs more than a channel, a centre and a type
   filter (a second channel, an engine of its own) gets a line here saying what it needed.
@@ -301,7 +356,10 @@ ZetaSDR has no decoder of its own for: their point is their packets, which Wires
   link type 101 (raw IP), as OnAir's capture files have it. Bluetooth LE: every good packet, the advertising access
   address and the dewhitened PDU and CRC (link type 251, BLUETOOTH_LE_LL), also an extended advertisement, which has no
   line. LoRaWAN: the PHY payload of every frame that has a line, behind a LoRaTap header (frequency, bandwidth, spreading
-  factor, SNR; link type 270). The other bus modes and the polled modes have no packets and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that
+  factor, SNR; link type 270). Zigbee and Thread: the PSDU with its FCS (link type 195, IEEE 802.15.4 with FCS). Z-Wave: a
+  byte for the data rate (0 to 2) and the MPDU (link type 148, USER1; `onair-rx --lua` has the dissector). Wi-Fi: a radiotap
+  header and the 802.11 frame, FCS taken off (link type 127), every good frame, also those without a line. Each of these
+  has at least as many records as lines. The other bus modes and the polled modes have no packets and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that
   connects a few seconds late still gets them; a client that hangs up is dropped, and the next one gets a new header.
   Record times are the frame's sample time (bus modes: its block's first sample) on the wall clock of the first sample,
   moved on when the input falls more than 100 ms behind real time. What is still queued at the end with no client is
@@ -326,8 +384,9 @@ test/bus.sh                               # the bus modes on OnAir's own test si
 test/poll.sh                              # the polled modes on OnAir's own test signals (_build/onair-gen), the voice
                                           # modes also with mbelib and Codec 2 hidden, the status modes also on noise
                                           # (about 40 s; it prints each status run's user CPU)
-test/only.sh                              # the modes only OnAir decodes (ble, lorawan) on OnAir's own scenes, their
-                                          # packets, the options each mode refuses, and onair-gen's --sigmf pair
+test/only.sh                              # the modes only OnAir decodes (ble, lorawan, zigbee, thread, zwave, wifi) on
+                                          # OnAir's own scenes, their packets, the options each mode refuses, noise alone
+                                          # (it prints each mode's user CPU), and onair-gen's --sigmf pair
 ```
 
 The wrapper's headers are on the quoted include path only (`-iquote`), so that `src/poll.h` does not stand in for the
@@ -365,10 +424,24 @@ OnAir's EU868 scene once (`makeLorawanSynth`: data uplinks from DevAddr 26011A2B
 27023C00, a join request and its join accept, a confirmed uplink from 260B1234 and its answer, a proprietary frame, and
 the FSK channel's frames), on its channels around `--freq` (default 868.3 MHz, the scene's centre; the frames stay on
 their channels). `--freq` of `ble` (default 2402 MHz) only goes into a `--sigmf` pair.
+`onair-gen --mode zigbee|thread|zwave|wifi --rate HZ [--freq HZ]` likewise, each once: Zigbee, OnAir's schedule
+(`makeZigbeeSynth`: PAN `1A62`, the coordinator `0000`, a beacon request, its beacon, an association of the bulb
+`00:17:88:01:0A:0B:0C:0D`, an ack, a Device_annce from `1234` in the clear, a link status, encrypted NWK frames, a second
+PAN `3C2D`) with noise 25 dB down in 2 MHz; Thread, the frames of OnAir's Thread test (a beacon of the network
+`HomeThread`, PAN `7A31`, from `5000`, six link-layer encrypted data frames from `5400` and `5401` to `5000`, and an MLE
+Discovery Request in the clear from `01:23:45:67:89:AB:CD:EF`), 2 MHz likewise; Z-Wave, OnAir's EU network
+(`makeZwaveSynth`: home ID `C0FFEE01`, controller 1, nodes 2 to 6, frames at R1, R2 and R3 on 868.42, 868.40 and
+869.85 MHz, acks, a multicast, an S0 and an S2 frame) around `--freq` (default 869.13 MHz, the region's centre), noise in
+100 kHz; Wi-Fi, OnAir's 2.4 GHz scene (`makeWifiSynth`: "OnAir-Home", WPA2, `00:04:0E:12:34:56`, with a probe response;
+"OnAir-Cafe", WPA2/WPA3, `FC:EC:DA:AB:CD:EF`; a hidden open access point `02:11:22:33:44:55`; a data frame; 1 Mbit/s on
+channel 6), noise in 20 MHz and **a tenth of a second** of it either side (at 20 MHz a second is 160 MB). The
+`--freq` defaults of Zigbee and Thread (2425 MHz, channel 15) and Wi-Fi (2437 MHz, channel 6) only go into a `--sigmf` pair;
+Z-Wave's moves the channels in the band. Only the 2.4 GHz Wi-Fi scene is used: the 5 and 6 GHz paths of the receiver
+(OFDM, several channels in a wide input) are not exercised here.
 `onair-gen ... --sigmf STEM`, with any mode, writes `STEM.sigmf-data` (ci16_le: each value times 32768, rounded and
 clipped) and `STEM.sigmf-meta` instead of stdout, the meta in the shape of `iq/adsb1090.sigmf-meta`: the sample rate,
 the datatype, the centre frequency (`--freq`, or the mode's own: ACARS 131.525 MHz, AIS 162 MHz, Bluetooth LE 2402 MHz,
-LoRaWAN 868.3 MHz; left out for a mode with neither) and an annotation (`message`) per message: where the stderr line
+LoRaWAN 868.3 MHz, Zigbee and Thread 2425 MHz, Z-Wave 869.13 MHz, Wi-Fi 2437 MHz; left out for a mode with neither) and an annotation (`message`) per message: where the stderr line
 says it is.
 `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links,
 `onair-gen --selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`)
@@ -404,6 +477,10 @@ followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
   then runs with or without a pcap port. A row with `flushAtEnd` has its feed called once more at the end of input
   with no samples (which its feed takes as "flush"), and what that gives is drained at the last block's first sample.
   Another receiver on the bus is one more row.
+- `src/frames.cpp`: the `packetLines` of `zigbee`, `thread`, `zwave` and `wifi` (declared in `src/frames.h`), each turning
+  a hub packet into the members of a line with OnAir's own parser (`zigbee::parse`, `thread::analyse`, `zwave::parse`,
+  `wifi::parseFrame`), and Z-Wave's region choice. Z-Wave's lines need to know where the input is (its packets carry no
+  channel): `openZwave` tells `zwaveWhere` before the run, a file-level state, since `packetLines` takes no argument.
 - `src/hub_tap.cpp`: `HubTap`, the hub's packets of one channel: it configures the hub (no file, no live capture, no
   GSMTAP), puts its sink on it (`patches/0001`) and enables the channel; the sink collects under a lock, so a receiver
   may publish from a thread of its own, and the read loop drains it after each block. `hubRecord` makes a packet a

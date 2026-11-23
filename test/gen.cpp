@@ -9,7 +9,7 @@
 //   onair-gen --mode dmr|p25|m17 --rate HZ [--channel]
 //   onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC]
 //   onair-gen --mode video --rate HZ [--deviation HZ]
-//   onair-gen --mode ble|lorawan --rate HZ [--freq HZ]
+//   onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi --rate HZ [--freq HZ]
 //   onair-gen ... --sigmf STEM        any of the above into STEM.sigmf-data (ci16_le) and STEM.sigmf-meta instead of stdout
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
@@ -50,6 +50,14 @@
 // and its answer, a 250 kHz frame, a proprietary frame) once, on its channels around --freq (default 868.3 MHz, the scene's own
 // centre: the frames stay on their channels, so another --freq moves them in the band). Noise as for the messages above, its
 // carrier to noise in 1 MHz for Bluetooth LE and in 125 kHz for LoRaWAN, their channels' widths.
+// Four more, whose lines onair-rx makes from Wireshark hub packets: Zigbee, OnAir's schedule (makeZigbeeSynth, zigbeeTestSchedule:
+// PAN 1A62, the coordinator 0000, a beacon request, a beacon, an association, an ack, a Device_annce, encrypted NWK frames);
+// Thread, the frames of OnAir's Thread test (a beacon of PAN 7A31, six encrypted data frames, an MLE Discovery Request); Z-Wave,
+// OnAir's EU network (makeZwaveSynth: home ID C0FFEE01, nodes 1 to 6, R1, R2 and R3 frames) around --freq (default 869.13 MHz);
+// Wi-Fi, OnAir's 2.4 GHz scene (makeWifiSynth: "OnAir-Home", "OnAir-Cafe", a hidden access point, a data frame). Each once;
+// carrier to noise in 2 MHz (Zigbee, Thread), 100 kHz (Z-Wave) and 20 MHz (Wi-Fi); Wi-Fi has a tenth of a second of noise
+// either side, not a second (at 20 Msps a second is 160 MB). --freq of Zigbee, Thread (default 2425 MHz) and Wi-Fi (2437 MHz)
+// only goes into a --sigmf pair.
 // --sigmf STEM writes the output as a SigMF pair instead of stdout: STEM.sigmf-data, ci16_le (each value times 32768, rounded and
 // clipped), and STEM.sigmf-meta, its sample rate, the centre frequency (--freq, or the mode's default above; left out for a mode
 // with neither) and an annotation per message, in the shape of iq/adsb1090.sigmf-meta.
@@ -95,6 +103,14 @@
 #include "dect2/t2/t2.h"
 #include "dect2/vdl2/vdl2_gen.h"
 #include "dect2/vdl2/vdl2_proto.h"
+#include "dect2/wifi/wifi_gen.h"
+#include "dect2/wifi/wifi_proto.h"
+#include "dect2/zigbee/zigbee_gen.h"
+#include "dect2/zigbee/zigbee_proto.h"
+#include "dect2/zigbee/zigbee_rx.h"
+#include "dect2/zwave/zwave_gen.h"
+#include "dect2/zwave/zwave_proto.h"
+#include "dect2/zwave/zwave_rx.h"
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -111,6 +127,7 @@ using namespace dect2;
 namespace {
 
 constexpr double kPadSec = 1.0;
+constexpr double kWifiPadSec = 0.1;   // Wi-Fi's silence either side: at 20 Msps a second is 160 MB
 constexpr double kRepeatGapSec = 2.0;   // a voice mode's call is sent twice, this much silence between
 constexpr double kSnrDb = 25;   // carrier to noise in 25 kHz (Bluetooth LE: in 1 MHz; LoRaWAN: in 125 kHz)
 constexpr size_t kChunk = 1 << 14;
@@ -121,7 +138,7 @@ int usage() {
                     "       onair-gen --mode dmr|p25|m17 --rate HZ [--channel] > iq\n"
                     "       onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC] > iq\n"
                     "       onair-gen --mode video --rate HZ [--deviation HZ] > iq\n"
-                    "       onair-gen --mode ble|lorawan --rate HZ [--freq HZ] > iq\n"
+                    "       onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi --rate HZ [--freq HZ] > iq\n"
                     "       onair-gen ... --sigmf STEM     (STEM.sigmf-data, ci16_le, and STEM.sigmf-meta instead of stdout)\n"
                     "       onair-gen --selftest ais-join|sonde-id|json-utf8|calls\n");
     return 2;
@@ -509,6 +526,110 @@ std::vector<cf32> lorawanSignal(double rate, double freq) {
     return trim(all);
 }
 
+// --- the 802.15.4 scenes (Zigbee, Thread): OnAir's frames (zigbee_gen.h) once, without noise, the channel at 0 Hz. The generator
+// dials the channel zigbeeTuning().tuneOffsetHz below 0 Hz (the radio sits that far above it), which the carrier offset cancels. A
+// scene is made for as long as its frames last (the chip count and the gap of ZigbeeGenerator's own refill), before it would loop
+size_t zigbeeSceneSamples(const std::vector<ZigbeeGenFrame>& v, double rate, double leadSec) {
+    const double perSample = 2e6 / rate;   // chips per sample
+    size_t n = (size_t)std::llround(leadSec * rate);
+    for (const ZigbeeGenFrame& f : v) {
+        const size_t chips = (size_t)(f.preambleSyms + 4 + 2 * std::min<size_t>(f.psdu.size(), 127)) * 32;
+        n += (size_t)std::ceil(((double)chips + 8) / perSample) + (size_t)std::llround(f.gapSec * rate);
+    }
+    return n;
+}
+std::vector<cf32> zigbeeSignal(double rate) {
+    SynthConfig c;
+    c.snrDb = 200;                        // no noise of its own (99 and up)
+    c.cfoHz = zigbeeTuning().tuneOffsetHz;
+    auto s = makeZigbeeSynth(c, rate);
+    if (!s) return {};
+    std::vector<cf32> all(zigbeeSceneSamples(zigbeeTestSchedule(), rate, 0.0005));
+    s->generate(all.data(), all.size());
+    return trim(all);
+}
+
+// Thread: the frames of OnAir's own Thread test (tests/thread/test_thread_rx.cpp): a Thread beacon of the network "HomeThread" (PAN
+// 7A31, 5000), six link-layer encrypted data frames between 5400 or 5401 and 5000, and an MLE Discovery Request in the clear from the
+// extended address 0123456789ABCDEF
+std::vector<ZigbeeGenFrame> threadSchedule() {
+    std::vector<ZigbeeGenFrame> v;
+    auto add = [&](const std::vector<uint8_t>& psdu) { ZigbeeGenFrame f; f.psdu = psdu; f.gapSec = 0.0008; v.push_back(f); };
+    {   // beacon
+        std::vector<uint8_t> pl = {0xFF, 0xCF, 0x00, 0x00, 0x03, 0x20};
+        const char* nm = "HomeThread";
+        for (int i = 0; i < 16; i++) pl.push_back(i < 10 ? (uint8_t)nm[i] : 0);
+        for (int i = 0; i < 8; i++) pl.push_back((uint8_t)(0x11 * (i + 1)));
+        zigbee::MacBuild b; b.type = zigbee::Beacon; b.destMode = 0; b.srcShort = 0x5000; b.srcPan = 0x7A31; b.payload = pl;
+        add(zigbee::buildMac(b));
+    }
+    for (int k = 0; k < 6; k++) {   // encrypted data between two nodes of the PAN
+        std::vector<uint8_t> pl = {0x0D, (uint8_t)k, 0, 0, 0, 0x01};
+        for (int i = 0; i < 24; i++) pl.push_back((uint8_t)(i * 13 + k));
+        zigbee::MacBuild b; b.type = zigbee::Data; b.destPan = 0x7A31; b.destShort = 0x5000; b.srcShort = (uint16_t)(0x5400 + k % 2);
+        b.secured = true; b.seq = (uint8_t)k; b.payload = pl;
+        add(zigbee::buildMac(b));
+    }
+    {   // MLE Discovery Request in the clear
+        zigbee::MacBuild b; b.type = zigbee::Data; b.destPan = 0xFFFF; b.destShort = 0xFFFF; b.srcShort = 0x5600; b.srcMode = 3;
+        b.srcExt = 0x0123456789ABCDEFULL;
+        b.payload = {0x7F, 0x3B, 0x02, 0xF0, 0x4D, 0x4C, 0x4D, 0x4C, 0x12, 0x34, 0xFF, 0x10, 0x0B, 0x02, 0x20, 0x00};
+        add(zigbee::buildMac(b));
+    }
+    return v;
+}
+std::vector<cf32> threadSignal(double rate) {
+    ZigbeeGenConfig c;
+    c.rate = rate;
+    c.snrDb = 200;                        // no noise of its own
+    c.dialOffsetHz = 0;                   // the channel at 0 Hz
+    c.frames = threadSchedule();
+    ZigbeeGenerator g(c);
+    std::vector<cf32> all(zigbeeSceneSamples(c.frames, rate, c.leadSec));
+    g.generate(all.data(), all.size());
+    return trim(all);
+}
+
+// --- Z-Wave: OnAir's EU network (zwave_gen.h, makeZwaveSynth: home ID C0FFEE01, controller 1, nodes 2 to 6; R1, R2 and R3 frames
+// on the EU channels) once, without noise. The scene centres its dial (the region's centre, 869.13 MHz for EU) at 0 Hz; the carrier
+// offset moves it to freq - 869.13 MHz instead, so that --freq is at 0 Hz. Made for as long as its frames last
+constexpr const char* kZwaveRegion = "EU";
+std::vector<cf32> zwaveSignal(double rate, double freq) {
+    const std::vector<zwave::Region>& regs = zwave::regions();
+    size_t ri = 0;
+    while (regs[ri].id != std::string(kZwaveRegion)) ri++;
+    SynthConfig c;
+    c.snrDb = 200;
+    c.modeOpt[0] = (int)ri;
+    c.cfoHz = zwaveTuning().tuneOffsetHz + (regs[ri].centreMhz * 1e6 - freq);
+    auto s = makeZwaveSynth(c, rate);
+    if (!s) return {};
+    size_t n = 0;
+    for (const ZwGenFrame& f : zwaveTestSchedule(kZwaveRegion)) {
+        const size_t chips = zwavePpduBits(f).size() * (f.rate == 1 ? 2 : 1) + 2;
+        n += (size_t)((double)chips * (rate / zwave::chipRate(f.rate))) + (size_t)(f.gapSec * rate);
+    }
+    std::vector<cf32> all(n);
+    s->generate(all.data(), all.size());
+    return trim(all);
+}
+
+// --- Wi-Fi: OnAir's 2.4 GHz scene (wifi_gen.h, makeWifiSynth: two access points, "OnAir-Home" and "OnAir-Cafe", a hidden one, a
+// probe response and a data frame, 1 Mbit/s DSSS on channel 6) once, without noise, the channel at 0 Hz
+std::vector<cf32> wifiSignal(double rate) {
+    SynthConfig c;
+    c.snrDb = 200;
+    auto s = makeWifiSynth(c, rate);
+    if (!s) return {};
+    const double perSample = wifi::kChipRate / rate;
+    size_t n = (size_t)std::llround(0.001 * rate);   // the generator's lead
+    for (const WifiGenFrame& f : wifiTestSchedule())
+        n += (size_t)std::ceil((double)(wifi::ppduBits(f.mpdu).size() * 11) / perSample) + (size_t)std::llround(f.gapSec * rate);
+    std::vector<cf32> all(n);
+    s->generate(all.data(), all.size());
+    return trim(all);
+}
+
 // --- the output: cf32 on stdout, or with a stem the SigMF pair: <stem>.sigmf-data in ci16_le (each value times 32768, rounded and
 // clipped) and <stem>.sigmf-meta (the rate, the centre when known, one annotation per message: its first sample and its length).
 // false with the reason on stderr when it could not be written
@@ -768,7 +889,7 @@ int main(int argc, char** argv) {
     // each option belongs to its modes: one another mode would ignore is refused
     const bool voice = mode == "dmr" || mode == "p25" || mode == "m17";
     const bool tv = mode == "dvbt" || mode == "video";
-    const bool scene = mode == "ble" || mode == "lorawan";   // a scene of OnAir's own: only --freq
+    const bool scene = mode == "ble" || mode == "lorawan" || mode == "zigbee" || mode == "thread" || mode == "zwave" || mode == "wifi";   // a scene of OnAir's own: only --freq
     if (mode == "rds" ? freq || haveText || haveInfo : voice || tv ? freq || haveText || haveInfo || haveStation : haveStation) return usage();
     if (scene && (haveText || haveInfo)) return usage();
     if (channel && mode != "dmr" && mode != "p25") return usage();
@@ -778,7 +899,11 @@ int main(int argc, char** argv) {
     // 37, the LoRaWAN scene's centre); 0 for a mode with neither. ACARS's default is also every other mode's freq, which they ignore
     const bool ownCentre = mode == "acars" || mode == "ais" || scene;
     const double centre = freq ? freq : !ownCentre ? 0 : mode == "ais" ? 162e6 : mode == "ble" ? 2402e6
-                                      : mode == "lorawan" ? lorawanPlanCentreMhz(lorawan::EU868) * 1e6 : 131.525e6;
+                                      : mode == "lorawan" ? lorawanPlanCentreMhz(lorawan::EU868) * 1e6
+                                      : mode == "zigbee" || mode == "thread" ? 2425e6   // channel 15
+                                      : mode == "zwave" ? zwave::region(kZwaveRegion)->centreMhz * 1e6
+                                      : mode == "wifi" ? 2437e6                         // channel 6
+                                      : 131.525e6;
     if (!freq) freq = centre ? centre : 131.525e6;
     if (mode == "rds" || tv) {   // a broadcast is written as it is made: no cut and no silence (rds's and video's noise are the generator's own)
         const std::vector<cf32> x = mode == "rds" ? rdsSignal(rate, ps, rt) : mode == "dvbt" ? dvbtSignal(rate, bandwidth ? bandwidth : 8, service, lead)
@@ -802,6 +927,10 @@ int main(int argc, char** argv) {
     else if (mode == "m17") msg = m17Signal(rate);
     else if (mode == "ble") msg = bleSignal(rate);
     else if (mode == "lorawan") msg = lorawanSignal(rate, freq);
+    else if (mode == "zigbee") msg = zigbeeSignal(rate);
+    else if (mode == "thread") msg = threadSignal(rate);
+    else if (mode == "zwave") msg = zwaveSignal(rate, freq);
+    else if (mode == "wifi") msg = wifiSignal(rate);
     else return usage();
     if (msg.empty()) { fprintf(stderr, "onair-gen: no %s signal at %.0f Hz\n", mode.c_str(), rate); return 1; }
 
@@ -810,13 +939,14 @@ int main(int argc, char** argv) {
     for (const cf32& v : msg)
         if (std::norm(v) > 1e-12) { power += std::norm(v); on++; }
     const double carrier = std::sqrt(power / (double)on);
-    const size_t pad = (size_t)std::llround(kPadSec * rate);
+    const size_t pad = (size_t)std::llround((mode == "wifi" ? kWifiPadSec : kPadSec) * rate);
     const size_t again = voice ? pad + msg.size() + (size_t)std::llround(kRepeatGapSec * rate) : 0;   // where the second call starts
     std::vector<cf32> out((voice ? again : pad) + msg.size() + pad, cf32(0.f, 0.f));
     std::copy(msg.begin(), msg.end(), out.begin() + (long)pad);
     if (voice) std::copy(msg.begin(), msg.end(), out.begin() + (long)again);
     // kSnrDb in the mode's channel: 25 kHz, Bluetooth LE's 1 MHz, a LoRaWAN channel's 125 kHz
-    const double noiseBw = mode == "ble" ? 1e6 : mode == "lorawan" ? 125e3 : 25000.0;
+    const double noiseBw = mode == "ble" ? 1e6 : mode == "lorawan" ? 125e3 : mode == "zigbee" || mode == "thread" ? 2e6
+                         : mode == "zwave" ? 100e3 : mode == "wifi" ? 20e6 : 25000.0;
     genutil::NoiseSource noise(7);
     noise.add(out.data(), out.size(), (float)(carrier * std::sqrt(rate / (2 * noiseBw * std::pow(10.0, kSnrDb / 10)))));
     std::vector<Span> spans = {{pad, msg.size()}};

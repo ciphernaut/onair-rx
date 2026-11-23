@@ -9,6 +9,7 @@
 // bus event it writes), how to make and set up its receiver, its hub channel, and what its lines need that the bus lacks.
 #include "bus.h"
 #include "ais.h"
+#include "frames.h"
 #include "hub_tap.h"
 #include "dect2/acars/acars_rx.h"
 #include "dect2/ais/ais_longrange.h"
@@ -23,6 +24,9 @@
 #include "dect2/pager/pager_rx.h"
 #include "dect2/sonde/sonde_rx.h"
 #include "dect2/vdl2/vdl2_rx.h"
+#include "dect2/wifi/wifi_rx.h"
+#include "dect2/zigbee/zigbee_rx.h"
+#include "dect2/zwave/zwave_rx.h"
 #include "dect2/wirecap/wire.h"
 #include <algorithm>
 #include <cctype>
@@ -294,6 +298,41 @@ bool shapeLorawan(const automation::Event& e, Json& j) {
     return true;
 }
 
+// --- Zigbee, Thread, Z-Wave and Wi-Fi: OnAir's receivers put nothing on the bus; their lines come from the hub's packets (frames.h).
+// All four place their channel by --freq.
+// Zigbee and Thread: one 802.15.4 receiver (Thread: setThreadMode). --freq picks the PHY, O-QPSK at 2.4 GHz, the sub-GHz BPSK
+// channels below 1 GHz, and which channel the frames are noted on; the channel is at 0 Hz of the input.
+bool openZigbee(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<ZigbeeReceiver>();
+    rx->setCenterHz(o.freq);
+    return start(rx, o, "zigbee", zigbeeTuning().minSampleRate, feed, err);
+}
+bool openThread(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<ZigbeeReceiver>();
+    rx->setThreadMode(true);
+    rx->setCenterHz(o.freq);
+    return start(rx, o, "thread", threadTuning().minSampleRate, feed, err);
+}
+// Z-Wave: every channel of the region inside 0.45 of the rate around --freq is listened to. --region names the region; without it
+// the receiver takes the one with most channels inside the input. A region with no channel inside the input is refused.
+bool openZwave(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<ZwaveReceiver>();
+    if (!start(rx, o, "zwave", zwaveTuning().minSampleRate, feed, err)) return false;
+    std::string region;
+    if (!zwaveRegion(o.freq, o.rate, o.region, &region, err)) return false;
+    if (!o.region.empty()) rx->setRegion(region);
+    rx->setCenterHz(o.freq);
+    zwaveWhere(o.freq, o.rate, region);
+    return true;
+}
+// Wi-Fi: the band is the --freq's (2.4 GHz: the DSSS frames of the channel at 0 Hz; 5 and 6 GHz: the 20 MHz channels inside a
+// wide input)
+bool openWifi(const Options& o, Feed* feed, std::string* err) {
+    auto rx = std::make_shared<WifiReceiver>();
+    rx->setCenterHz(o.freq);
+    return start(rx, o, "wifi", wifiTuning().minSampleRate, feed, err);
+}
+
 // a bus value as a member: whole numbers without a decimal point, a non-finite number or a null left out
 void member(Json& j, const std::string& k, const automation::Value& v) {
     switch (v.t) {
@@ -323,6 +362,10 @@ const BusMode kBusModes[] = {
     {"m20", "sonde.update", -1, false, openM20, shapeM20, nullptr},
     {"ble", "ble.device", wire::Ble, false, openBle, shapeBle, nullptr},
     {"lorawan", "lora.packet", wire::LoRaWan, true, openLorawan, shapeLorawan, nullptr},
+    {"zigbee", "zigbee.frame", wire::Zigbee, true, openZigbee, nullptr, zigbeePackets},
+    {"thread", "thread.frame", wire::Thread, true, openThread, nullptr, threadPackets},
+    {"zwave", "zwave.frame", wire::Zwave, true, openZwave, nullptr, zwavePackets},
+    {"wifi", "wifi.frame", wire::Wifi, true, openWifi, nullptr, wifiPackets},
 };
 const size_t kBusModeCount = sizeof kBusModes / sizeof kBusModes[0];
 

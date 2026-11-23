@@ -47,7 +47,7 @@ struct OnlySome {
 static const OnlySome kOnlySome[] = {
     {"width", "", [](const Options& o) { return o.width > 0; }},
     {"plan", "lorawan", [](const Options& o) { return !o.plan.empty(); }},
-    {"region", "", [](const Options& o) { return !o.region.empty(); }},
+    {"region", "zwave", [](const Options& o) { return !o.region.empty(); }},
     {"drop", "", [](const Options& o) { return o.drop; }},
 };
 static bool takes(const char* modes, const std::string& mode) {
@@ -104,8 +104,9 @@ static void usage(FILE* f) {
                "IQ on stdin, interleaved little endian; --freq is the radio frequency at 0 Hz of the input; one JSON object\n"
                "per decode on stdout; with --pcap-port, a classic pcap stream of the frames for one client at a time on\n"
                "127.0.0.1:PORT; --bandwidth (dvbt: 8, 7, 6 or 5) fixes the channel width, which is otherwise found; --plan\n"
-               "(lorawan) names the channel plan, which is otherwise the one with most channels in the input. --width, --region\n"
-               "and --drop are taken by no mode yet. Modes:");
+               "(lorawan) names the channel plan, which is otherwise the one with most channels in the input; --region (zwave)\n"
+               "the Z-Wave region, which is otherwise the one with most channels in the input. --width and --drop are taken\n"
+               "by no mode yet. Modes:");
     for (const Mode& m : kModes) fprintf(f, " %s", m.name);
     for (size_t i = 0; i < kBusModeCount; i++) fprintf(f, " %s", kBusModes[i].name);
     for (size_t i = 0; i < kPollModeCount; i++) fprintf(f, " %s", kPollModes[i].name);
