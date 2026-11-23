@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 #
-# End-to-end check of the modes only OnAir decodes (so far ble, lorawan, zigbee, thread, zwave, wifi and wisun) on OnAir's own
+# End-to-end check of the modes only OnAir decodes (so far ble, lorawan, zigbee, thread, zwave, wifi, wisun, tetra and gsmr) on OnAir's own
 # test signals: _build/onair-gen makes the scene of OnAir's generator for the mode (makeBleSynth, makeLorawanSynth,
 # makeZigbeeSynth, the frames of OnAir's Thread test, makeZwaveSynth, makeWifiSynth, makeWisunSynth) with a second of noise either
 # side (Wi-Fi: a tenth of a second, at 20 Msps), onair-rx decodes it. Wi-SUN, whose frames come out of a decoder thread, is also
@@ -11,7 +11,10 @@
 # zwave, wifi) are also checked against what OnAir's generator put in the scene, their pcap link types, --freq missing, and
 # noise alone (8 s of /dev/urandom: no line, exit 0); the script prints each mode's user CPU over its seconds of input. The signals are synthesised; no capture is used. Also: the options a mode does not take (--width, --plan,
 # --region, --drop) are refused by every mode that does not take them, lorawan without --freq and at a --freq no channel plan covers, the frames on the
-# pcap port, and onair-gen's --sigmf pair read back.
+# pcap port, and onair-gen's --sigmf pair read back. TETRA and GSM-R (polled cells, decoded a stretch at a time on the
+# receiver's worker; makeTetraSynth and makeGsmrSynth, scene 0, three stretches long, the generator's own noise): one line per
+# cell with the scene's identity and no second one, the same bytes from two runs, on one CPU and through a pipe, --drop runs
+# and ends, 1 s of input ends within 8 s with no line, their GSMTAP packets, --freq missing, a rate too low, and noise alone.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -44,6 +47,14 @@ ws_hz=921500000      # the centre of OnAir's Wi-SUN scene (wisunTuning().defMhz)
   fail "wisun: $(cat "$d/wisun.empty.err")"
 [ ! -s "$d/wisun.empty" ] || fail "wisun: a line on empty input"
 echo "ok: onair-rx has wisun"
+te_hz=392500000      # the centre of OnAir's TETRA scene (kTetraTestCentreHz); its cell at 392.4125 MHz
+gr_hz=923000000      # the middle of OnAir's GSM-R scene 0 (ARFCN 960 at 922.2 MHz, 968 at 923.8 MHz): 2 MHz holds both
+for row in "tetra $te_hz" "gsmr $gr_hz"; do
+  read -r m hz <<<"$row"
+  "$bin" --mode "$m" --rate 2000000 --freq "$hz" </dev/null >"$d/$m.empty" 2>"$d/$m.empty.err" || fail "$m: $(cat "$d/$m.empty.err")"
+  [ ! -s "$d/$m.empty" ] || fail "$m: a line on empty input"
+done
+echo "ok: onair-rx has tetra and gsmr"
 
 # --- refuses <stderr> <onair-rx args...>: exit 2 with exactly that one line on stderr, before reading any input (stdin stays
 # open and is never written), and nothing on stdout
@@ -96,26 +107,34 @@ refuses "onair-rx: wisun: region EU863 has no channel within 920.600-922.400 MHz
   --region EU863 || fail "wisun with a --region that has no channel in the input"
 refuses "onair-rx: wisun: region ANZ (OnAir's pick for 100.000 MHz) has no channel within 99.100-100.900 MHz" --mode wisun \
   --rate 2000000 --freq 100000000 || fail "wisun at a --freq whose region has no channel in the input"
+refuses "onair-rx: tetra needs --freq HZ" --mode tetra --rate 2000000 || fail "tetra without --freq"
+refuses "onair-rx: gsmr needs --freq HZ" --mode gsmr --rate 2000000 || fail "gsmr without --freq"
+refuses "onair-rx: 100000 Hz is too low for tetra (at least 200000 Hz)" --mode tetra --rate 100000 --freq "$te_hz" ||
+  fail "tetra at 100 kHz"
+refuses "onair-rx: 500000 Hz is too low for gsmr (at least 1000000 Hz)" --mode gsmr --rate 500000 --freq "$gr_hz" ||
+  fail "gsmr at 500 kHz"
 
 # --- the options a mode does not take: every mode before this plan refuses all four; ble, zigbee, thread and wifi all four;
-# lorawan all but --plan; zwave all but --region; wisun --width and --plan.
+# lorawan all but --plan; zwave all but --region; wisun --width and --plan; tetra and gsmr --width, --plan and --region.
 # Each mode gets the rate and the --freq it needs, so that the option is the only thing wrong
 for row in "adsb 2400000" "pocsag 1000000" "flex 1000000" "acars 1000000 131525000" "aprs 240000" "ais 250000 162000000" \
   "vdl2 250000 136975000" "hfdl 24000 8927000" "rs41 2000000" "dfm 2000000" "m20 2000000" "rds 500000" "dmr 48000" \
   "p25 250000" "m17 250000" "dvbt 10000000" "video 8000000" "ble 4000000" "lorawan 2000000 $lora_hz" \
-  "zigbee 4000000 $zb_hz" "thread 4000000 $zb_hz" "zwave 2000000 $zw_hz" "wifi 20000000 $wf_hz" "wisun 2000000 $ws_hz"; do
+  "zigbee 4000000 $zb_hz" "thread 4000000 $zb_hz" "zwave 2000000 $zw_hz" "wifi 20000000 $wf_hz" "wisun 2000000 $ws_hz" \
+  "tetra 2000000 $te_hz" "gsmr 2000000 $gr_hz"; do
   read -r m rate hz <<<"$row"
   f=(--mode "$m" --rate "$rate")
   [ -z "${hz:-}" ] || f+=(--freq "$hz")
   for opt in "width 2000000" "plan EU868" "region EU" "drop"; do
     read -r o v <<<"$opt"
-    case "$m/$o" in lorawan/plan | zwave/region | wisun/region | wisun/drop) continue ;; esac
+    case "$m/$o" in lorawan/plan | zwave/region | wisun/region | wisun/drop | tetra/drop | gsmr/drop) continue ;; esac
     a=(--"$o")
     [ -z "${v:-}" ] || a+=("$v")
     refuses "onair-rx: $m takes no --$o" "${f[@]}" "${a[@]}" >/dev/null || fail "$m with --$o"
   done
 done
-echo "ok: every mode refuses the options it does not take (lorawan takes --plan, zwave --region, wisun --region and --drop)"
+echo "ok: every mode refuses the options it does not take (lorawan takes --plan, zwave --region, wisun --region and --drop," \
+  "tetra and gsmr --drop)"
 
 [ -x "$gen" ] || fail "no test signal generator at $gen (run ./build.sh)"
 
@@ -266,7 +285,18 @@ elif tag == "wifi":               # a radiotap header (version 0, its length, th
 elif tag == "wisun":              # the MPDU without its FCS (link type 230), one per line: the line's len is the record's
     lens = [json.loads(l)["len"] for l in out.splitlines()]
     assert [len(r) for r in recs] == lens, f"records of {[len(r) for r in recs]} octets for lines of len {lens}"
+elif tag in ("tetra", "gsmr"):    # GSMTAP in IPv4 + UDP to port 4729, as OnAir's capture files have it: OnAir writes version 1
+    # with a header of 4 words (wire_format.cpp, makeGsmtap); TETRA's blocks are type 5 (TETRA I1), GSM-R's BCCH blocks type 1 (Um)
+    want_type = 5 if tag == "tetra" else 1
+    for r in recs:
+        assert r[0] >> 4 == 4 and r[9] == 17, "not IPv4 carrying UDP"
+        ihl = (r[0] & 15) * 4
+        dport, = struct.unpack(">H", r[ihl + 2:ihl + 4])
+        assert dport == 4729, f"UDP to port {dport}, not 4729"
+        g = r[ihl + 8:]
+        assert g[0] == 1 and g[1] == 4 and g[2] == want_type, f"GSMTAP version {g[0]}, header {g[1]} words, type {g[2]}"
 elif tag == "ble":   # BLUETOOTH_LE_LL: the advertising access address 0x8E89BED6, little endian, then the PDU
+
     assert all(r[:4] == bytes.fromhex("d6be898e") for r in recs), "a record without the advertising access address"
 else:              # LoRaTap version 0, its 15-byte header, the channel's frequency inside the input
     hz, rate = float(args[args.index("--freq") + 1]), float(args[args.index("--rate") + 1])
@@ -521,9 +551,120 @@ print(f"ok: wisun on input cut in the middle of frame {len(a) // 2 + 1}: exit 0 
   "$d/wisun-1.jsonl" "$d/wisun-mid.jsonl" || fail "wisun on input cut in the middle of a frame"
 pcap wisun 230 --mode wisun --rate 2000000 --freq "$ws_hz" || fail "wisun on the pcap port"
 
+# --- TETRA and GSM-R: polled cells, decoded a stretch of input at a time on the receiver's own worker (TETRA 2.3 s, GSM-R
+# 2.2 s). onair-gen plays OnAir's scene 0 (makeTetraSynth: one cell; makeGsmrSynth: two) for three stretches and a little,
+# with the generator's own noise, and says each cell's identity: "cell N at F Hz: ...".
+# cellcheck <tag> <rate> <stretch s>: one line per generated cell with the scene's identity, at the first poll after the first
+# stretch ends, and no second line (the scene's cells do not change); no null, and no decimal number but snr_db
+cellcheck() {
+  python3 -I - "$d/$1.jsonl" "$d/$1.gen" "$2" "$(samples "$1")" "$1" "$3" <<'EOF'
+import json, re, sys
+path, genlog, rate, nsamp, tag, stretch = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4]), sys.argv[5], float(sys.argv[6])
+raw = open(path, "rb").read()
+assert raw.endswith(b"\n"), "the last line is not ended"
+ls = [json.loads(l) for l in raw.splitlines()]
+log = open(genlog).read()
+want = []
+for hz, rest in re.findall(r"cell \d+ at (\d+) Hz: (.*)", log):
+    w = {"freq_hz": int(hz)}
+    for k, v in re.findall(r"([a-z_]+) ([0-9]+)", rest):
+        w[k] = int(v)
+    w["network_time"] = "network time" in rest
+    want.append(w)
+assert want, "the generator did not say its cells"
+assert len(ls) == len(want), f"{len(ls)} line(s) for the scene's {len(want)} cell(s): {ls!r}"
+first, last = int(stretch * rate), 0
+for n, o in enumerate(ls):
+    assert o.get("event") == f"{tag}.cell", f"line {n}: event {o.get('event')!r}"
+    t = o.get("t_sample")
+    assert type(t) is int and 0 <= t < nsamp and t >= last, f"line {n}: t_sample {t!r} (of {nsamp}, after {last})"
+    last = t
+    # the first poll after the first stretch ends: the block that completes it, or the poll interval's (0.25 s) end after it
+    assert first - 16384 < t <= first + 0.25 * rate, f"line {n}: at {t / rate:.3f} s, the first stretch ends at {stretch} s"
+    assert all(v is not None for v in o.values()), f"line {n}: a null member"
+    assert all(type(v) in (int, str) for k, v in o.items() if k != "snr_db"), f"line {n}: a decimal number {o!r}"
+    assert type(o.get("snr_db")) in (int, float) and 10 < o["snr_db"] < 40, f"line {n}: snr_db {o.get('snr_db')!r}"
+got = sorted(ls, key=lambda o: o["freq_hz"])
+for o, w in zip(got, sorted(want, key=lambda w: w["freq_hz"])):
+    for k, v in w.items():
+        if k == "network_time":
+            assert (isinstance(o.get(k), str) and o[k] != "") == v, f"network_time {o.get(k)!r}, the scene has {'one' if v else 'none'}"
+        else:
+            assert o.get(k) == v, f"{k} {o.get(k)!r}, the scene's cell at {w['freq_hz']} Hz has {v}: {o!r}"
+print(f"ok: {len(ls)} {tag}.cell line(s), one per cell of the scene: " + "; ".join(
+    ", ".join(f"{k} {v}" for k, v in o.items() if k not in ("event", "t_sample")) for o in got))
+EOF
+}
+# cellrun <tag> <freq> <stretch s>: the scene, its lines checked; two runs, a run on CPU 0 and one through a pipe give the
+# same bytes; the user CPU and the wall time per second of input, with and without --drop
+cellrun() {
+  local m=$1 hz=$2 stretch=$3 secs
+  gen "$m" --mode "$m" --rate 2000000 --freq "$hz"
+  /usr/bin/time -f "%U %e" -o "$d/$m.cpu" "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" \
+    <"$d/$m.iq" >"$d/$m.jsonl" 2>"$d/$m.err" || fail "$m: onair-rx exited $?: $(tail -n 3 "$d/$m.err")"
+  secs=$(python3 -I -c 'import sys; print(f"{int(sys.argv[1]) / 8 / 2e6:.2f}")' "$(stat -c %s "$d/$m.iq")")
+  read -r user wall <"$d/$m.cpu"
+  echo "cpu: $m $user s user, $wall s wall over $secs s of input at 2000000 Hz"
+  cellcheck "$m" 2000000 "$stretch" || fail "$m"
+  cp "$d/$m.jsonl" "$d/$m-1.jsonl"
+  rx "$m" --mode "$m" --rate 2000000 --freq "$hz"
+  cmp -s "$d/$m-1.jsonl" "$d/$m.jsonl" || fail "$m: a second run gives other bytes"
+  taskset -c 0 "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" <"$d/$m.iq" >"$d/$m-cpu.jsonl" 2>"$d/$m-cpu.err" ||
+    fail "$m on CPU 0: $(tail -n 3 "$d/$m-cpu.err")"
+  cmp -s "$d/$m-1.jsonl" "$d/$m-cpu.jsonl" || fail "$m on CPU 0 gives other bytes"
+  cat "$d/$m.iq" | "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" >"$d/$m-pipe.jsonl" 2>"$d/$m-pipe.err" ||
+    fail "$m through a pipe: $(tail -n 3 "$d/$m-pipe.err")"
+  cmp -s "$d/$m-1.jsonl" "$d/$m-pipe.jsonl" || fail "$m through a pipe gives other bytes"
+  echo "ok: $m: two runs, a run on CPU 0 and one through a pipe give the same bytes"
+  # nothing skipped: the input cut to exactly three stretches gives the packets and the lines of the whole input, which holds
+  # the same three stretches and 0.3 s more (a receiver that skipped input at a stretch's end would not complete the third).
+  # The packets are counted with a pcap port no client connects to (stderr's "<n> packets")
+  python3 -I - "$bin" "$d/$m.iq" "$m" "$hz" "$stretch" <<'EOF' || fail "$m on exactly three stretches"
+import re, socket, subprocess, sys
+binary, iq, m, hz, stretch = sys.argv[1:6]
+n = int(2000000.0 * float(stretch)) * 3   # the receiver's own expression of a stretch (configure()), three times
+data = open(iq, "rb").read()
+assert len(data) // 8 > n, "the input is not longer than three stretches"
+def run(raw):
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    p = subprocess.run([binary, "--format", "cf32", "--mode", m, "--rate", "2000000", "--freq", hz, "--pcap-port", str(port)],
+                       input=raw, capture_output=True, timeout=120)
+    assert p.returncode == 0, f"exit {p.returncode}: {p.stderr.decode(errors='replace')}"
+    g = re.search(rb": \d+ lines, (\d+) packets", p.stderr)
+    assert g, f"no packet count: {p.stderr.decode(errors='replace')}"
+    return int(g.group(1)), p.stdout
+whole, wl = run(data)
+cut, cl = run(data[:n * 8])
+assert whole > 0 and cut == whole, f"{cut} packets from exactly three stretches, {whole} from the whole input"
+assert cl == wl, "the lines differ"
+print(f"ok: {m}: the input cut to exactly three stretches ({n} samples): its {cut} packets and its lines")
+EOF
+  # --drop: the receiver skips the input that comes while its worker is busy, as it does live; it runs and ends (its lines
+  # depend on the worker's timing and are not compared)
+  /usr/bin/time -f "%U %e" -o "$d/$m.cpu" "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" --drop \
+    <"$d/$m.iq" >"$d/$m-drop.jsonl" 2>"$d/$m-drop.err" || fail "$m --drop: onair-rx exited $?: $(tail -n 3 "$d/$m-drop.err")"
+  read -r user wall <"$d/$m.cpu"
+  echo "ok: $m --drop runs and ends: $(wc -l <"$d/$m-drop.jsonl") line(s); cpu $user s user, $wall s wall over $secs s of input"
+  # the input cut to 1 s, shorter than a stretch: exit 0 within 8 s, and no line (the receiver decodes whole stretches only)
+  head -c $((2000000 * 8)) "$d/$m.iq" >"$d/$m-cut.iq"
+  for extra in "" --drop; do
+    st=0
+    # shellcheck disable=SC2086
+    timeout 8 "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" $extra <"$d/$m-cut.iq" >"$d/$m-cut.jsonl" \
+      2>"$d/$m-cut.err" || st=$?
+    [ "$st" = 0 ] || fail "$m $extra on 1 s of input: exit $st (124: not within 8 s): $(tail -n 3 "$d/$m-cut.err")"
+    [ ! -s "$d/$m-cut.jsonl" ] || fail "$m $extra on 1 s of input: a line: $(head -n 1 "$d/$m-cut.jsonl")"
+  done
+  echo "ok: $m on 1 s of input, with and without --drop: exit 0 within 8 s, no line"
+}
+cellrun tetra "$te_hz" 2.3
+pcap tetra 101 --mode tetra --rate 2000000 --freq "$te_hz" || fail "tetra on the pcap port"
+cellrun gsmr "$gr_hz" 2.2
+pcap gsmr 101 --mode gsmr --rate 2000000 --freq "$gr_hz" || fail "gsmr on the pcap port"
+
 # --- noise alone: 8 s (Wi-Fi: 2 s) of /dev/urandom as cs16 gives no line and exit 0
 for row in "zigbee 4000000 $zb_hz 8" "thread 4000000 $zb_hz 8" "zwave 2000000 $zw_hz 8" "wifi 20000000 $wf_hz 2" \
-  "wisun 2000000 $ws_hz 8"; do
+  "wisun 2000000 $ws_hz 8" "tetra 2000000 $te_hz 8" "gsmr 2000000 $gr_hz 8"; do
   read -r m rate hz secs <<<"$row"
   head -c $((rate * secs * 4)) /dev/urandom >"$d/noise.cs16"
   /usr/bin/time -f %U -o "$d/noise.cpu" "$bin" --mode "$m" --rate "$rate" --freq "$hz" --format cs16 <"$d/noise.cs16" \

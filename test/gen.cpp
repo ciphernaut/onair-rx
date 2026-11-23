@@ -10,6 +10,7 @@
 //   onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC]
 //   onair-gen --mode video --rate HZ [--deviation HZ]
 //   onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi|wisun --rate HZ [--freq HZ]
+//   onair-gen --mode tetra|gsmr --rate HZ [--freq HZ]
 //   onair-gen ... --sigmf STEM        any of the above into STEM.sigmf-data (ci16_le) and STEM.sigmf-meta instead of stdout
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
@@ -63,6 +64,13 @@
 // one PAN configuration solicit at 50 kbit/s) once, on its ANZ channels around --freq (default 921.5 MHz, the scene's own centre:
 // the frames stay on their channels, so another --freq moves them in the input); carrier to noise in 400 kHz, the generator's own
 // measure. stderr also says where each frame is, after the message line: "frame N from A s to B s, R bit/s on F Hz".
+// TETRA and GSM-R, a downlink each, written as it is made with the generator's own noise (25 dB in 25 kHz, TETRA; in 200 kHz,
+// GSM-R), for three of the receiver's stretches and 0.3 s more: TETRA, OnAir's scene 0 (makeTetraSynth: one cell on 392.4125
+// MHz, MCC 1, MNC 1, colour code 5, LA 1001, two neighbours and the network time; at 4 Msps and more OnAir's wide scene of 12
+// cells instead) around --freq (default 392.5 MHz, the scene's centre); GSM-R, OnAir's scene 0 (makeGsmrSynth: ARFCN 960 and
+// 968, BSIC 1-2 and 1-5, MCC 1, MNC 1, LAC 4711, cells 12001 and 12002) around --freq (default 923.0 MHz, the middle of the two,
+// so that 2 MHz holds both). The cells stay on their frequencies. stderr also says what each cell inside the part of the input
+// the receiver searches broadcasts, as onair-rx's line names it: "cell N at F Hz: mcc 1, mnc 1, ...".
 // --sigmf STEM writes the output as a SigMF pair instead of stdout: STEM.sigmf-data, ci16_le (each value times 32768, rounded and
 // clipped), and STEM.sigmf-meta, its sample rate, the centre frequency (--freq, or the mode's default above; left out for a mode
 // with neither) and an annotation per message, in the shape of iq/adsb1090.sigmf-meta.
@@ -92,6 +100,8 @@
 #include "dect2/dvbt/dvbt_gen.h"
 #include "dect2/fm/fm_gen.h"
 #include "dect2/fpv/fpv_gen.h"
+#include "dect2/gsmr/gsmr_gen.h"
+#include "dect2/gsmr/gsmr_rx.h"
 #include "dect2/hfdl/hfdl_gen.h"
 #include "dect2/hfdl/hfdl_proto.h"
 #include "dect2/lorawan/lorawan_gen.h"
@@ -106,6 +116,8 @@
 #include "dect2/sonde/sonde_gen.h"
 #include "dect2/source/source.h"
 #include "dect2/t2/t2.h"
+#include "dect2/tetra/tetra_gen.h"
+#include "dect2/tetra/tetra_rx.h"
 #include "dect2/vdl2/vdl2_gen.h"
 #include "dect2/vdl2/vdl2_proto.h"
 #include "dect2/wifi/wifi_gen.h"
@@ -146,6 +158,7 @@ int usage() {
                     "       onair-gen --mode dvbt --rate HZ [--bandwidth 8|7|6|5] [--service NAME] [--lead SEC] > iq\n"
                     "       onair-gen --mode video --rate HZ [--deviation HZ] > iq\n"
                     "       onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi|wisun --rate HZ [--freq HZ] > iq\n"
+                    "       onair-gen --mode tetra|gsmr --rate HZ [--freq HZ] > iq\n"
                     "       onair-gen ... --sigmf STEM     (STEM.sigmf-data, ci16_le, and STEM.sigmf-meta instead of stdout)\n"
                     "       onair-gen --selftest ais-join|sonde-id|json-utf8|calls\n");
     return 2;
@@ -681,6 +694,57 @@ std::vector<cf32> wisunSignal(double rate, double freq, std::vector<WisunSpan>* 
     return trim(all);
 }
 
+// --- TETRA and GSM-R: OnAir's scene 0 of each (makeTetraSynth: one cell; makeGsmrSynth: two railway cells) as a continuous
+// downlink, with the generator's own noise (kSnrDb: TETRA's in 25 kHz, GSM-R's in 200 kHz, of the strongest carrier). Each
+// scene sits at its cells' own frequencies around its centre (kTetraTestCentreHz, kGsmrTestCentreHz); the carrier offset moves
+// that centre to freq - centre, so that freq is at 0 Hz and every cell stays on its frequency. Made for kCellStretches of the
+// receiver's stretches (TETRA's 2.3 s, GSM-R's 2.2 s) and kCellMoreSec more. cells: what each cell inside the part of the input
+// its receiver searches (TETRA: the middle 72 %, tetra::kUsableBand; GSM-R: the middle 90 %) broadcasts, as onair-rx's line
+// names it: "cell N at F Hz: mcc 1, mnc 1, ..."
+constexpr double kCellStretches = 3, kCellMoreSec = 0.3;
+constexpr double kGsmrStretchSec = 2.2;   // GsmrReceiver's block (gsmr_rx.cpp, kBlockSec), which its header does not export
+// GSM-R's default --freq: the middle of scene 0's two cells (ARFCN 960 at 922.2 MHz, 968 at 923.8 MHz), so that an input of 2 MHz
+// holds both; at the scene's own centre (kGsmrTestCentreHz, 922.8 MHz) ARFCN 968 is 1 MHz up, at the edge of such an input
+constexpr double kGsmrScene0MidHz = 923.0e6;
+struct CellText { double hz; std::string text; };
+std::vector<cf32> cellSignal(const std::string& mode, double rate, double freq, std::vector<CellText>* cells) {
+    const bool isTetra = mode == "tetra";
+    SynthConfig c;
+    c.snrDb = kSnrDb;
+    c.cfoHz = (isTetra ? kTetraTestCentreHz : kGsmrTestCentreHz) - freq;
+    auto s = isTetra ? makeTetraSynth(c, rate) : makeGsmrSynth(c, rate);
+    if (!s) return {};
+    std::vector<cf32> x((size_t)std::llround((kCellStretches * (isTetra ? TetraReceiver::kCaptureSec : kGsmrStretchSec) + kCellMoreSec) * rate));
+    s->generate(x.data(), x.size());
+    const double searched = (isTetra ? tetra::kUsableBand : 0.9) * rate / 2;
+    char b[200];
+    if (isTetra) {
+        // a capture of 4 Msps or more plays the wide scene (2) instead of scene 0 (makeTetraSynth), with its 12 cells
+        const bool wide = rate >= 4e6;
+        const int n = wide ? 12 : tetraTestCells(0);
+        for (int i = 0; i < n; i++) {
+            const TetraCellCfg k = wide ? tetraWideCell(i, n, rate).cfg : tetraTestCell(0, i);
+            const double hz = tetra::dlCarrierHz(k.si.band, k.si.mainCarrier, k.si.offset);
+            if (std::fabs(hz - freq) > searched) continue;
+            snprintf(b, sizeof b, "mcc %d, mnc %d, colour_code %d, la %d", k.sync.mcc, k.sync.mnc, k.sync.colourCode, k.si.la);
+            std::string t = b;
+            if (!k.nwrk.nbrs.empty()) t += ", neighbours " + std::to_string(k.nwrk.nbrs.size());
+            if (k.nwrk.hasTime) t += ", network time";
+            cells->push_back({hz, t});
+        }
+    } else {
+        for (int i = 0; i < gsmrTestCells(0); i++) {
+            const GsmrCellCfg k = gsmrTestCell(0, i);
+            const double hz = gsmrArfcnToHz(k.arfcn);
+            if (std::fabs(hz - freq) > searched) continue;
+            snprintf(b, sizeof b, "arfcn %d, bsic %d, mcc %d, mnc %d, lac %u, cell_id %u", k.arfcn, (k.ncc << 3) | k.bcc, k.si.lai.mcc,
+                     k.si.lai.mnc, (unsigned)k.si.lai.lac, (unsigned)k.si.cellId);
+            cells->push_back({hz, b});
+        }
+    }
+    return x;
+}
+
 bool writeOut(const std::vector<cf32>& x, const std::string& stem, double rate, double centre, const std::vector<Span>& msgs) {
     if (stem.empty()) {
         if (fwrite(x.data(), sizeof(cf32), x.size(), stdout) != x.size() || fflush(stdout) != 0) {
@@ -933,19 +997,22 @@ int main(int argc, char** argv) {
     const bool scene = mode == "ble" || mode == "lorawan" || mode == "zigbee" || mode == "thread" || mode == "zwave" || mode == "wifi" ||
                        mode == "wisun";   // a scene of OnAir's own: only --freq
     if (mode == "rds" ? freq || haveText || haveInfo : voice || tv ? freq || haveText || haveInfo || haveStation : haveStation) return usage();
-    if (scene && (haveText || haveInfo)) return usage();
+    const bool cells = mode == "tetra" || mode == "gsmr";   // a downlink of OnAir's own: only --freq
+    if ((scene || cells) && (haveText || haveInfo)) return usage();
     if (channel && mode != "dmr" && mode != "p25") return usage();
     if ((bandwidth || haveService || lead) && mode != "dvbt") return usage();
     if (deviation && mode != "video") return usage();
     // the centre the pair records: --freq, or the mode's own (ACARS's channel, the middle of AIS 1 and 2, Bluetooth LE's channel
     // 37, the LoRaWAN scene's centre); 0 for a mode with neither. ACARS's default is also every other mode's freq, which they ignore
-    const bool ownCentre = mode == "acars" || mode == "ais" || scene;
+    const bool ownCentre = mode == "acars" || mode == "ais" || scene || cells;
     const double centre = freq ? freq : !ownCentre ? 0 : mode == "ais" ? 162e6 : mode == "ble" ? 2402e6
                                       : mode == "lorawan" ? lorawanPlanCentreMhz(lorawan::EU868) * 1e6
                                       : mode == "zigbee" || mode == "thread" ? 2425e6   // channel 15
                                       : mode == "zwave" ? zwave::region(kZwaveRegion)->centreMhz * 1e6
                                       : mode == "wifi" ? 2437e6                         // channel 6
                                       : mode == "wisun" ? wisunTuning().defMhz * 1e6     // the scene's own centre
+                                      : mode == "tetra" ? kTetraTestCentreHz              // the scene's own centre
+                                      : mode == "gsmr" ? kGsmrScene0MidHz                 // between scene 0's two cells
                                       : 131.525e6;
     if (!freq) freq = centre ? centre : 131.525e6;
     if (mode == "rds" || tv) {   // a broadcast is written as it is made: no cut and no silence (rds's and video's noise are the generator's own)
@@ -955,6 +1022,17 @@ int main(int argc, char** argv) {
         if (!writeOut(x, sigmf, rate, centre, {{0, x.size()}})) return 1;
         fprintf(stderr, "onair-gen: %s message from 0.000 s to %.3f s, %zu samples at %.0f Hz\n", mode.c_str(),
                 (double)x.size() / rate, x.size(), rate);
+        return 0;
+    }
+    if (cells) {   // a downlink is written as it is made, as a broadcast is (its noise is the generator's own)
+        std::vector<CellText> seen;
+        const std::vector<cf32> x = cellSignal(mode, rate, freq, &seen);
+        if (x.empty()) { fprintf(stderr, "onair-gen: no %s signal at %.0f Hz\n", mode.c_str(), rate); return 1; }
+        if (!writeOut(x, sigmf, rate, centre, {{0, x.size()}})) return 1;
+        fprintf(stderr, "onair-gen: %s message from 0.000 s to %.3f s, %zu samples at %.0f Hz\n", mode.c_str(),
+                (double)x.size() / rate, x.size(), rate);
+        for (size_t i = 0; i < seen.size(); i++)
+            fprintf(stderr, "onair-gen: cell %zu at %.0f Hz: %s\n", i + 1, seen[i].hz, seen[i].text.c_str());
         return 0;
     }
     std::vector<cf32> msg;

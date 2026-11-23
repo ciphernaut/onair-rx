@@ -85,6 +85,23 @@ Described only; not written here.
   channel or bit rate.
 - **Test:** the receiver's own test (`tests/wisun/test_wisun_rx.cpp`), reading the header's channel off a hub sink.
 
+## 5. TETRA and GSM-R: an offline switch, and the last stretch
+
+Described only; not written here.
+
+- **Change:** `TetraReceiver` and `GsmrReceiver` (`tetra/tetra_rx.cpp`, `gsmr/gsmr_rx.cpp`, `feed()`) skip the input that
+  comes while their worker decodes a stretch; GSM-R also drops the rest of the `feed()` that completes a stretch, even with
+  its worker idle. A `setOffline(true)`, as `WisunReceiver` has, would make `feed()` wait for the worker instead and keep
+  every sample. GSM-R's stretch (`kBlockSec`, 2.2 s) is not in its header, as TETRA's `kCaptureSec` is. Neither has a
+  `flush()` for the input after the last whole stretch.
+- **Why:** `onair-rx`'s `tetra` and `gsmr` modes (`src/poll_cell.cpp`) wait on `busy()` after each block (GSM-R: at each
+  stretch's end, where they cut the block, with the stretch's length copied from the source), so that a replay faster
+  than real time skips nothing and gives the lines of a live run. A switch inside the receiver would let it go on
+  reading the next stretch while it decodes (TETRA already gathers it), so a caller's input would not stall for the
+  decoding time (up to 1.4 s on GSM-R's two-cell scene). A replay shorter than one stretch gives nothing today.
+- **Test:** the receivers' own tests (`tests/tetra/test_tetra_rx.cpp`, `tests/gsmr/test_gsmr_rx.cpp`), fed without their
+  `while (rx.busy()) sleep` pacing.
+
 ## Dropped
 
 The parent spec also named a patch for OnAir's raw file source to read a pipe. It is not needed: the raw file source

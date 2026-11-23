@@ -21,15 +21,16 @@ onair-rx --version
 ```
 
 Modes: `adsb`, the bus modes `pocsag`, `flex`, `acars`, `aprs`, `ais`, `vdl2`, `hfdl`, `rs41`, `dfm`, `m20`, `ble`,
-`lorawan`, `zigbee`, `thread`, `zwave`, `wifi` and `wisun`, and the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and
-`video` (below). `ble`, `lorawan`, `zigbee`, `thread`, `zwave`, `wifi` and `wisun` are modes ZetaSDR has no decoder of its
-own for: their point is their packets, which Wireshark reads.
+`lorawan`, `zigbee`, `thread`, `zwave`, `wifi` and `wisun`, and the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt`,
+`video`, `tetra` and `gsmr` (below). `ble`, `lorawan`, `zigbee`, `thread`, `zwave`, `wifi`, `wisun`, `tetra` and `gsmr` are
+modes ZetaSDR has no decoder of its own for: their point is their packets, which Wireshark reads.
 
 - **stdin:** interleaved little-endian IQ at `--rate` Hz, `cf32` (the default) or `cs16`, the signal's channel at
   0 Hz (HFDL: its dial frequency at 0 Hz). The receivers' minimum rates: ADS-B 2 MHz (2.4 MHz is usual); the bus
   and polled modes' are in their tables below. A rate below the mode's exits 2 with one line saying so.
 - **`--freq HZ`:** the radio frequency at 0 Hz of the input. Every mode takes it; ACARS, AIS, VDL2 and HFDL need it
-  (they place their channels by frequency), as do `lorawan`, `zigbee`, `thread`, `zwave`, `wifi` and `wisun`; they exit 2 with
+  (they place their channels by frequency), as do `lorawan`, `zigbee`, `thread`, `zwave`, `wifi`, `wisun`, `tetra` and
+  `gsmr`; they exit 2 with
   `onair-rx: <mode> needs --freq HZ` without it, before reading any input.
   AIS also exits 2, before reading input, with `onair-rx: ais: no AIS channel within <rate> Hz of <freq> Hz` when the
   input does not hold AIS 1 (161.975 MHz) or AIS 2 (162.025 MHz) as OnAir's receiver needs them: the middle of the two,
@@ -47,8 +48,8 @@ own for: their point is their packets, which Wireshark reads.
   - `--region` (`wisun`): the Wi-SUN band plan, one of OnAir's `ANZ`, `NA`, `MX`, `BZ`, `JP`, `KR`, `PH`, `MY`, `HK`,
     `SG`, `SG866`, `TH`, `VN`, `EU863`, `EU870`, `IN`, `CN470`, `CN779`, `CN920`, `WW` (in any case). Without it the
     receiver takes the plan for `--freq` (below).
-  - `--drop` (`wisun`): a receiver with a worker skips the input that comes while it is busy, as it does live, instead of
-    being waited for (below).
+  - `--drop` (`wisun`, `tetra`, `gsmr`): a receiver with a worker skips the input that comes while it is busy, as it does
+    live, instead of being waited for (below).
   - `--width` (the job's band, Hz) is taken by no mode yet: every mode refuses it.
 - **stdout, adsb:** one JSON object per decoded Mode S frame, flushed per line. A line carries only what its own frame
   established, as an SBS (BaseStation) line does, never a value remembered from an earlier frame. A member whose value
@@ -270,8 +271,9 @@ own for: their point is their packets, which Wireshark reads.
   sample of the block after which the poll ran), a member only when its value is known, whole numbers without a
   decimal point. Text the receiver hands over in UTF-8 (`ps`, `rt`, `alias`, a DVB-T service's `name`) is written as
   UTF-8, escaping only a quote, a backslash and a control character; text that is not valid UTF-8 is written byte by
-  byte as above, so a line is always valid JSON. None of them has packets: `--pcap-port` exits 2 with
-  `onair-rx: <mode> has no packets (no --pcap-port)`, before reading any input. The modes:
+  byte as above, so a line is always valid JSON. Only `tetra` and `gsmr` have packets (a row's hub channel): with
+  another polled mode `--pcap-port` exits 2 with `onair-rx: <mode> has no packets (no --pcap-port)`, before reading any
+  input. The modes:
 
   | mode | OnAir receiver | minimum rate | poll | event | members |
   |---|---|---|---|---|---|
@@ -281,6 +283,8 @@ own for: their point is their packets, which Wireshark reads.
   | `m17` | `M17Receiver` | 250 kHz | 0.25 s | `voice.call` | `src`, `dst`, `can`, `type`, `encryption`, `lat`, `lon`, `eot` |
   | `dvbt` | `DvbtReceiver`, `TsDemux` | 7.9 MHz for 8 MHz (4.9375 MHz for 5) | 0.25 s | `dvbt.status` | `locked`, `lock`, `bandwidth_hz`, `mode`, `guard`, `constellation`, `code_rate`, `hierarchy`, `lp_code_rate`, `snr_db`, `services` |
   | `video` | `AtvReceiver` (FM video) | 8 MHz | 0.25 s | `video.status` | `system`, `standard`, `locked`, `lock`, `line_hz`, `snr_db` |
+  | `tetra` | `TetraReceiver` | 200 kHz (2 MHz usual) | 0.25 s | `tetra.cell` | `freq_hz`, `mcc`, `mnc`, `colour_code`, `la`, `network_time`, `neighbours`, `snr_db` |
+  | `gsmr` | `GsmrReceiver` | 1 MHz (2 MHz in the node's row, 5 MHz OnAir's usual) | 0.25 s | `gsmr.cell` | `freq_hz`, `arfcn`, `bsic`, `mcc`, `mnc`, `lac`, `cell_id`, `snr_db` |
 
   - `rds`: the FM station at 0 Hz of the input (OnAir's station finder is off, so the station is the one at the
     centre however weak; the receiver is silent, no sound device is opened). One line per RDS group from the
@@ -371,6 +375,51 @@ own for: their point is their packets, which Wireshark reads.
       8 or 16 MHz a SECAM picture is `pal`); `locked` is line and field sync, `lock` `locked` or `no lock`; `line_hz`
       (the measured line rate, whole Hz) and `snr_db` (sync against the noise on the porches, whole dB) are written
       once there is line sync. No picture is taken (the receiver still decodes one, which is most of its cost).
+  - `tetra`, `gsmr` (the cell modes, `src/poll_cell.cpp`): the base stations on the input, from what each broadcasts in
+    the clear to every terminal on its downlink. `--freq` is required (each cell's carrier is the radio frequency plus
+    its offset; without it the modes exit 2 with `onair-rx: <mode> needs --freq HZ`), and the whole input is searched
+    for carriers, as the receivers do by default (TETRA: 25 kHz carriers in the middle 72 % of the input; GSM-R: 200 kHz
+    carriers, the strongest 12, outside 4 % of each edge). Receive only: nothing addressed to a terminal is decoded,
+    nothing is decrypted, no key is loaded.
+    - `tetra` (`tetra.cell`): `freq_hz` (the main carrier's frequency the cell announces in SYSINFO, when this carrier is
+      it; else the carrier as measured, to the hertz), `mcc`, `mnc` and `colour_code` (the synchronisation burst: the
+      receiver keeps no cell without them), `la` (the location area, from SYSINFO), `network_time` (OnAir's text of the
+      neighbour broadcast's network time, `2026-10-12 09:30:00 UTC, local +03:00`, when the broadcast carries one),
+      `neighbours` (how many neighbour cells the cell has broadcast, once it has) and `snr_db` (one decimal). Not
+      `setSingleCarrier`: every carrier in the input is a cell of its own.
+    - `gsmr` (`gsmr.cell`): `freq_hz` (the ARFCN's own downlink frequency; off the raster, as measured), `arfcn` (when
+      the carrier is on the raster of GSM 850, 900, DCS 1800 or PCS 1900: OnAir's `gsmrHzToArfcn`), `bsic` (the SCH's base
+      station identity code, NCC times 8 plus BCC: 1-2 is 10), `mcc`, `mnc` and `lac` (System Information 3 or 4),
+      `cell_id` (System Information 3) and `snr_db` (one decimal). Paging and access blocks are only counted by the
+      receiver; none of it is written.
+    A cell gives a line when it is first read and one when a member of it changes. A cell is keyed by its carrier and its
+    identity (TETRA: MCC, MNC and colour code, the carrier within 5 kHz of where it was; GSM-R: ARFCN and BSIC, within 60
+    kHz off the raster), the receivers' own rules, so a carrier measured a few hertz off in each stretch stays one cell.
+    What is measured (`snr_db`, a carrier's measured `freq_hz`) and TETRA's clock (`network_time`'s value; whether there
+    is one counts) is written on each line and makes no line of its own, as `dvbt`'s `snr_db`: a cell that stays on the
+    air gives no line per poll. A cell no longer heard gives no line. The line comes at the first poll after the stretch
+    that read it (below).
+    **The receivers decode a stretch of input at a time, on a worker thread of their own:** TETRA 2.3 s
+    (`TetraReceiver::kCaptureSec`), GSM-R 2.2 s (`kBlockSec` in `gsmr_rx.cpp`). Live they skip what comes while the worker
+    is busy (TETRA gathers the next stretch meanwhile and skips only once that is full; GSM-R gathers only while the
+    worker is idle, and also drops the rest of the block that completes a stretch). A replay faster than real time (ZetaSDR's
+    `capture_decode`) would lose most of its input that way, and which part would depend on the worker's timing. So the
+    session waits for the worker (`busy()`; neither receiver has a switch to block) after each block (TETRA) or at each
+    stretch's end, where it cuts the block (GSM-R): the receiver skips nothing, the stretches follow each other from sample
+    0, each is decoded before the next sample is fed, and every line depends on the input alone (two runs, one CPU or
+    several, a file or a pipe give the same bytes). A stretch's lines come at the first poll after the block that ends
+    it: at most 0.25 s of input and one block later. The input after the last whole stretch is never decoded (the
+    receivers have no flush), so input shorter than 2.3 s (2.2 s) gives no line. At the end of input the last poll waits
+    at most 5 s for a stretch still being decoded (only with `--drop` is there one), then reports what the snapshot has;
+    the session's end then makes such a stretch give up at its next carrier, so the program never waits on it.
+    **`--drop`** runs the receiver as it runs live: the session does not wait, and the receiver skips what comes while it
+    decodes. Which stretches are decoded then depends on the worker's timing (from a file nearly all the input after the
+    first stretch goes), and so do the lines.
+    **Packets** (`--pcap-port`): each signalling block the receiver decoded, as GSMTAP in IPv4 + UDP to port 4729 (link
+    type 101), as OnAir's capture files have them: TETRA's synchronisation bursts and signalling blocks (GSMTAP type 5,
+    TETRA I1; OnAir's encrypted signalling as received), GSM-R's BCCH blocks (type 1, Um; the CCCH is not published).
+    OnAir's GSMTAP is version 1 with a 4-word header. They come from the worker, through the hub tap's lock; `runPolled`
+    drains them after every block and writes each at the drained block's first sample.
 
   Measured on the build host (12 cores, x86-64), OnAir `a63c3a8`, user CPU per second of input (`/usr/bin/time -f %U`
   over the input's seconds; `test/poll.sh` prints its own):
@@ -396,6 +445,26 @@ own for: their point is their packets, which Wireshark reads.
     about 17 MHz wide and asks for 20 MHz. The cost is the receiver's FM search on noise more than its decoding of a
     locked picture: at 12 and 20 MHz a channel with nothing on it takes more than one core. `setColour(false)` takes
     about a third off a locked picture at 12 MHz and nothing off noise; it is not set, since it would lose SECAM.
+  - `tetra` and `gsmr` at 2 MHz on `onair-gen`'s scenes (TETRA: one cell; GSM-R: two cells), user CPU and wall time per
+    second of input, OnAir's worker and the feeding thread together; eleven file runs and two paced runs each, the load
+    average 3 to 10 from other work. The worker takes 0.18 s a stretch for TETRA's one carrier and about 1.0 s for
+    GSM-R's two (about 0.5 s a carrier: OnAir's search keeps up to 12, so a full band costs up to six times the scene's). On 8 s of noise (no carrier) both cost
+    0.01 s a second.
+
+    | mode, input | user CPU a second | wall a second | keeps real time |
+    |---|---|---|---|
+    | `tetra`, file | 0.07 | 0.09 to 0.10 | yes (every stretch decoded) |
+    | `tetra --drop`, file | 0.03 | 0.03 | yes, but it decoded 1 of the 3 stretches here |
+    | `tetra`, paced at real time | 0.05 to 0.08 | ends 0.1 to 0.2 s after the input | yes; its input stops for up to 0.2 to 0.3 s at each stretch's end |
+    | `tetra --drop`, paced at real time | 0.08 | ends with the input | yes (every stretch decoded) |
+    | `gsmr`, file | 0.43 to 0.45 | 0.48 to 0.50 | yes (every stretch decoded) |
+    | `gsmr --drop`, file | 0.15 | 0.17 | yes, but it decoded 1 of the 3 stretches here |
+    | `gsmr`, paced at real time | 0.44 to 0.49 | ends 0.9 to 1.0 s after the input | on average; its input stops for up to 1.0 to 1.4 s at each stretch's end |
+    | `gsmr --drop`, paced at real time | 0.27 to 0.31 | ends with the input | yes, but it skips about a second after each stretch (2 of 3 decoded) |
+
+    Without `--drop` the session's wait stops the reading of stdin while a stretch is decoded, so a writer feeding at
+    real time is held up that long (the pipe fills) and catches up after. The node's writer skips frames when its own
+    queue overflows, so a GSM-R job at real time needs a queue that holds 1.4 s of input, or `--drop`.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic
   pcap stream: the file header, then one record per frame. ADS-B: 7 or 14 bytes, link type 147 (USER0), and every
   JSON line has exactly one record. APRS: the AX.25 frame as OnAir's Wireshark hub gets it (link type 3), also a
@@ -406,8 +475,9 @@ own for: their point is their packets, which Wireshark reads.
   factor, SNR; link type 270). Zigbee and Thread: the PSDU with its FCS (link type 195, IEEE 802.15.4 with FCS). Z-Wave: a
   byte for the data rate (0 to 2) and the MPDU (link type 148, USER1; `onair-rx --lua` has the dissector). Wi-Fi: a radiotap
   header and the 802.11 frame, FCS taken off (link type 127), every good frame, also those without a line. Wi-SUN: the
-  MPDU as received, without its FCS (link type 230, IEEE 802.15.4 without FCS), one per frame. Each of these
-  has at least as many records as lines. The other bus modes and the polled modes have no packets and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that
+  MPDU as received, without its FCS (link type 230, IEEE 802.15.4 without FCS), one per frame. TETRA and GSM-R: each
+  signalling block in GSMTAP, inside IPv4 + UDP to port 4729 (link type 101). Each of these
+  has at least as many records as lines. The other bus modes and the other polled modes have no packets and refuse the option (exit 2). Records wait in a bounded queue (8192, the oldest dropped first), so a client that
   connects a few seconds late still gets them; a client that hangs up is dropped, and the next one gets a new header.
   Record times are the frame's sample time (bus modes: its block's first sample) on the wall clock of the first sample,
   moved on when the input falls more than 100 ms behind real time. What is still queued at the end with no client is
@@ -418,7 +488,8 @@ own for: their point is their packets, which Wireshark reads.
   Only `wisun` flushes its receiver at the end of input (a bus row's `flushAtEnd`, below, is for one that holds frames
   until told); with another mode a decode a receiver still holds when stdin closes is not written, and a short
   replay (ZetaSDR's `capture_decode`) can lose its last message this way. A polled mode polls once more at EOF, so
-  what its receiver's snapshot has by then is written.
+  what its receiver's snapshot has by then is written; `tetra` and `gsmr` never decode the input after their last whole
+  stretch, and with `--drop` the last poll waits at most 5 s for a stretch still being decoded.
   SIGTERM ends it at once.
 
 ## Build
@@ -433,9 +504,11 @@ test/poll.sh                              # the polled modes on OnAir's own test
                                           # modes also with mbelib and Codec 2 hidden, the status modes also on noise
                                           # (about 40 s; it prints each status run's user CPU)
 test/only.sh                              # the modes only OnAir decodes (ble, lorawan, zigbee, thread, zwave, wifi,
-                                          # wisun) on OnAir's own scenes, their packets, the options each mode refuses,
-                                          # noise alone (it prints each mode's user CPU), onair-gen's --sigmf pair; wisun
-                                          # also cut short, run twice and on one CPU and two (taskset)
+                                          # wisun, tetra, gsmr) on OnAir's own scenes, their packets, the options each
+                                          # mode refuses, noise alone (it prints each mode's user CPU), onair-gen's
+                                          # --sigmf pair; wisun also cut short, run twice and on one CPU and two
+                                          # (taskset); tetra and gsmr run twice, on one CPU, through a pipe, with --drop
+                                          # and on 1 s of input
 ```
 
 The wrapper's headers are on the quoted include path only (`-iquote`), so that `src/poll.h` does not stand in for the
@@ -495,10 +568,20 @@ the ANZ 400 kHz channels within 0.4 of the rate of 921.5 MHz, and a PAN configur
 channel), on its channels around `--freq` (default 921.5 MHz, the scene's centre, between two channels; the frames stay
 on their channels), noise in 400 kHz (the generator's own measure). At 2 MHz that is 16 frames on 921.0, 921.2 and
 922.2 MHz. After its message line stderr says where each frame is: `frame N from A s to B s, R bit/s on F Hz`.
+`onair-gen --mode tetra|gsmr --rate HZ [--freq HZ]` is a downlink, written as it is made with the generator's own noise (25
+dB in 25 kHz for TETRA, in 200 kHz for GSM-R), for three of the receiver's stretches and 0.3 s more (7.2 s, 6.9 s):
+TETRA, OnAir's scene 0 (`makeTetraSynth`: one cell on 392.4125 MHz, MCC 1, MNC 1, colour code 5, LA 1001, two neighbours,
+the network time, encrypted signalling; at 4 MHz and more OnAir's wide scene of 12 cells instead) around `--freq`
+(default 392.5 MHz, the scene's centre); GSM-R, OnAir's scene 0 (`makeGsmrSynth`: ARFCN 960 on 922.2 MHz and 968 on
+923.8 MHz, BSIC 1-2 and 1-5, MCC 1, MNC 1, LAC 4711, cells 12001 and 12002) around `--freq` (default **923.0 MHz**, the
+middle of the two: at the scene's own centre, 922.8 MHz, ARFCN 968 is at the edge of a 2 MHz input and is not found).
+The cells stay on their frequencies. After its message line stderr says what each cell inside the part of the input its
+receiver searches broadcasts, as onair-rx's line names it: `cell N at F Hz: mcc 1, mnc 1, colour_code 5, ...`.
 `onair-gen ... --sigmf STEM`, with any mode, writes `STEM.sigmf-data` (ci16_le: each value times 32768, rounded and
 clipped) and `STEM.sigmf-meta` instead of stdout, the meta in the shape of `iq/adsb1090.sigmf-meta`: the sample rate,
 the datatype, the centre frequency (`--freq`, or the mode's own: ACARS 131.525 MHz, AIS 162 MHz, Bluetooth LE 2402 MHz,
-LoRaWAN 868.3 MHz, Zigbee and Thread 2425 MHz, Z-Wave 869.13 MHz, Wi-Fi 2437 MHz, Wi-SUN 921.5 MHz; left out for a mode with neither) and an annotation (`message`) per message: where the stderr line
+LoRaWAN 868.3 MHz, Zigbee and Thread 2425 MHz, Z-Wave 869.13 MHz, Wi-Fi 2437 MHz, Wi-SUN 921.5 MHz, TETRA 392.5 MHz,
+GSM-R 923.0 MHz; left out for a mode with neither) and an annotation (`message`) per message: where the stderr line
 says it is.
 `onair-gen --selftest ais-join` tests the AIS sentence joiner of `src/ais.cpp`, which it links,
 `onair-gen --selftest sonde-id` the spelling of a sonde's `id` (`sondeId`, `src/bus.h`)
@@ -551,7 +634,12 @@ followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
   about each call (a key and the members) and hands that to a `CallLog` (`src/calls.h`), which writes the first, the
   changed and the last line of each call. The status modes (`src/poll_tv.cpp`) are polled every 0.25 s and write
   their receiver's state on a change and at least every 2 s; DVB-T's session also steps through the channel widths
-  as it feeds, and reads the service list from a `TsDemux` its packet callback feeds.
+  as it feeds, and reads the service list from a `TsDemux` its packet callback feeds. The cell modes
+  (`src/poll_cell.cpp`) are polled every 0.25 s: each waits for its receiver's worker as it feeds (unless `--drop`),
+  turns the receiver's cell table into what it says about each cell (its identity, its carrier, the members compared
+  and the line) and hands that to a `CellLog`, which writes a cell's first line and its changed ones. A row with a hub
+  channel (`chan`) has a `HubTap` with a pcap port, drained after every block and after the last poll; a row with
+  `needsFreq` refuses to run without `--freq`.
 - `src/ais.cpp`: AIS's lines. A joiner puts a message's sentences back together (OnAir publishes them one after the
   other); OnAir's `ais::parseNmea`, `ais::unarmour` and `ais::decodeMessage` read the message.
 - `src/adsb.cpp`: OnAir's `AdsbReceiver` does the decoding. Its frame callback hands over every good frame, decoded

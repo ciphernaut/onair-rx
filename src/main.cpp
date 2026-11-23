@@ -48,7 +48,7 @@ static const OnlySome kOnlySome[] = {
     {"width", "", [](const Options& o) { return o.width > 0; }},
     {"plan", "lorawan", [](const Options& o) { return !o.plan.empty(); }},
     {"region", "zwave wisun", [](const Options& o) { return !o.region.empty(); }},
-    {"drop", "wisun", [](const Options& o) { return o.drop; }},
+    {"drop", "wisun tetra gsmr", [](const Options& o) { return o.drop; }},
 };
 static bool takes(const char* modes, const std::string& mode) {
     const std::string list = std::string(" ") + modes + " ";
@@ -106,8 +106,9 @@ static void usage(FILE* f) {
                "127.0.0.1:PORT; --bandwidth (dvbt: 8, 7, 6 or 5) fixes the channel width, which is otherwise found; --plan\n"
                "(lorawan) names the channel plan, which is otherwise the one with most channels in the input; --region (zwave)\n"
                "the Z-Wave region, which is otherwise the one with most channels in the input, and (wisun) the Wi-SUN band\n"
-               "plan, which is otherwise the one for --freq; --drop (wisun) lets the receiver drop bursts its decoder has no\n"
-               "time for, as it does live, instead of waiting for it. --width is taken by no mode yet. Modes:");
+               "plan, which is otherwise the one for --freq; --drop (wisun, tetra, gsmr) lets the receiver drop what its\n"
+               "decoder has no time for (wisun: bursts; tetra, gsmr: the input while a stretch is decoded), as it does live,\n"
+               "instead of waiting for it. --width is taken by no mode yet. Modes:");
     for (const Mode& m : kModes) fprintf(f, " %s", m.name);
     for (size_t i = 0; i < kBusModeCount; i++) fprintf(f, " %s", kBusModes[i].name);
     for (size_t i = 0; i < kPollModeCount; i++) fprintf(f, " %s", kPollModes[i].name);
@@ -180,14 +181,15 @@ int main(int argc, char** argv) {
     if (o.format != "cf32" && o.format != "cs16") { fprintf(stderr, "onair-rx: no format %s (cf32 or cs16)\n", o.format.c_str()); return 2; }
     // before any sample is read: a mode that places its channels by frequency never runs without one
     if (bus && bus->needsFreq && o.freq <= 0) { fprintf(stderr, "onair-rx: %s needs --freq HZ\n", bus->name); return 2; }
+    if (polled && polled->needsFreq && o.freq <= 0) { fprintf(stderr, "onair-rx: %s needs --freq HZ\n", polled->name); return 2; }
     if (bus && bus->chan < 0 && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", bus->name); return 2; }
     if (o.bandwidthMhz && o.mode != "dvbt") { fprintf(stderr, "onair-rx: %s has no --bandwidth (dvbt only)\n", o.mode.c_str()); return 2; }
-    if (polled && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", polled->name); return 2; }   // no polled mode has packets
+    if (polled && polled->chan < 0 && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", polled->name); return 2; }
 
     PcapPort pcap;
     if (o.pcapPort) {
         std::string err;
-        const uint32_t linktype = bus ? wire::kChans[bus->chan].linktype : mode->linktype;
+        const uint32_t linktype = bus ? wire::kChans[bus->chan].linktype : polled ? wire::kChans[polled->chan].linktype : mode->linktype;
         if (!pcap.listen(o.pcapPort, linktype, err)) {
             fprintf(stderr, "onair-rx: cannot listen on 127.0.0.1:%d: %s\n", o.pcapPort, err.c_str());
             return 1;
