@@ -293,7 +293,7 @@ timed() {
 # poll of the block that reaches 2 s and no earlier. Successive lines are never more than 2 s of input apart, and the last is
 # less than 2 s from the end. Wanted: "first", the members the first line has; "locked", the members some locked line has
 # (and every locked line with signalling has them); "service", an object some line's services holds; "never", no line is
-# locked; "lines", at least that many lines
+# locked; "lines", at least that many lines; "snr_above", every snr_db present is above it (a made-up 0 is not written)
 status() {
   python3 -I - "$d/$1.jsonl" "$4" "$3" "$2" "$5" <<'EOF'
 import json, sys
@@ -349,6 +349,9 @@ assert nsamp - last <= 2 * rate, f"the last line {(nsamp - last) / rate:.3f} s o
 assert len(lines) >= want.get("lines", 1), f"{len(lines)} lines, want at least {want.get('lines', 1)}"
 locked = [o for o in lines if o["locked"]]
 everything = "the lines:\n  " + "\n  ".join(map(json.dumps, lines))
+if "snr_above" in want:
+    low = [o for o in lines if "snr_db" in o and not o["snr_db"] > want["snr_above"]]
+    assert not low, f"an snr_db not above {want['snr_above']}: {json.dumps(low[0])}"
 if "first" in want:
     assert all(lines[0].get(k) == v for k, v in want["first"].items()), f"the first line is not {want['first']}; {everything}"
 if want.get("never"):
@@ -376,14 +379,15 @@ dvbt_locked='{"locked":true,"lock":"locked","bandwidth_hz":8000000,"mode":"8K","
 gen dvbt --mode dvbt --rate 10000000
 timed dvbt --format cf32 --mode dvbt --rate 10000000
 status dvbt dvbt 10000000 "$(samples dvbt)" \
-  "{\"first\":$dvbt_locked,\"locked\":$dvbt_locked,\"service\":{\"id\":4660,\"name\":\"ZETA TEST\",\"kind\":\"tv\"}}" || fail "dvbt"
+  "{\"snr_above\":20,\"first\":$dvbt_locked,\"locked\":$dvbt_locked,\"service\":{\"id\":4660,\"name\":\"ZETA TEST\",\"kind\":\"tv\"}}" || fail "dvbt"
 rm -f "$d/dvbt.iq"
 # the same multiplex after 1.855 s of noise: OnAir's receiver decodes its TPS a few blocks before the 8 MHz width's 2 s end
 # (found by trying leads; it is the same on every run), so the first line, at 2 s, is locked at 8 MHz, and the width is
-# held from the lock the line reports: no line says 7 MHz, nor another width's signalling
+# held from the lock the line reports: no line says 7 MHz, nor another width's signalling; the lock's first line has no
+# snr_db yet (no channel estimate), rather than a 0
 gen dvbt-late --mode dvbt --rate 10000000 --lead 1.855
 timed dvbt-late --format cf32 --mode dvbt --rate 10000000
-status dvbt-late dvbt 10000000 "$(samples dvbt-late)" "{\"first\":$dvbt_locked,\"locked\":$dvbt_locked}" ||
+status dvbt-late dvbt 10000000 "$(samples dvbt-late)" "{\"snr_above\":20,\"first\":$dvbt_locked,\"locked\":$dvbt_locked}" ||
   fail "dvbt, a multiplex that locks at the end of the 8 MHz window"
 rm -f "$d/dvbt-late.iq"
 # a 7 MHz multiplex: 8 MHz gives no lock in its 2 s, then 7 does

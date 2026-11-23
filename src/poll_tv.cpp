@@ -127,7 +127,9 @@ public:
                     add("lp_code_rate", name(kRates, t.crLp));
                 }
                 // no cell_id: OnAir's TPS decoder does not read the cell id bits (dvbt.cpp), so it is never known
-                if (measured) j.num("snr_db", (double)tel_.dataSnrDb, 1);
+                // the SNR once this acquisition has measured it: OnAir works it out with the channel response it shows (chValid,
+                // cleared by a restart, the SNR is not); a lock just made reads 0, or an earlier lock's
+                if (measured && tel_.chValid) j.num("snr_db", (double)tel_.dataSnrDb, 1);
                 if (!services.empty()) j.raw("services", services);
             }
             return j;

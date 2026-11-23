@@ -205,7 +205,8 @@ the polled modes `rds`, `dmr`, `p25`, `m17`, `dvbt` and `video` (below).
       is on, in Hz), `mode` (`2K`, `8K`, or DVB-H's `4K`), `guard` (`1/32`, `1/16`, `1/8`, `1/4`), `constellation`
       (`QPSK`, `16-QAM`, `64-QAM`), `code_rate` (the high-priority stream's: `1/2`, `2/3`, `3/4`, `5/6`, `7/8`),
       `hierarchy` (`a=1`, `a=2`, `a=4`) and `lp_code_rate` (only for a hierarchical multiplex), `snr_db` (OnAir's
-      channel estimate's signal to noise, one decimal) and `services`. `cell_id` is never written: OnAir's TPS
+      channel estimate's signal to noise, one decimal, once the receiver has measured it for this lock: the line of a
+      lock just made may have none) and `services`. `cell_id` is never written: OnAir's TPS
       decoder does not read the cell id bits. `services` is the transport stream's services as OnAir's
       demultiplexer (`TsDemux`) has read them from its tables: an array of `{"id": <service id>, "name": "<name>",
       "kind": "tv"|"radio"|"data"}`, the name once the SDT gave it (UTF-8: OnAir reads it from the broadcast's
