@@ -264,9 +264,15 @@ modes ZetaSDR has no decoder of its own for: their point is their packets, which
   (`telemetry()`). A polled mode feeds its receiver blocks of 16384 samples, each one whole however the input arrives
   (only the last may be short), and polls at the multiples of the mode's poll interval from sample 0, each after the
   block that reaches one, so a replay gives the same lines as a live run, byte for byte. stdin is read on a thread of
-  its own into a queue of 4 s of input at the rate (at least two blocks), from which the blocks are taken: a session
-  that waits for its receiver (`tetra`, `gsmr`) does not hold up the writer meanwhile. When the queue is full the reader
-  waits, and the writer with it (back-pressure; no sample is dropped). An interval shorter than a
+  its own into a queue of whole blocks (however small the reads), from which the blocks are taken, so that a session
+  that waits for its receiver (`tetra`, `gsmr`) does not hold up the writer meanwhile. The queue is the mode's own
+  (`PollMode::readAheadSec`): two of its receiver's stretches for a mode whose session waits (`tetra` 4.6 s, `gsmr`
+  4.4 s: 70 MB at 2 MHz), two blocks for the others and under `--drop`, never more than 256 MB. When it is full the
+  reader waits, and the writer with it (back-pressure; no sample is dropped), except under `--drop`: a block that finds
+  the queue full is dropped, the samples after it keep their index on the input (`t_sample`), and at the end stderr says
+  `onair-rx: <mode>: <n> samples dropped` (only when some were). Peak RSS from a file: `dvbt` at 10 MHz 33 MB, as
+  before the queue; `gsmr` at 2 MHz 177 MB (108 MB without the queue). `ONAIR_RX_TEST_BLOCK_DELAY_US` (a test knob,
+  `test/only.sh`) sleeps that long after each block, to make a session slower than its writer. An interval shorter than a
   block is a poll after every block: `dmr` at 48 kHz (0.25 s is 12000 samples) is polled every block, each 0.34 s
   of input. A poll writes one JSON object
   per line for what is new or has changed since the last poll; one more poll runs at the end of input, so that what
@@ -471,7 +477,7 @@ modes ZetaSDR has no decoder of its own for: their point is their packets, which
 
     Without `--drop` the session waits while a stretch is decoded; the read-ahead thread keeps reading stdin meanwhile
     (before it, a writer at real time was held up 0.17 to 0.31 s by TETRA's wait and 1.0 to 1.4 s by GSM-R's), and the
-    session catches up on the queued input after. The queue's 4 s is well above a stretch's decoding here; a band whose
+    session catches up on the queued input after. The queue's two stretches are well above a stretch's decoding here; a band whose
     stretch takes longer to decode than it lasts cannot keep real time without `--drop`. The paced figures (input end
     and CPU) are from before the read-ahead thread.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic

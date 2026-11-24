@@ -701,6 +701,63 @@ pcap tetra 101 --mode tetra --rate 2000000 --freq "$te_hz" || fail "tetra on the
 cellrun gsmr "$gr_hz" 2.2
 pcap gsmr 101 --mode gsmr --rate 2000000 --freq "$gr_hz" || fail "gsmr on the pcap port"
 
+# --- the polled path's read-ahead (src/poll.cpp, ReadAhead) is sized per mode. A mode whose session never waits (dvbt) keeps
+# its footprint from a file: its peak RSS within 64 MB of master 9843b13's build on the same run, 32480 kB (measured
+# 2026-11-24 on the build host; the round-0 read-ahead of 4 s held 345 MB). gsmr, whose session waits, reads ahead two
+# stretches: within 256 MB of the build before the read-ahead (0cf4726), 107824 kB, measured the same way
+"$gen" --mode dvbt --rate 10000000 >"$d/dvbt10.iq" 2>"$d/dvbt10.gen" || fail "onair-gen --mode dvbt: $(cat "$d/dvbt10.gen")"
+/usr/bin/time -f %M -o "$d/rss" "$bin" --mode dvbt --rate 10000000 <"$d/dvbt10.iq" >/dev/null 2>"$d/dvbt10.err" ||
+  fail "dvbt at 10 MHz: $(tail -n 3 "$d/dvbt10.err")"
+rm -f "$d/dvbt10.iq"
+rss=$(cat "$d/rss")
+[ "$rss" -le $((32480 + 64 * 1024)) ] || fail "dvbt at 10 MHz from a file: peak RSS $rss kB, master's 32480 kB"
+echo "ok: dvbt at 10 MHz from a file: peak RSS $rss kB (master 9843b13: 32480 kB)"
+/usr/bin/time -f %M -o "$d/rss" "$bin" --mode gsmr --rate 2000000 --freq "$gr_hz" <"$d/gsmr.iq" >/dev/null 2>"$d/gsmr-rss.err" ||
+  fail "gsmr for its RSS: $(tail -n 3 "$d/gsmr-rss.err")"
+rss=$(cat "$d/rss")
+[ "$rss" -le $((107824 + 256 * 1024)) ] || fail "gsmr from a file: peak RSS $rss kB, 107824 kB before the read-ahead"
+echo "ok: gsmr from a file: peak RSS $rss kB (107824 kB before the read-ahead)"
+# --drop: the read-ahead never waits. A writer at 4 times real time, with the session slowed to 5 ms a block
+# (ONAIR_RX_TEST_BLOCK_DELAY_US, a test knob, so that the queue fills), is never held up 0.2 s; the blocks that find the
+# queue full are dropped (whole blocks, and the short last one) and said on stderr, and t_sample stays a block's index on
+# the input
+python3 -I - "$bin" "$d/gsmr.iq" "$gr_hz" <<'EOF' || fail "gsmr --drop, a writer at 4 times real time"
+import json, os, re, subprocess, sys, threading, time
+binary, iq, hz = sys.argv[1:4]
+rate, chunk = 4 * 2000000.0, 16384 * 8
+data = open(iq, "rb").read()
+env = dict(os.environ, ONAIR_RX_TEST_BLOCK_DELAY_US="5000")
+p = subprocess.Popen([binary, "--format", "cf32", "--mode", "gsmr", "--rate", "2000000", "--freq", hz, "--drop"],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+got = {}
+ths = [threading.Thread(target=lambda k=k, f=f: got.__setitem__(k, f.read())) for k, f in (("out", p.stdout), ("err", p.stderr))]
+for th in ths: th.start()
+t0, worst = time.monotonic(), 0.0
+for i in range(0, len(data), chunk):
+    due = t0 + (i / 8) / rate
+    now = time.monotonic()
+    if now < due:
+        time.sleep(due - now)
+    w = time.monotonic()
+    p.stdin.write(data[i:i + chunk]); p.stdin.flush()
+    worst = max(worst, time.monotonic() - w)
+p.stdin.close()
+for th in ths: th.join(60)
+p.wait(60)
+err = got["err"].decode(errors="replace")
+assert p.returncode == 0, f"exit {p.returncode}: {err}"
+g = re.search(r"onair-rx: gsmr: (\d+) samples dropped", err)
+assert g and int(g.group(1)) > 0, \
+    f"no dropped line ({time.monotonic() - t0:.2f} s, writes up to {worst:.3f} s): {err}"
+nsamp = len(data) // 8
+for l in got["out"].splitlines():
+    t = json.loads(l)["t_sample"]
+    assert t % 16384 == 0 and 0 <= t < nsamp, f"t_sample {t}"
+print(f"stall: gsmr --drop at 4 times real time: the writer held up at most {worst * 1000:.1f} ms by a write; "
+      f"{g.group(1)} samples dropped")
+assert worst < 0.2, f"a write held the writer up {worst:.3f} s"
+EOF
+
 # --- noise alone: 8 s (Wi-Fi: 2 s) of /dev/urandom as cs16 gives no line and exit 0
 for row in "zigbee 4000000 $zb_hz 8" "thread 4000000 $zb_hz 8" "zwave 2000000 $zw_hz 8" "wifi 20000000 $wf_hz 2" \
   "wisun 2000000 $ws_hz 8" "tetra 2000000 $te_hz 8" "gsmr 2000000 $gr_hz 8"; do

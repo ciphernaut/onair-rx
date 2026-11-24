@@ -10,9 +10,11 @@
 #include "hub_tap.h"
 #include "dect2/wirecap/wire.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -23,16 +25,18 @@ namespace wire = dect2::wire;
 
 namespace {
 
-// stdin read ahead on a thread of its own into a bounded queue: while a session waits for its receiver's worker (tetra,
-// gsmr), stdin is still drained, so a writer feeding at real time is not held up for the decoding. The queue holds
-// kReadAheadSec of input at the rate (at least two blocks); when it is full the reader waits, so the writer is held up then
-// (back-pressure, as without the thread) and no sample is ever dropped, with --drop too (there the receiver skips, as it
-// does live, and the session does not wait, so the queue does not fill). The samples come out in the order they were read;
-// EOF and a read error (IqInput::error(), read by the caller once the run is over) end them.
-constexpr double kReadAheadSec = 4;
+// stdin read ahead on a thread of its own into a bounded queue of whole blocks: while a session waits for its receiver's
+// worker (tetra, gsmr), stdin is still drained, so a writer feeding at real time is not held up for the decoding. The reader
+// gathers what stdin delivers into blocks of kPollBlock (the last may be short), however small its reads, so the queue holds
+// whole blocks and the read loop takes them as they are. The queue holds `blocks` of them (the mode's readAheadSec; two
+// blocks for a mode whose session does not wait); when it is full the reader waits, so the writer is held up then
+// (back-pressure, as without the thread) and no sample is dropped. Under --drop it never waits: a block that finds the
+// queue full is dropped and counted, and the block after it says how many samples went before it, so that the sample count
+// (t_sample) stays the index on the input. EOF and a read error (IqInput::error(), read by the caller once the run is
+// over) end the blocks.
 class ReadAhead {
 public:
-    ReadAhead(IqInput& in, size_t capacity) : in_(in), cap_(capacity), th_([this] { run(); }) {}
+    ReadAhead(IqInput& in, size_t blocks, bool drop) : in_(in), cap_(std::max<size_t>(1, blocks)), drop_(drop), th_([this] { run(); }) {}
     ~ReadAhead() {   // the run reads to EOF, so the reader has ended; it is only told to stop should it still wait for room
         { std::lock_guard<std::mutex> lk(mu_); stop_ = true; }
         cv_.notify_all();
@@ -40,45 +44,81 @@ public:
     }
     ReadAhead(const ReadAhead&) = delete;
     ReadAhead& operator=(const ReadAhead&) = delete;
-    // The next samples, at most n, into x, as soon as any are there; 0 at the end of input
-    size_t read(cf32* x, size_t n) {
+    // The next block into out, and in dropped the samples dropped before it; false at the end of input (dropped: those
+    // dropped after the last block)
+    bool next(std::vector<cf32>& out, uint64_t& dropped) {
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [this] { return !q_.empty() || eof_; });
-        if (q_.empty()) return 0;
-        const std::vector<cf32>& c = q_.front();
-        const size_t k = std::min(n, c.size() - at_);
-        std::copy(c.begin() + (long)at_, c.begin() + (long)(at_ + k), x);
-        at_ += k;
-        queued_ -= k;
-        if (at_ == c.size()) { q_.pop_front(); at_ = 0; }
+        if (q_.empty()) { dropped = droppedSince_; droppedSince_ = 0; return false; }
+        out.swap(q_.front().samples);
+        dropped = q_.front().droppedBefore;
+        q_.pop_front();
         cv_.notify_all();
-        return k;
+        return true;
     }
+    uint64_t dropped() const { std::lock_guard<std::mutex> lk(mu_); return droppedTotal_; }   // all samples dropped so far
 
 private:
+    struct Block {
+        std::vector<cf32> samples;
+        uint64_t droppedBefore;   // samples dropped between the block before it and this one
+    };
     void run() {
-        std::vector<cf32> buf(kPollBlock);
+        std::vector<cf32> block(kPollBlock), part;
+        size_t have = 0;
         for (;;) {
-            const size_t n = in_.read(buf);   // outside the lock: what stdin has, up to a block
-            std::unique_lock<std::mutex> lk(mu_);
-            if (n == 0) { eof_ = true; cv_.notify_all(); return; }
-            cv_.wait(lk, [&] { return stop_ || queued_ == 0 || queued_ + n <= cap_; });
-            if (stop_) return;
-            q_.emplace_back(buf.begin(), buf.begin() + (long)n);
-            queued_ += n;
-            cv_.notify_all();
+            part.resize(kPollBlock - have);
+            const size_t n = in_.read(part);   // outside the lock: what stdin has, up to the rest of the block
+            std::copy(part.begin(), part.begin() + (long)n, block.begin() + (long)have);
+            have += n;
+            if (n > 0 && have < kPollBlock) continue;
+            if (have > 0) {   // a whole block, or the last one
+                block.resize(have);
+                if (!put(block)) return;
+                block.assign(kPollBlock, cf32());
+                have = 0;
+            }
+            if (n == 0) {
+                std::lock_guard<std::mutex> lk(mu_);
+                eof_ = true;
+                cv_.notify_all();
+                return;
+            }
         }
     }
+    bool put(std::vector<cf32>& block) {   // false: told to stop
+        std::unique_lock<std::mutex> lk(mu_);
+        if (drop_ && q_.size() >= cap_) {
+            droppedSince_ += block.size();
+            droppedTotal_ += block.size();
+            return true;
+        }
+        cv_.wait(lk, [&] { return stop_ || q_.size() < cap_; });
+        if (stop_) return false;
+        q_.push_back({std::move(block), droppedSince_});
+        droppedSince_ = 0;
+        cv_.notify_all();
+        return true;
+    }
     IqInput& in_;
-    const size_t cap_;
-    std::mutex mu_;
+    const size_t cap_;     // blocks
+    const bool drop_;
+    mutable std::mutex mu_;
     std::condition_variable cv_;
-    std::deque<std::vector<cf32>> q_;
-    size_t at_ = 0;        // samples of q_.front() already taken
-    size_t queued_ = 0;    // samples in q_ not yet taken
+    std::deque<Block> q_;
+    uint64_t droppedSince_ = 0, droppedTotal_ = 0;
     bool eof_ = false, stop_ = false;
     std::thread th_;       // last: it starts once the rest is made
 };
+
+// The read-ahead's blocks for a mode: two, or the mode's readAheadSec at the rate when its session waits for its receiver (and
+// not under --drop, where it does not); never more than kReadAheadMaxBytes, whatever the rate
+constexpr size_t kReadAheadMaxBytes = (size_t)256 << 20;
+size_t readAheadBlocks(const PollMode& m, const Options& o) {
+    size_t blocks = 2;
+    if (m.readAheadSec > 0 && !o.drop) blocks = std::max(blocks, (size_t)std::ceil(m.readAheadSec * o.rate / (double)kPollBlock));
+    return std::min(blocks, kReadAheadMaxBytes / (kPollBlock * sizeof(cf32)));
+}
 
 } // namespace
 
@@ -90,9 +130,10 @@ const PollMode kPollModes[] = {
     {"dvbt", "dvbt.status", kStatusPollSec, openDvbt},   // a status line on a change and at least every 2 s (poll_tv.cpp)
     {"video", "video.status", kStatusPollSec, openVideo},
     // a cell line when a cell is first read and when it changes (poll_cell.cpp); the receivers decode a stretch of 2.3 s and of
-    // 2.2 s at a time, so the poll interval only bounds how long after a stretch its lines come
-    {"tetra", "tetra.cell", 0.25, openTetra, wire::Tetra, true},
-    {"gsmr", "gsmr.cell", 0.25, openGsmr, wire::GsmR, true},
+    // 2.2 s at a time, so the poll interval only bounds how long after a stretch its lines come. Their sessions wait for the
+    // decoding of a stretch, so stdin is read ahead by two stretches (TetraReceiver::kCaptureSec, gsmr_rx.cpp's kBlockSec)
+    {"tetra", "tetra.cell", 0.25, openTetra, wire::Tetra, true, 2 * 2.3},
+    {"gsmr", "gsmr.cell", 0.25, openGsmr, wire::GsmR, true, 2 * 2.2},
 };
 const size_t kPollModeCount = sizeof kPollModes / sizeof kPollModes[0];
 
@@ -141,30 +182,28 @@ int runPolled(const PollMode& m, const Options& o, IqInput& in, Output& out) {
     };
 
     // Every block is a whole 16384 samples (only the last may be short), however the input arrives: a read of a pipe returns
-    // what happens to be there, and the read-ahead hands on what it has. So the blocks, every t_sample and where each poll
-    // lands depend on the input alone, and a replay gives the same lines as a live run. The polls are at the multiples of the interval from sample 0, each after the
-    // block that reaches one, so they do not drift.
-    constexpr size_t kBlock = kPollBlock;
+    // what happens to be there, and the read-ahead gathers it into blocks. So the blocks, every t_sample and where each poll
+    // lands depend on the input alone, and a replay gives the same lines as a live run. The polls are at the multiples of the
+    // interval from sample 0, each after the block that reaches one, so they do not drift. Samples the read-ahead dropped
+    // (--drop) count as input: the next block starts after them.
     const uint64_t every = (uint64_t)std::llround(m.pollSec * o.rate);   // 0: every block
-    uint64_t fed = 0, first = 0, due = every;
-    ReadAhead ahead(in, std::max<size_t>(2 * kBlock, (size_t)std::ceil(kReadAheadSec * o.rate)));
-    std::vector<cf32> iq(kBlock);
-    for (bool eof = false; !eof;) {
-        size_t have = 0;
-        while (have < kBlock) {
-            const size_t n = ahead.read(iq.data() + have, kBlock - have);
-            if (n == 0) { eof = true; break; }
-            have += n;
-        }
-        if (have == 0) break;
+    uint64_t fed = 0, first = 0, due = every, skipped = 0;
+    // a test's slow session (test/only.sh, --drop's read-ahead): this long a sleep after each block, in microseconds
+    const char* slow = getenv("ONAIR_RX_TEST_BLOCK_DELAY_US");
+    const long delayUs = slow ? atol(slow) : 0;
+    ReadAhead ahead(in, readAheadBlocks(m, o), o.drop);
+    std::vector<cf32> iq;
+    while (ahead.next(iq, skipped)) {
+        fed += skipped;
         first = fed;
-        s->feed(iq.data(), have);
-        fed += have;
+        s->feed(iq.data(), iq.size());
+        fed += iq.size();
         drain(first);
         if (fed >= due) {
             poll(false, first);
             if (every) due = (fed / every + 1) * every;
         }
+        if (delayUs > 0) std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
     }
     poll(true, first);   // what the last block completed, also when it ended short of the interval
     drain(first);        // and what the last poll waited for
@@ -172,6 +211,7 @@ int runPolled(const PollMode& m, const Options& o, IqInput& in, Output& out) {
     fprintf(stderr, "onair-rx: %s: %llu lines", m.name, (unsigned long long)lines);
     if (records) fprintf(stderr, ", %llu packets", (unsigned long long)sent);
     fprintf(stderr, "\n");
+    if (const uint64_t n = ahead.dropped()) fprintf(stderr, "onair-rx: %s: %llu samples dropped\n", m.name, (unsigned long long)n);
     return 0;
 }
 

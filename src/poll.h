@@ -33,6 +33,9 @@ struct PollMode {
     std::unique_ptr<PollSession> (*open)(const Options& o, std::string* err);
     int chan = -1;            // a dect2::wire::Chan, or -1: no packets (--pcap-port is refused)
     bool needsFreq = false;   // the receiver is told the radio frequency of the input: --freq is required
+    // seconds of stdin read ahead (runPolled's read-ahead thread), at least the longest wait of a session that waits for its
+    // receiver; 0: two blocks, for a session that never waits. Two blocks under --drop, and never more than 256 MB
+    double readAheadSec = 0;
 };
 extern const PollMode kPollModes[];
 extern const size_t kPollModeCount;
