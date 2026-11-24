@@ -15,9 +15,13 @@ Written: `patches/0001-wirecap-hub-sink.patch`, which `build.sh` applies to the 
   stream and for AIS.
 - **Test:** `tests/wirecap/test_wire_sink.cpp`, in OnAir's style. `test/patch.sh` compiles and runs it against the
   built libraries.
-- **Before it is offered:** the patch's `CMakeLists.txt` hunk has never been configured with `DECT2_BUILD_TESTS=ON`.
-  The test has only been compiled by hand by `test/patch.sh`. Build it once in OnAir's own test build, and fix the
-  hunk if that build needs it.
+- **Ready to offer (2026-11-24):** the branch `wirecap-hub-sink` on the operator's fork
+  (<https://github.com/ciphernaut/OnAir/tree/wirecap-hub-sink>) is this patch on OnAir 4.6.0. Built there in OnAir's own
+  test build (`DECT2_BUILD_TESTS=ON`, app off), `ctest -R wire_sink` passes. One change from the carried patch: 4.6.0
+  registers the Wireshark tests inside `if(DECT2_BUILD_APP)`, so a test beside `test_wirecap` is never built headless;
+  the branch registers `test_wire_sink` in the headless test block instead (it needs only `dect2core`). The carried
+  patch keeps its a63c3a8 placement, which `build.sh` and `test/patch.sh` use. Not yet a pull request: OnAir asks for a
+  DCO sign-off, which is the operator's to give.
 
 ## 2. Receivers passing sample time to `Hub::publish`
 
