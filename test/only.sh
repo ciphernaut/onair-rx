@@ -678,10 +678,11 @@ assert cl == zl, "the lines differ"
 print(f"ok: {m}: the input cut to exactly three stretches ({n} samples): the {cut} packets and the lines of it with zeros after")
 EOF
   # the reading of stdin never waits for the receiver: a writer at real time in blocks of 16384 samples is never held up
-  # by a write for 0.2 s or more, while every stretch is still decoded (the lines of the run from a file)
-  python3 -I - "$bin" "$d/$m.iq" "$m" "$hz" "$d/$m-1.jsonl" "$rate" <<'EOF' || fail "$m: a writer at real time is held up"
+  # by a write for 0.2 s or more, while every stretch is still decoded (the lines of the run from a file). A mode that decodes
+  # more slowly than real time (lte: CELLRUN_SLOW=1) holds the writer up whatever its read-ahead: only its lines are checked
+  python3 -I - "$bin" "$d/$m.iq" "$m" "$hz" "$d/$m-1.jsonl" "$rate" "${CELLRUN_SLOW:-0}" <<'EOF' ||
 import subprocess, sys, time
-binary, iq, m, hz, ref, rates = sys.argv[1:7]
+binary, iq, m, hz, ref, rates, slow = sys.argv[1:8]
 rate, chunk = float(rates), 16384 * 8
 data = open(iq, "rb").read()
 p = subprocess.Popen([binary, "--format", "cf32", "--mode", m, "--rate", rates, "--freq", hz],
@@ -702,9 +703,13 @@ p.stdin.close()
 th.join(60); p.wait(60)
 assert p.returncode == 0, f"exit {p.returncode}"
 assert got[0] == open(ref, "rb").read(), "the lines differ from the run from a file"
+if slow == "1":
+    print(f"stall: {m}: slower than real time, a writer at real time held up at most {worst * 1000:.1f} ms by a write; the lines of the run from a file")
+    sys.exit(0)
 print(f"stall: {m}: a writer at real time held up at most {worst * 1000:.1f} ms by a write")
 assert worst < 0.2, f"a write held the writer up {worst:.3f} s"
 EOF
+    fail "$m: a writer at real time is held up"
   # --drop: the receiver skips the input that comes while its worker is busy, as it does live; it runs and ends (its lines
   # depend on the worker's timing and are not compared)
   /usr/bin/time -f "%U %e" -o "$d/$m.cpu" "$bin" --format cf32 --mode "$m" --rate "$rate" --freq "$hz" --drop \
@@ -739,7 +744,7 @@ pcap gsmr 101 --mode gsmr --rate 2000000 --freq "$gr_hz" || fail "gsmr on the pc
 # more. The scene's cell sends SIB1 to SIB5 in each block, so its one line has the PCI, the MIB's bandwidth and SIB1's MCC,
 # MNC, TAC and cell identity, and the SIBs read. The short cut is 0.19 s, 95 % of a block: the receiver's search tracks the
 # cell over the whole block, so a block padded with more zeros loses it (0.17 s reads SIB2 no more, 0.16 s no cell; README)
-cellrun lte "$lte_hz" 0.2 "$lte_rate" $((lte_rate * 19 / 100))
+CELLRUN_SLOW=1 cellrun lte "$lte_hz" 0.2 "$lte_rate" $((lte_rate * 19 / 100))
 pcap lte 101 --mode lte --rate "$lte_rate" --freq "$lte_hz" || fail "lte on the pcap port"
 
 # --- DVB-S: a polled status mode. onair-gen plays OnAir's transmitter chain for 4 s carrying one UDP datagram over and over
@@ -884,6 +889,18 @@ rm -f "$d/dvbt10.iq"
 rss=$(cat "$d/rss")
 [ "$rss" -le $((32480 + 64 * 1024)) ] || fail "dvbt at 10 MHz from a file: peak RSS $rss kB, master's 32480 kB"
 echo "ok: dvbt at 10 MHz from a file: peak RSS $rss kB (master 9843b13: 32480 kB)"
+# and within 8 MB of 6ee1931's (33328 kB at most, plan 47 Task 4): onair-rx links no more of OnAir than its modes need (its
+# DVB-S receiver's rrcAt is the wrapper's own, src/rrc.cpp, so OnAir's signal generator and FFmpeg stay out)
+[ "$rss" -le $((33328 + 8 * 1024)) ] || fail "dvbt at 10 MHz from a file: peak RSS $rss kB, 6ee1931's 33328 kB"
+echo "ok: dvbt at 10 MHz from a file: within 8 MB of 6ee1931's 33328 kB"
+# onair-rx needs none of FFmpeg's libraries (onair-gen, which links OnAir's generators, does)
+if command -v ldd >/dev/null; then
+  ff=$(ldd "$bin" | grep -E 'libavformat|libavcodec|libavutil|libswscale|libswresample' || true)
+  [ -z "$ff" ] || fail "onair-rx links FFmpeg: $ff"
+  echo "ok: onair-rx needs no FFmpeg library (ldd)"
+else
+  echo "skip: no ldd, onair-rx's FFmpeg libraries not checked"
+fi
 /usr/bin/time -f %M -o "$d/rss" "$bin" --mode gsmr --rate 2000000 --freq "$gr_hz" <"$d/gsmr.iq" >/dev/null 2>"$d/gsmr-rss.err" ||
   fail "gsmr for its RSS: $(tail -n 3 "$d/gsmr-rss.err")"
 rss=$(cat "$d/rss")

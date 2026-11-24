@@ -119,8 +119,8 @@ Described only; not written here.
   that names the carriers to look at (a list of EARFCNs, or "the one at the dial frequency"), or the worker spread over
   the candidates, would let a job that knows its cell keep real time.
 - **Why:** `onair-rx`'s `lte` mode waits on `busy()` at each block's end, where it cuts the block, so that a replay skips
-  nothing; it cannot keep real time without `--drop` (README, `lte`), and its read-ahead of two decodes does not fit the
-  256 MB cap at 20 Msps.
+  nothing; it cannot keep real time without `--drop` (README, `lte`), and a decode is longer than its read-ahead of two
+  blocks (no read-ahead helps a receiver slower than its input).
 - **Test:** `tests/cell/test_cell_rx.cpp`'s scenes through `CellReceiver` with no pacing, and a 0.1 s input.
 
 ## 7. DVB-S: a bound on the symbol rate search, the GPU probe, and the generator in the receiver's link
@@ -136,9 +136,9 @@ Described only; not written here.
     lines; `onair-rx` sets `DECT2_NOGPU` to keep the GPU untouched. Asking only when the mode is GPU or auto would do.
   - `rrcAt` (the root raised cosine the receiver's matched filter uses, `dvbs_dsp.cpp`) is defined in `dvbs_gen.cpp`,
     the test signal generator, which also holds `demoTsSource`, the test programme's video encoder: a program linking
-    the receiver alone links the generator and FFmpeg (`libavcodec`, `libavformat`, `libavutil`, `libswscale`). Since
-    0.4.0 `onair-rx` needs FFmpeg's libraries at run time for every mode, and starts with about 16 MB more shared
-    library pages resident. Moving `rrcAt` into `dvbs_dsp.cpp` would end it.
+    the receiver alone would link the generator and FFmpeg (`libavcodec`, `libavformat`, `libavutil`, `libswscale`,
+    `libswresample`) and start about 20 MB larger. The wrapper defines `rrcAt` itself (`src/rrc.cpp`, OnAir's body), so
+    the generator stays out of its link; moving `rrcAt` into `dvbs_dsp.cpp` upstream would remove that.
 - **Already there, no change needed:** `setBlocking(true)` and `flush()` give a replay its deterministic output, and MPE
   and ULE work by handing the receiver's transport stream back through `feedTs` from its packet callback, which runs
   outside the receiver's IP lock.

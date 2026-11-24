@@ -291,15 +291,15 @@ sample of the block it was drained after) stands to the frame on the air.
   its own into a queue of whole blocks (however small the reads), from which the blocks are taken, so that a session
   that waits for its receiver (`tetra`, `gsmr`, `lte`, `dvbs`) does not hold up the writer meanwhile. The queue is the
   mode's own (`PollMode::readAheadSec`), its longest waits on the build host for a mode whose session waits: two of its
-  receiver's stretches (`tetra` 4.6 s, `gsmr` 4.4 s: 70 MB at 2 MHz), two of its longest decodes (`lte`, 5.6 s: 206 MB at
-  4.6 MHz; at 20 MHz the cap holds 1.68 s, **less than one decode**, below), twice its longest hold and more (`dvbs`,
-  0.25 s: 20 MB at 10 MHz); two blocks for the others and under `--drop`; never more than 256 MB. When it is full the
+  receiver's stretches (`tetra` 4.6 s, `gsmr` 4.4 s: 70 MB at 2 MHz; `lte` 0.4 s: 15 MB at 4.6 MHz, 64 MB at 20 MHz,
+  **less than one of its decodes**, below), twice its longest hold and more (`dvbs`, 0.25 s: 20 MB at 10 MHz); two blocks
+  for the others and under `--drop`; never more than 256 MB. When it is full the
   reader waits, and the writer with it (back-pressure; no sample is dropped), except under `--drop`: a block that finds
   the queue full is dropped, the samples after it keep their index on the input (`t_sample`), and at the end stderr says
   `onair-rx: <mode>: <n> samples dropped` (only when some were). Peak RSS from a file: `dvbt` at 10 MHz 33 MB, as
-  before the queue; `gsmr` at 2 MHz 177 MB (108 MB without the queue); since 0.4.0 about 20 MB more for every mode, the
-  shared FFmpeg libraries the DVB-S receiver's link brings (`UPSTREAM.md`, 7): `dvbt` 53 MB, `gsmr` 197 MB; `lte` at
-  20 MHz 397 MB (the queue at its cap, 256 MB; 106 MB with `--drop`), `dvbs` at 10 MHz 107 MB.
+  before the queue; `gsmr` at 2 MHz 177 MB (108 MB without the queue); `lte` 61 MB at 4.6 MHz and 178 MB at 20 MHz
+  (106 MB with `--drop`); `dvbs` at 10 MHz 87 MB. onair-rx links none of OnAir's signal generators, so none of FFmpeg
+  (`src/rrc.cpp`, How it works).
   `ONAIR_RX_TEST_BLOCK_DELAY_US` (a test knob,
   `test/only.sh`) sleeps that long after each block, to make a session slower than its writer. An interval shorter than a
   block is a poll after every block: `dmr` at 48 kHz (0.25 s is 12000 samples) is polled every block, each 0.34 s
@@ -585,9 +585,10 @@ sample of the block it was drained after) stands to the frame on the air.
 
     **`lte` does not keep real time without `--drop` at any rate tested:** its one worker takes about 0.8 s per 0.2 s
     block at 4.6 MHz and 2.8 s at 20 MHz, whatever the cell's width (most of it the raster search `--freq` turns on,
-    `UPSTREAM.md`, 6). Its read-ahead (5.6 s, two of the longest decodes) holds two decodes up to about 6 MHz of input;
-    at 20 MHz the 256 MB cap holds 1.68 s, **less than one decode, so LTE's wait does not fit**, and a writer at real
-    time is held up once the queue is full whatever its size, since the decoding is slower than the input. With
+    `UPSTREAM.md`, 6). Its read-ahead is two of its 0.2 s blocks, as the other cell modes' is two of their stretches:
+    **LTE's wait does not fit it** (one decode is two to fourteen times as long), and no size would, since the decoding
+    is slower than the input: a writer at real time is held up once the queue is full, and a larger queue would only
+    put that off (up to the 256 MB cap, 1.68 s at 20 MHz, also less than one decode). With
     `--drop` it keeps real time and decodes the blocks its worker has time for: a cell that stays on the air is read
     within a few blocks, so live it is the way to run it; a replay faster than real time under `--drop` loses most of
     its input (ruling R10). The other three keep real time without `--drop`; `gsmr`'s run ends about a decode after its
@@ -800,6 +801,11 @@ followed by `+patched` (`onair-rx --version`: `OnAir a63c3a8+patched`).
   per-frame cost does not grow with the number of aircraft (about 5 us a frame on the test capture). The same
   frame's bytes become the pcap record.
 - `src/pcap_port.cpp`: the port, with OnAir's own pcap byte layout (`wire_format.h`).
+- `src/rrc.cpp`: OnAir's `dect2::dvbs::rrcAt`, the root raised cosine the DVB-S receiver's matched filter calls, defined
+  in the wrapper. OnAir defines it in its signal generator (`dvbs_gen.cpp`), whose test programme needs FFmpeg; with the
+  function here the linker never takes the generator out of `libdect2core.a`, so `onair-rx` needs none of FFmpeg's
+  libraries (`test/only.sh` checks with `ldd`) and starts at 9 MB. Should OnAir move `rrcAt` next to its caller, the link
+  fails with a duplicate symbol, and the file goes. `onair-gen` links OnAir's generators on purpose and not this file.
 
 ## Findings from the first spike (2026-11-20, OnAir a63c3a8, Ubuntu 24.04, g++ 13)
 

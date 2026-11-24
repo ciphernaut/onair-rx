@@ -135,10 +135,11 @@ const PollMode kPollModes[] = {
     // decoding of a stretch, so stdin is read ahead by two stretches (TetraReceiver::kCaptureSec, gsmr_rx.cpp's kBlockSec)
     {"tetra", "tetra.cell", 0.25, openTetra, wire::Tetra, true, 2 * 2.3},
     {"gsmr", "gsmr.cell", 0.25, openGsmr, wire::GsmR, true, 2 * 2.2},
-    // LTE decodes a block of 0.2 s at a time, but more slowly than it comes at every rate (on the build host 0.8 s for a block at
-    // 4.6 Msps, up to 2.8 s at 20 Msps): the read-ahead is two of the longest decodes, which the 256 MB cap cuts to 1.68 s
-    // at 20 Msps (README, "lte")
-    {"lte", "lte.cell", 0.25, openLte, wire::Lte, true, 2 * 2.8},
+    // LTE decodes a block of 0.2 s at a time (cell_rx.cpp's kBlockSec), so stdin is read ahead by two of them, as for the other
+    // cell modes. It decodes more slowly than the input comes at every rate (on the build host 0.8 s for a block at 4.6 Msps,
+    // 2.8 s at 20 Msps), so no read-ahead would keep a writer at real time from being held up without --drop: a larger one
+    // would only put the stall off (README, "lte")
+    {"lte", "lte.cell", 0.25, openLte, wire::Lte, true, 2 * 0.2},
     // a status line as dvbt's (poll_tv.cpp); the IP datagrams on the hub. Its session waits for the receiver's decoder threads
     // (the blocking switch) and, at each poll, for what is queued; with its search and frame hunt, which run in feed, that held
     // a block up to 111 ms on the build host (README, "dvbs"): stdin is read ahead by twice that and more
