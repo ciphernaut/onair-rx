@@ -28,7 +28,7 @@ namespace onair_rx {
 
 namespace wire = dect2::wire;
 
-static const char* kVersion = "0.3.0";
+static const char* kVersion = "0.4.0";
 
 // The modes with a run function of their own: each is one OnAir receiver. The modes read from OnAir's automation bus are
 // rows of the bus mode table (bus.cpp) instead, and the modes that poll their receiver's state rows of the polled mode table
@@ -45,10 +45,10 @@ struct OnlySome {
     bool (*given)(const Options& o);
 };
 static const OnlySome kOnlySome[] = {
-    {"width", "", [](const Options& o) { return o.width > 0; }},
+    {"width", "dvbs", [](const Options& o) { return o.width > 0; }},
     {"plan", "lorawan", [](const Options& o) { return !o.plan.empty(); }},
     {"region", "zwave wisun", [](const Options& o) { return !o.region.empty(); }},
-    {"drop", "wisun tetra gsmr", [](const Options& o) { return o.drop; }},
+    {"drop", "wisun tetra gsmr lte dvbs", [](const Options& o) { return o.drop; }},
 };
 static bool takes(const char* modes, const std::string& mode) {
     const std::string list = std::string(" ") + modes + " ";
@@ -106,9 +106,10 @@ static void usage(FILE* f) {
                "127.0.0.1:PORT; --bandwidth (dvbt: 8, 7, 6 or 5) fixes the channel width, which is otherwise found; --plan\n"
                "(lorawan) names the channel plan, which is otherwise the one with most channels in the input; --region (zwave)\n"
                "the Z-Wave region, which is otherwise the one with most channels in the input, and (wisun) the Wi-SUN band\n"
-               "plan, which is otherwise the one for --freq; --drop (wisun, tetra, gsmr) lets the receiver drop what its\n"
-               "decoder has no time for (wisun: bursts; tetra, gsmr: the input while a stretch is decoded), as it does live,\n"
-               "instead of waiting for it. --width is taken by no mode yet. Modes:");
+               "plan, which is otherwise the one for --freq; --drop (wisun, tetra, gsmr, lte, dvbs) lets the receiver drop\n"
+               "what its decoder has no time for (wisun: bursts; tetra, gsmr, lte: the input while a stretch is decoded; dvbs:\n"
+               "frames), as it does live, instead of waiting for it; --width (dvbs) is the band the carrier is in, around\n"
+               "0 Hz. Modes:");
     for (const Mode& m : kModes) fprintf(f, " %s", m.name);
     for (size_t i = 0; i < kBusModeCount; i++) fprintf(f, " %s", kBusModes[i].name);
     for (size_t i = 0; i < kPollModeCount; i++) fprintf(f, " %s", kPollModes[i].name);

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 #
-# End-to-end check of the modes only OnAir decodes (so far ble, lorawan, zigbee, thread, zwave, wifi, wisun, tetra and gsmr) on OnAir's own
+# End-to-end check of the modes only OnAir decodes (ble, lorawan, zigbee, thread, zwave, wifi, wisun, tetra, gsmr, lte and dvbs) on OnAir's own
 # test signals: _build/onair-gen makes the scene of OnAir's generator for the mode (makeBleSynth, makeLorawanSynth,
 # makeZigbeeSynth, the frames of OnAir's Thread test, makeZwaveSynth, makeWifiSynth, makeWisunSynth) with a second of noise either
 # side (Wi-Fi: a tenth of a second, at 20 Msps), onair-rx decodes it. Wi-SUN, whose frames come out of a decoder thread, is also
@@ -16,6 +16,11 @@
 # cell with the scene's identity and no second one, the same bytes from two runs, on one CPU and through a pipe, --drop runs
 # and ends, 1.5 s of input (under one stretch, padded at its end) gives the cells, a writer at real time is never held up
 # 0.2 s, input of exactly three stretches skips nothing, their GSMTAP packets, --freq missing, a rate too low, and noise alone.
+# LTE (a polled cell mode as well, decoded 0.2 s at a time; makeCellSynth's 5 MHz cell at 4.6 Msps, the lowest rate whose
+# input holds the cell) the same way, with 0.19 s of input for the short cut. DVB-S (a polled status mode; OnAir's transmitter
+# chain carrying one known UDP datagram in GSE, in MPE and in ULE): a status line at first lock or 2 s, then on a change and at
+# least every 2 s, the datagrams counted and on the pcap port byte for byte, --width bounding the carrier the receiver takes,
+# the same bytes from runs on one CPU, through a pipe and from a writer at real time, a cut input, --drop, and noise alone.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -56,6 +61,15 @@ for row in "tetra $te_hz" "gsmr $gr_hz"; do
   [ ! -s "$d/$m.empty" ] || fail "$m: a line on empty input"
 done
 echo "ok: onair-rx has tetra and gsmr"
+lte_hz=1815000000    # the 5 MHz cell of OnAir's LTE scene 1 (cell_gen.cpp: band 3, EARFCN 1300)
+lte_rate=4600000     # the lowest rate of 100 kHz steps whose input holds that cell's 4.5 MHz (4.4 Msps reads its MIB, not SIB1)
+"$bin" --mode lte --rate "$lte_rate" --freq "$lte_hz" </dev/null >"$d/lte.empty" 2>"$d/lte.empty.err" ||
+  fail "lte: $(cat "$d/lte.empty.err")"
+[ ! -s "$d/lte.empty" ] || fail "lte: a line on empty input"
+"$bin" --mode dvbs --rate 10000000 --width 8000000 </dev/null >"$d/dvbs.empty" 2>"$d/dvbs.empty.err" ||
+  fail "dvbs: $(cat "$d/dvbs.empty.err")"
+[ ! -s "$d/dvbs.empty" ] || fail "dvbs: a line on empty input"
+echo "ok: onair-rx has lte and dvbs"
 
 # --- refuses <stderr> <onair-rx args...>: exit 2 with exactly that one line on stderr, before reading any input (stdin stays
 # open and is never written), and nothing on stdout
@@ -114,28 +128,33 @@ refuses "onair-rx: 100000 Hz is too low for tetra (at least 200000 Hz)" --mode t
   fail "tetra at 100 kHz"
 refuses "onair-rx: 500000 Hz is too low for gsmr (at least 1000000 Hz)" --mode gsmr --rate 500000 --freq "$gr_hz" ||
   fail "gsmr at 500 kHz"
+refuses "onair-rx: lte needs --freq HZ" --mode lte --rate "$lte_rate" || fail "lte without --freq"
+refuses "onair-rx: 1000000 Hz is too low for lte (at least 1920000 Hz)" --mode lte --rate 1000000 --freq "$lte_hz" ||
+  fail "lte at 1 MHz"
+refuses "onair-rx: 1000000 Hz is too low for dvbs (at least 2000000 Hz)" --mode dvbs --rate 1000000 || fail "dvbs at 1 MHz"
 
 # --- the options a mode does not take: every mode before this plan refuses all four; ble, zigbee, thread and wifi all four;
-# lorawan all but --plan; zwave all but --region; wisun --width and --plan; tetra and gsmr --width, --plan and --region.
-# Each mode gets the rate and the --freq it needs, so that the option is the only thing wrong
+# lorawan all but --plan; zwave all but --region; wisun --width and --plan; tetra, gsmr and lte --width, --plan and
+# --region; dvbs --plan and --region. Each mode gets the rate and the --freq it needs, so that the option is the only thing wrong
 for row in "adsb 2400000" "pocsag 1000000" "flex 1000000" "acars 1000000 131525000" "aprs 240000" "ais 250000 162000000" \
   "vdl2 250000 136975000" "hfdl 24000 8927000" "rs41 2000000" "dfm 2000000" "m20 2000000" "rds 500000" "dmr 48000" \
   "p25 250000" "m17 250000" "dvbt 10000000" "video 8000000" "ble 4000000" "lorawan 2000000 $lora_hz" \
   "zigbee 4000000 $zb_hz" "thread 4000000 $zb_hz" "zwave 2000000 $zw_hz" "wifi 20000000 $wf_hz" "wisun 2000000 $ws_hz" \
-  "tetra 2000000 $te_hz" "gsmr 2000000 $gr_hz"; do
+  "tetra 2000000 $te_hz" "gsmr 2000000 $gr_hz" "lte $lte_rate $lte_hz" "dvbs 10000000"; do
   read -r m rate hz <<<"$row"
   f=(--mode "$m" --rate "$rate")
   [ -z "${hz:-}" ] || f+=(--freq "$hz")
   for opt in "width 2000000" "plan EU868" "region EU" "drop"; do
     read -r o v <<<"$opt"
-    case "$m/$o" in lorawan/plan | zwave/region | wisun/region | wisun/drop | tetra/drop | gsmr/drop) continue ;; esac
+    case "$m/$o" in lorawan/plan | zwave/region | wisun/region | wisun/drop | tetra/drop | gsmr/drop | lte/drop | dvbs/width | \
+      dvbs/drop) continue ;; esac
     a=(--"$o")
     [ -z "${v:-}" ] || a+=("$v")
     refuses "onair-rx: $m takes no --$o" "${f[@]}" "${a[@]}" >/dev/null || fail "$m with --$o"
   done
 done
 echo "ok: every mode refuses the options it does not take (lorawan takes --plan, zwave --region, wisun --region and --drop," \
-  "tetra and gsmr --drop)"
+  "tetra, gsmr and lte --drop, dvbs --width and --drop)"
 
 [ -x "$gen" ] || fail "no test signal generator at $gen (run ./build.sh)"
 
@@ -235,7 +254,7 @@ print("ok: --plan EU868 gives the lines of the plan found from --freq")' "$d/lor
 # of a run without the port. pcap <tag> <link type> <onair-rx args...>
 pcap() {
   python3 -I - "$bin" "$d/$1.iq" "$d/$1.jsonl" "$@" <<'EOF'
-import json, socket, struct, subprocess, sys, threading, time
+import json, re, socket, struct, subprocess, sys, threading, time
 binary, iq, plain, tag, link_want, args = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6:]
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
 p = subprocess.Popen([binary, "--format", "cf32", *args, "--pcap-port", str(port)],
@@ -286,9 +305,10 @@ elif tag == "wifi":               # a radiotap header (version 0, its length, th
 elif tag == "wisun":              # the MPDU without its FCS (link type 230), one per line: the line's len is the record's
     lens = [json.loads(l)["len"] for l in out.splitlines()]
     assert [len(r) for r in recs] == lens, f"records of {[len(r) for r in recs]} octets for lines of len {lens}"
-elif tag in ("tetra", "gsmr"):    # GSMTAP in IPv4 + UDP to port 4729, as OnAir's capture files have it: OnAir writes version 1
-    # with a header of 4 words (wire_format.cpp, makeGsmtap); TETRA's blocks are type 5 (TETRA I1), GSM-R's BCCH blocks type 1 (Um)
-    want_type = 5 if tag == "tetra" else 1
+elif tag in ("tetra", "gsmr", "lte"):   # GSMTAP in IPv4 + UDP to port 4729, as OnAir's capture files have it: OnAir writes
+    # version 1 with a header of 4 words (wire_format.cpp, makeGsmtap); TETRA's blocks are type 5 (TETRA I1), GSM-R's BCCH blocks
+    # type 1 (Um), LTE's system information type 13 (LTE RRC)
+    want_type = {"tetra": 5, "gsmr": 1, "lte": 13}[tag]
     for r in recs:
         assert r[0] >> 4 == 4 and r[9] == 17, "not IPv4 carrying UDP"
         ihl = (r[0] & 15) * 4
@@ -296,6 +316,13 @@ elif tag in ("tetra", "gsmr"):    # GSMTAP in IPv4 + UDP to port 4729, as OnAir'
         assert dport == 4729, f"UDP to port {dport}, not 4729"
         g = r[ihl + 8:]
         assert g[0] == 1 and g[1] == 4 and g[2] == want_type, f"GSMTAP version {g[0]}, header {g[1]} words, type {g[2]}"
+        if tag == "lte":   # BCCH-DL-SCH (sub-type 5) on the cell's EARFCN (scene 1: 1300)
+            assert g[12] == 5 and struct.unpack(">H", g[4:6])[0] == 1300, f"sub-type {g[12]}, EARFCN {struct.unpack('>H', g[4:6])[0]}"
+elif tag.startswith("dvbs"):   # whole IP datagrams as they are (link type RAW): each one the datagram the generator sent
+    want = bytes.fromhex(re.search(r"datagram ([0-9a-f]+)", open(iq[:-3] + ".gen").read()).group(1))
+    assert all(r == want for r in recs), f"a record that is not the datagram sent: {next(r for r in recs if r != want).hex()}"
+    n = json.loads(out.splitlines()[-1])["datagrams"]   # the datagrams so far at the last line, which may come before the end
+    assert n >= 1 and len(recs) >= n, f"{len(recs)} record(s), the last line counts {n} datagram(s)"
 elif tag == "ble":   # BLUETOOTH_LE_LL: the advertising access address 0x8E89BED6, little endian, then the PDU
 
     assert all(r[:4] == bytes.fromhex("d6be898e") for r in recs), "a record without the advertising access address"
@@ -568,6 +595,10 @@ log = open(genlog).read()
 want = []
 for hz, rest in re.findall(r"cell \d+ at (\d+) Hz: (.*)", log):
     w = {"freq_hz": int(hz)}
+    sibs = re.search(r"sibs ([0-9 ]+)", rest)   # lte: the SIB numbers the cell sends, ascending
+    if sibs:
+        w["sibs"] = [int(x) for x in sibs.group(1).split()]
+        rest = rest[:sibs.start()]
     for k, v in re.findall(r"([a-z_]+) ([0-9]+)", rest):
         w[k] = int(v)
     w["network_time"] = "network time" in rest
@@ -583,7 +614,9 @@ for n, o in enumerate(ls):
     # the first poll after the first stretch ends: the block that completes it, or the poll interval's (0.25 s) end after it
     assert first - 16384 < t <= first + 0.25 * rate, f"line {n}: at {t / rate:.3f} s, the first stretch ends at {stretch} s"
     assert all(v is not None for v in o.values()), f"line {n}: a null member"
-    assert all(type(v) in (int, str) for k, v in o.items() if k != "snr_db"), f"line {n}: a decimal number {o!r}"
+    assert all(type(v) in (int, str) for k, v in o.items() if k not in ("snr_db", "sibs")), f"line {n}: a decimal number {o!r}"
+    assert "sibs" not in o or (o["sibs"] and all(type(x) is int for x in o["sibs"]) and o["sibs"] == sorted(set(o["sibs"]))), \
+        f"line {n}: sibs {o.get('sibs')!r}"
     assert type(o.get("snr_db")) in (int, float) and 10 < o["snr_db"] < 40, f"line {n}: snr_db {o.get('snr_db')!r}"
 got = sorted(ls, key=lambda o: o["freq_hz"])
 for o, w in zip(got, sorted(want, key=lambda w: w["freq_hz"])):
@@ -596,24 +629,26 @@ print(f"ok: {len(ls)} {tag}.cell line(s), one per cell of the scene: " + "; ".jo
     ", ".join(f"{k} {v}" for k, v in o.items() if k not in ("event", "t_sample")) for o in got))
 EOF
 }
-# cellrun <tag> <freq> <stretch s>: the scene, its lines checked; two runs, a run on CPU 0 and one through a pipe give the
-# same bytes; the user CPU and the wall time per second of input, with and without --drop
+# cellrun <tag> <freq> <stretch s> [<rate> <cut samples>]: the scene at the rate (default 2 MHz), its lines checked; two runs, a
+# run on CPU 0 and one through a pipe give the same bytes; the user CPU and the wall time per second of input, with and without
+# --drop; the input cut to its first <cut samples> (default 3000000, 1.5 s at 2 MHz), shorter than a stretch
 cellrun() {
-  local m=$1 hz=$2 stretch=$3 secs
-  gen "$m" --mode "$m" --rate 2000000 --freq "$hz"
-  /usr/bin/time -f "%U %e" -o "$d/$m.cpu" "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" \
+  local m=$1 hz=$2 stretch=$3 rate=${4:-2000000} cut=${5:-3000000} secs cutsecs
+  gen "$m" --mode "$m" --rate "$rate" --freq "$hz"
+  /usr/bin/time -f "%U %e" -o "$d/$m.cpu" "$bin" --format cf32 --mode "$m" --rate "$rate" --freq "$hz" \
     <"$d/$m.iq" >"$d/$m.jsonl" 2>"$d/$m.err" || fail "$m: onair-rx exited $?: $(tail -n 3 "$d/$m.err")"
-  secs=$(python3 -I -c 'import sys; print(f"{int(sys.argv[1]) / 8 / 2e6:.2f}")' "$(stat -c %s "$d/$m.iq")")
+  secs=$(python3 -I -c 'import sys; print(f"{int(sys.argv[1]) / 8 / float(sys.argv[2]):.2f}")' "$(stat -c %s "$d/$m.iq")" "$rate")
+  cutsecs=$(python3 -I -c 'import sys; print(f"{int(sys.argv[1]) / float(sys.argv[2]):g}")' "$cut" "$rate")
   read -r user wall <"$d/$m.cpu"
-  echo "cpu: $m $user s user, $wall s wall over $secs s of input at 2000000 Hz"
-  cellcheck "$m" 2000000 "$stretch" || fail "$m"
+  echo "cpu: $m $user s user, $wall s wall over $secs s of input at $rate Hz"
+  cellcheck "$m" "$rate" "$stretch" || fail "$m"
   cp "$d/$m.jsonl" "$d/$m-1.jsonl"
-  rx "$m" --mode "$m" --rate 2000000 --freq "$hz"
+  rx "$m" --mode "$m" --rate "$rate" --freq "$hz"
   cmp -s "$d/$m-1.jsonl" "$d/$m.jsonl" || fail "$m: a second run gives other bytes"
-  taskset -c 0 "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" <"$d/$m.iq" >"$d/$m-cpu.jsonl" 2>"$d/$m-cpu.err" ||
+  taskset -c 0 "$bin" --format cf32 --mode "$m" --rate "$rate" --freq "$hz" <"$d/$m.iq" >"$d/$m-cpu.jsonl" 2>"$d/$m-cpu.err" ||
     fail "$m on CPU 0: $(tail -n 3 "$d/$m-cpu.err")"
   cmp -s "$d/$m-1.jsonl" "$d/$m-cpu.jsonl" || fail "$m on CPU 0 gives other bytes"
-  cat "$d/$m.iq" | "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" >"$d/$m-pipe.jsonl" 2>"$d/$m-pipe.err" ||
+  cat "$d/$m.iq" | "$bin" --format cf32 --mode "$m" --rate "$rate" --freq "$hz" >"$d/$m-pipe.jsonl" 2>"$d/$m-pipe.err" ||
     fail "$m through a pipe: $(tail -n 3 "$d/$m-pipe.err")"
   cmp -s "$d/$m-1.jsonl" "$d/$m-pipe.jsonl" || fail "$m through a pipe gives other bytes"
   echo "ok: $m: two runs, a run on CPU 0 and one through a pipe give the same bytes"
@@ -622,34 +657,34 @@ cellrun() {
   # decodes (no carrier, no packet). A receiver that skipped input at a stretch's end would hold the third stretch
   # incomplete at the end of the exact cut, whose end then pads nothing, while the zeros complete it. The packets are counted
   # with a pcap port no client connects to (stderr's "<n> packets")
-  python3 -I - "$bin" "$d/$m.iq" "$m" "$hz" "$stretch" <<'EOF' || fail "$m on exactly three stretches"
+  python3 -I - "$bin" "$d/$m.iq" "$m" "$hz" "$stretch" "$rate" <<'EOF' || fail "$m on exactly three stretches"
 import re, socket, subprocess, sys
-binary, iq, m, hz, stretch = sys.argv[1:6]
-n = int(2000000.0 * float(stretch)) * 3   # the receiver's own expression of a stretch (configure()), three times
+binary, iq, m, hz, stretch, rate = sys.argv[1:7]
+n = int(float(rate) * float(stretch)) * 3   # the receiver's own expression of a stretch (configure()), three times
 data = open(iq, "rb").read()
 assert len(data) // 8 > n, "the input is not longer than three stretches"
 def run(raw):
     s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
-    p = subprocess.run([binary, "--format", "cf32", "--mode", m, "--rate", "2000000", "--freq", hz, "--pcap-port", str(port)],
+    p = subprocess.run([binary, "--format", "cf32", "--mode", m, "--rate", rate, "--freq", hz, "--pcap-port", str(port)],
                        input=raw, capture_output=True, timeout=120)
     assert p.returncode == 0, f"exit {p.returncode}: {p.stderr.decode(errors='replace')}"
     g = re.search(rb": \d+ lines, (\d+) packets", p.stderr)
     assert g, f"no packet count: {p.stderr.decode(errors='replace')}"
     return int(g.group(1)), p.stdout
 cut, cl = run(data[:n * 8])
-zeros, zl = run(data[:n * 8] + bytes(100000 * 8))
+zeros, zl = run(data[:n * 8] + bytes(int(0.05 * float(rate)) * 8))
 assert cut > 0 and cut == zeros, f"{cut} packets from exactly three stretches, {zeros} with 0.05 s of zeros after them"
 assert cl == zl, "the lines differ"
 print(f"ok: {m}: the input cut to exactly three stretches ({n} samples): the {cut} packets and the lines of it with zeros after")
 EOF
   # the reading of stdin never waits for the receiver: a writer at real time in blocks of 16384 samples is never held up
   # by a write for 0.2 s or more, while every stretch is still decoded (the lines of the run from a file)
-  python3 -I - "$bin" "$d/$m.iq" "$m" "$hz" "$d/$m-1.jsonl" <<'EOF' || fail "$m: a writer at real time is held up"
+  python3 -I - "$bin" "$d/$m.iq" "$m" "$hz" "$d/$m-1.jsonl" "$rate" <<'EOF' || fail "$m: a writer at real time is held up"
 import subprocess, sys, time
-binary, iq, m, hz, ref = sys.argv[1:6]
-rate, chunk = 2000000.0, 16384 * 8
+binary, iq, m, hz, ref, rates = sys.argv[1:7]
+rate, chunk = float(rates), 16384 * 8
 data = open(iq, "rb").read()
-p = subprocess.Popen([binary, "--format", "cf32", "--mode", m, "--rate", "2000000", "--freq", hz],
+p = subprocess.Popen([binary, "--format", "cf32", "--mode", m, "--rate", rates, "--freq", hz],
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 import threading
 got = []
@@ -672,34 +707,171 @@ assert worst < 0.2, f"a write held the writer up {worst:.3f} s"
 EOF
   # --drop: the receiver skips the input that comes while its worker is busy, as it does live; it runs and ends (its lines
   # depend on the worker's timing and are not compared)
-  /usr/bin/time -f "%U %e" -o "$d/$m.cpu" "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" --drop \
+  /usr/bin/time -f "%U %e" -o "$d/$m.cpu" "$bin" --format cf32 --mode "$m" --rate "$rate" --freq "$hz" --drop \
     <"$d/$m.iq" >"$d/$m-drop.jsonl" 2>"$d/$m-drop.err" || fail "$m --drop: onair-rx exited $?: $(tail -n 3 "$d/$m-drop.err")"
   read -r user wall <"$d/$m.cpu"
   echo "ok: $m --drop runs and ends: $(wc -l <"$d/$m-drop.jsonl") line(s); cpu $user s user, $wall s wall over $secs s of input"
-  # the input cut to 1.5 s, shorter than a stretch: the end of input pads it, so the receiver decodes it. Exit 0 within 8 s
-  # with and without --drop, and without it the scene's cells, each with what the run of the whole scene said of it
-  head -c $((3000000 * 8)) "$d/$m.iq" >"$d/$m-cut.iq"
+  # the input cut shorter than a stretch: the end of input pads it, so the receiver decodes it. Exit 0 within 8 s with and
+  # without --drop, and without it the scene's cells, each with what the run of the whole scene said of it
+  head -c $((cut * 8)) "$d/$m.iq" >"$d/$m-cut.iq"
   for extra in "" --drop; do
     st=0
     # shellcheck disable=SC2086
-    timeout 8 "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" $extra <"$d/$m-cut.iq" >"$d/$m-cut.jsonl" \
+    timeout 8 "$bin" --format cf32 --mode "$m" --rate "$rate" --freq "$hz" $extra <"$d/$m-cut.iq" >"$d/$m-cut.jsonl" \
       2>"$d/$m-cut.err" || st=$?
-    [ "$st" = 0 ] || fail "$m $extra on 1.5 s of input: exit $st (124: not within 8 s): $(tail -n 3 "$d/$m-cut.err")"
+    [ "$st" = 0 ] || fail "$m $extra on $cutsecs s of input: exit $st (124: not within 8 s): $(tail -n 3 "$d/$m-cut.err")"
   done
-  rx "$m-cut" --mode "$m" --rate 2000000 --freq "$hz"
+  rx "$m-cut" --mode "$m" --rate "$rate" --freq "$hz"
   python3 -I -c '
 import json, sys
 strip = lambda p: sorted(({k: v for k, v in json.loads(l).items() if k not in ("t_sample", "snr_db")} for l in open(p, "rb")),
                          key=lambda o: o["freq_hz"])
 a, b = strip(sys.argv[1]), strip(sys.argv[2])
-assert a and a == b, f"1.5 s gives {b!r}; the whole scene {a!r}"
-print(f"ok: {sys.argv[3]} on 1.5 s of input (shorter than a stretch), with and without --drop: exit 0 within 8 s; the {len(b)} cell line(s) of the scene")' \
-    "$d/$m-1.jsonl" "$d/$m-cut.jsonl" "$m" || fail "$m on 1.5 s of input"
+assert a and a == b, f"{sys.argv[4]} s gives {b!r}; the whole scene {a!r}"
+print(f"ok: {sys.argv[3]} on {sys.argv[4]} s of input (shorter than a stretch), with and without --drop: exit 0 within 8 s; the {len(b)} cell line(s) of the scene")' \
+    "$d/$m-1.jsonl" "$d/$m-cut.jsonl" "$m" "$cutsecs" || fail "$m on $cutsecs s of input"
 }
 cellrun tetra "$te_hz" 2.3
 pcap tetra 101 --mode tetra --rate 2000000 --freq "$te_hz" || fail "tetra on the pcap port"
 cellrun gsmr "$gr_hz" 2.2
 pcap gsmr 101 --mode gsmr --rate 2000000 --freq "$gr_hz" || fail "gsmr on the pcap port"
+# LTE: the 5 MHz cell of OnAir's scene 1 at the lowest rate that holds it, three of the receiver's 0.2 s blocks and 0.3 s
+# more. The scene's cell sends SIB1 to SIB5 in each block, so its one line has the PCI, the MIB's bandwidth and SIB1's MCC,
+# MNC, TAC and cell identity, and the SIBs read. The short cut is 0.19 s, 95 % of a block: the receiver's search tracks the
+# cell over the whole block, so a block padded with more zeros loses it (0.17 s reads SIB2 no more, 0.16 s no cell; README)
+cellrun lte "$lte_hz" 0.2 "$lte_rate" $((lte_rate * 19 / 100))
+pcap lte 101 --mode lte --rate "$lte_rate" --freq "$lte_hz" || fail "lte on the pcap port"
+
+# --- DVB-S: a polled status mode. onair-gen plays OnAir's transmitter chain for 4 s carrying one UDP datagram over and over
+# (gse: DVB-S2 QPSK 2/3, the datagram in a GSE packet of every BBFRAME; mpe: DVB-S QPSK 2/3, in MPE sections; ule: DVB-S2
+# QPSK 2/3 carrying a transport stream, in ULE SNDUs) and says its symbol rate and the datagram's bytes.
+# dvbscheck <tag> <rate> <standard | noise> [<samples>]: every line a dvbs.status with an integer t_sample that never goes
+# down, locked and datagrams (never going down) always, no null, no decimal number but snr_db; the first line at most 2 s of
+# samples in and
+# never more than 2 s between two lines; a locked line has the standard, the generator's symbol rate (to 1 ksym/s), the
+# modcod QPSK 2/3 and snr_db, and an unlocked one none of them; some locked line, and a line with at least one datagram.
+# noise: at least three lines, none locked, no datagram
+dvbscheck() {
+  python3 -I - "$d/$1.jsonl" "$d/$1.gen" "$2" "${4:-$(samples "$1")}" "$3" <<'EOF'
+import json, re, sys
+path, genlog, rate, nsamp, want = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+raw = open(path, "rb").read()
+assert raw.endswith(b"\n"), "the last line is not ended"
+ls = [json.loads(l) for l in raw.splitlines()]
+last, count = 0, 0
+for n, o in enumerate(ls):
+    assert o.get("event") == "dvbs.status", f"line {n}: event {o.get('event')!r}"
+    t = o.get("t_sample")
+    assert type(t) is int and 0 <= t < nsamp and t >= last, f"line {n}: t_sample {t!r} (of {nsamp}, after {last})"
+    assert t - last <= 2 * rate, f"line {n}: {(t - last) / rate:.3f} s after the line before (or the start)"
+    last = t
+    assert all(v is not None for v in o.values()), f"line {n}: a null member"
+    assert all(type(v) in (bool, int, str) for k, v in o.items() if k != "snr_db"), f"line {n}: a decimal number {o!r}"
+    assert type(o.get("locked")) is bool, f"line {n}: locked {o.get('locked')!r}"
+    assert type(o.get("datagrams")) is int and o["datagrams"] >= count, f"line {n}: datagrams {o.get('datagrams')!r} after {count}"
+    count = o["datagrams"]
+    signal = ("standard", "symbol_rate", "modcod", "snr_db")
+    if not o["locked"]:
+        assert not any(k in o for k in signal), f"line {n}: an unlocked line with {o!r}"
+        continue
+    assert o.get("standard") == want, f"line {n}: standard {o.get('standard')!r}, the generator sent {want}"
+    rs = int(re.search(r"at (\d+) symbol/s", open(genlog).read()).group(1))
+    assert type(o.get("symbol_rate")) is int and abs(o["symbol_rate"] - rs) <= 1000, f"line {n}: symbol_rate {o.get('symbol_rate')!r}, sent {rs}"
+    assert o.get("modcod") == "QPSK 2/3", f"line {n}: modcod {o.get('modcod')!r}"
+    assert type(o.get("snr_db")) in (int, float), f"line {n}: snr_db {o.get('snr_db')!r}"
+if want == "noise":
+    assert len(ls) >= 3 and not any(o["locked"] for o in ls) and count == 0, f"{len(ls)} line(s) on noise: {ls!r}"
+    print(f"ok: dvbs on {nsamp / rate:.0f} s of noise: {len(ls)} lines, none locked, no datagram, at most 2 s apart")
+    sys.exit(0)
+first = next((n for n, o in enumerate(ls) if o["locked"]), None)
+assert first is not None, f"no locked line: {ls!r}"
+assert any(o["datagrams"] >= 1 for o in ls[first:]), f"no datagram counted: {ls!r}"
+print(f"ok: {sys.argv[1].split('/')[-1]}: {len(ls)} dvbs.status line(s), the first locked at {ls[first]['t_sample'] / rate:.2f} s "
+      f"({', '.join(f'{k} {v}' for k, v in ls[first].items() if k not in ('event', 't_sample'))}); {count} datagram(s) by the last")
+EOF
+}
+dv_rate=10000000
+dv_width=8000000   # the job's band: the 5 Msym/s carrier's 6.75 MHz and room
+gen dvbs --mode dvbs --rate "$dv_rate"
+/usr/bin/time -f "%U %e" -o "$d/dvbs.cpu" "$bin" --format cf32 --mode dvbs --rate "$dv_rate" --width "$dv_width" <"$d/dvbs.iq" \
+  >"$d/dvbs.jsonl" 2>"$d/dvbs.err" || fail "dvbs: onair-rx exited $?: $(tail -n 3 "$d/dvbs.err")"
+read -r user wall <"$d/dvbs.cpu"
+echo "cpu: dvbs $user s user, $wall s wall over 4.00 s of input at $dv_rate Hz"
+dvbscheck dvbs "$dv_rate" dvbs2 || fail "dvbs"
+cp "$d/dvbs.jsonl" "$d/dvbs-1.jsonl"
+rx dvbs --mode dvbs --rate "$dv_rate" --width "$dv_width"
+cmp -s "$d/dvbs-1.jsonl" "$d/dvbs.jsonl" || fail "dvbs: a second run gives other bytes"
+taskset -c 0 "$bin" --format cf32 --mode dvbs --rate "$dv_rate" --width "$dv_width" <"$d/dvbs.iq" >"$d/dvbs-cpu.jsonl" \
+  2>"$d/dvbs-cpu.err" || fail "dvbs on CPU 0: $(tail -n 3 "$d/dvbs-cpu.err")"
+cmp -s "$d/dvbs-1.jsonl" "$d/dvbs-cpu.jsonl" || fail "dvbs on CPU 0 gives other bytes"
+cat "$d/dvbs.iq" | "$bin" --format cf32 --mode dvbs --rate "$dv_rate" --width "$dv_width" >"$d/dvbs-pipe.jsonl" \
+  2>"$d/dvbs-pipe.err" || fail "dvbs through a pipe: $(tail -n 3 "$d/dvbs-pipe.err")"
+cmp -s "$d/dvbs-1.jsonl" "$d/dvbs-pipe.jsonl" || fail "dvbs through a pipe gives other bytes"
+echo "ok: dvbs: two runs, a run on CPU 0 and one through a pipe give the same bytes"
+# a writer at real time in blocks of 16384 samples is never held up by a write for 0.2 s or more, and gets the lines of the
+# run from a file
+python3 -I - "$bin" "$d/dvbs.iq" "$dv_rate" "$dv_width" "$d/dvbs-1.jsonl" <<'EOF' || fail "dvbs: a writer at real time is held up"
+import subprocess, sys, threading, time
+binary, iq, rates, width, ref = sys.argv[1:6]
+rate, chunk = float(rates), 16384 * 8
+data = open(iq, "rb").read()
+p = subprocess.Popen([binary, "--format", "cf32", "--mode", "dvbs", "--rate", rates, "--width", width],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+got = []
+th = threading.Thread(target=lambda: got.append(p.stdout.read())); th.start()
+t0, worst = time.monotonic(), 0.0
+for i in range(0, len(data), chunk):
+    due = t0 + (i / 8) / rate
+    now = time.monotonic()
+    if now < due:
+        time.sleep(due - now)
+    w = time.monotonic()
+    p.stdin.write(data[i:i + chunk]); p.stdin.flush()
+    worst = max(worst, time.monotonic() - w)
+p.stdin.close()
+th.join(60); p.wait(60)
+assert p.returncode == 0, f"exit {p.returncode}"
+assert got[0] == open(ref, "rb").read(), "the lines differ from the run from a file"
+print(f"stall: dvbs: a writer at real time held up at most {worst * 1000:.1f} ms by a write")
+assert worst < 0.2, f"a write held the writer up {worst:.3f} s"
+EOF
+# --drop: the receiver drops what its decoder threads have no time for, as it does live; it runs and ends
+/usr/bin/time -f "%U %e" -o "$d/dvbs.cpu" "$bin" --format cf32 --mode dvbs --rate "$dv_rate" --width "$dv_width" --drop \
+  <"$d/dvbs.iq" >"$d/dvbs-drop.jsonl" 2>"$d/dvbs-drop.err" || fail "dvbs --drop: onair-rx exited $?: $(tail -n 3 "$d/dvbs-drop.err")"
+read -r user wall <"$d/dvbs.cpu"
+echo "ok: dvbs --drop runs and ends: $(wc -l <"$d/dvbs-drop.jsonl") line(s); cpu $user s user, $wall s wall over 4.00 s of input"
+# the input cut to 1 s: exit 0 within 8 s, a locked line and the datagrams of that second
+head -c $((dv_rate * 8)) "$d/dvbs.iq" >"$d/dvbs-cut.iq"
+cp "$d/dvbs.gen" "$d/dvbs-cut.gen"
+st=0
+timeout 8 "$bin" --format cf32 --mode dvbs --rate "$dv_rate" --width "$dv_width" <"$d/dvbs-cut.iq" >"$d/dvbs-cut.jsonl" \
+  2>"$d/dvbs-cut.err" || st=$?
+[ "$st" = 0 ] || fail "dvbs on 1 s of input: exit $st (124: not within 8 s): $(tail -n 3 "$d/dvbs-cut.err")"
+dvbscheck dvbs-cut "$dv_rate" dvbs2 || fail "dvbs on 1 s of input"
+# without --width, the receiver's own search finds the carrier too; a --width narrower than the carrier (3 MHz, for its
+# 6.75 MHz) leaves the receiver no carrier it can lock to
+cp "$d/dvbs.gen" "$d/dvbs-own.gen"
+"$bin" --format cf32 --mode dvbs --rate "$dv_rate" <"$d/dvbs.iq" >"$d/dvbs-own.jsonl" 2>"$d/dvbs-own.err" ||
+  fail "dvbs without --width: $(tail -n 3 "$d/dvbs-own.err")"
+ln -f "$d/dvbs.iq" "$d/dvbs-own.iq"
+dvbscheck dvbs-own "$dv_rate" dvbs2 || fail "dvbs without --width"
+"$bin" --format cf32 --mode dvbs --rate "$dv_rate" --width 3000000 <"$d/dvbs.iq" >"$d/dvbs-narrow.jsonl" 2>"$d/dvbs-narrow.err" ||
+  fail "dvbs --width 3000000: $(tail -n 3 "$d/dvbs-narrow.err")"
+python3 -I -c '
+import json, sys
+ls = [json.loads(l) for l in open(sys.argv[1], "rb")]
+assert ls and not any(o["locked"] for o in ls), f"--width 3000000 on a 6.75 MHz carrier: {ls!r}"
+print(f"ok: dvbs --width 3000000 on the 5 Msym/s carrier: {len(ls)} line(s), none locked")' "$d/dvbs-narrow.jsonl" ||
+  fail "dvbs with a --width narrower than the carrier"
+pcap dvbs 101 --mode dvbs --rate "$dv_rate" --width "$dv_width" || fail "dvbs on the pcap port"
+# MPE (DVB-S) and ULE (DVB-S2, a transport stream): the receiver's transport stream handed back to it (feedTs), at 4 Msps
+for e in mpe ule; do
+  gen "dvbs-$e" --mode dvbs --rate 4000000 --encap "$e"
+  rx "dvbs-$e" --mode dvbs --rate 4000000
+  dvbscheck "dvbs-$e" 4000000 "$([ "$e" = mpe ] && echo dvbs || echo dvbs2)" || fail "dvbs with $e"
+  pcap "dvbs-$e" 101 --mode dvbs --rate 4000000 || fail "dvbs with $e on the pcap port"
+done
+rm -f "$d"/dvbs*.iq
 
 # --- the polled path's read-ahead (src/poll.cpp, ReadAhead) is sized per mode. A mode whose session never waits (dvbt) keeps
 # its footprint from a file: its peak RSS within 64 MB of master 9843b13's build on the same run, 32480 kB (measured
@@ -758,9 +930,9 @@ print(f"stall: gsmr --drop at 4 times real time: the writer held up at most {wor
 assert worst < 0.2, f"a write held the writer up {worst:.3f} s"
 EOF
 
-# --- noise alone: 8 s (Wi-Fi: 2 s) of /dev/urandom as cs16 gives no line and exit 0
+# --- noise alone: 8 s (Wi-Fi: 2 s, LTE: 1 s) of /dev/urandom as cs16 gives no line and exit 0
 for row in "zigbee 4000000 $zb_hz 8" "thread 4000000 $zb_hz 8" "zwave 2000000 $zw_hz 8" "wifi 20000000 $wf_hz 2" \
-  "wisun 2000000 $ws_hz 8" "tetra 2000000 $te_hz 8" "gsmr 2000000 $gr_hz 8"; do
+  "wisun 2000000 $ws_hz 8" "tetra 2000000 $te_hz 8" "gsmr 2000000 $gr_hz 8" "lte $lte_rate $lte_hz 1"; do
   read -r m rate hz secs <<<"$row"
   head -c $((rate * secs * 4)) /dev/urandom >"$d/noise.cs16"
   /usr/bin/time -f %U -o "$d/noise.cpu" "$bin" --mode "$m" --rate "$rate" --freq "$hz" --format cs16 <"$d/noise.cs16" \
@@ -769,6 +941,10 @@ for row in "zigbee 4000000 $zb_hz 8" "thread 4000000 $zb_hz 8" "zwave 2000000 $z
   echo "ok: $m on $secs s of noise: no line, exit 0 ($(cat "$d/noise.cpu") s user over $secs s of input)"
 done
 rm -f "$d/noise.cs16"
+# dvbs on 6 s of noise, through a pipe: a status line at 2 s and at least every 2 s after, none locked
+head -c $((dv_rate * 6 * 4)) /dev/urandom | "$bin" --mode dvbs --rate "$dv_rate" --width "$dv_width" --format cs16 \
+  >"$d/dvbs-noise.jsonl" 2>"$d/dvbs-noise.err" || fail "dvbs on noise: onair-rx exited $?: $(tail -n 3 "$d/dvbs-noise.err")"
+dvbscheck dvbs-noise "$dv_rate" noise $((dv_rate * 6)) || fail "dvbs on noise"
 
 # --- onair-gen --sigmf: the pair (ci16_le) holds the signal of stdout, and onair-rx decodes it as cs16
 "$gen" --mode ble --rate 4000000 --sigmf "$d/ble-pair" >"$d/ble-pair.out" 2>"$d/ble-pair.gen" ||

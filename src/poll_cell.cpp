@@ -1,26 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// onair-rx: the cell modes tetra and gsmr. Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
+// onair-rx: the cell modes tetra, gsmr and lte. Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
 //
-// OnAir's TETRA and GSM-R receivers read what base stations broadcast in the clear to every terminal on their downlink: TETRA
-// the synchronisation burst (MCC, MNC, colour code), SYSINFO (location area) and the neighbour broadcast (neighbours, network
-// time); GSM-R the SCH (BSIC) and System Information 1 to 4 (location area, cell identity). Each keeps a table of the cells it
-// has heard in its snapshot. Each mode reads that table at every poll and hands what it says about each cell to a CellLog, which
-// writes a line when a cell is first read and when a member of it changes, keyed by its carrier: a cell that stays on the air
-// gives no line per poll.
+// OnAir's TETRA, GSM-R and LTE receivers read what base stations broadcast in the clear to every terminal on their downlink:
+// TETRA the synchronisation burst (MCC, MNC, colour code), SYSINFO (location area) and the neighbour broadcast (neighbours,
+// network time); GSM-R the SCH (BSIC) and System Information 1 to 4 (location area, cell identity); LTE the synchronisation
+// signals (physical cell id), the MIB (bandwidth) and the system information on SI-RNTI (SIB1: MCC, MNC, tracking area, cell
+// identity; the SIBs read). Each keeps a table of the cells it has heard in its snapshot. Each mode reads that table at every
+// poll and hands what it says about each cell to a CellLog, which writes a line when a cell is first read and when a member of
+// it changes, keyed by its carrier: a cell that stays on the air gives no line per poll.
 //
-// Both decode a stretch of input at a time on a worker thread of their own (TETRA 2.3 s, GSM-R 2.2 s) and skip the input that
-// comes while it is busy, as they do live. A replay faster than real time would then lose most of its input, and which part
-// would depend on the worker's timing. So, unless --drop, a session waits for the worker after each stretch it hands over, and
-// the receiver skips nothing: the stretches follow each other from sample 0, each decoded before the next sample is fed, so
-// every snapshot and every line depends on the input alone. GSM-R's receiver also drops the rest of the feed that completes a
-// stretch (gsmr_rx.cpp, feed): its session splits its blocks at the stretch's end. The receivers have no flush, so at the end
-// of input the session completes the last partial stretch with zeros, and the receiver decodes what it holds. The last poll
-// waits at most kFlushSec in all (--drop: first for a stretch still being decoded, then for the padded one), and the session's
-// end makes a stretch still being decoded give up at its next carrier.
+// All three decode a stretch of input at a time on a worker thread of their own (TETRA 2.3 s, GSM-R 2.2 s, LTE 0.2 s) and skip
+// the input that comes while it is busy, as they do live. A replay faster than real time would then lose most of its input, and
+// which part would depend on the worker's timing. So, unless --drop, a session waits for the worker after each stretch it hands
+// over, and the receiver skips nothing: the stretches follow each other from sample 0, each decoded before the next sample is
+// fed, so every snapshot and every line depends on the input alone. GSM-R's and LTE's receivers also drop the rest of the feed
+// that completes a stretch (gsmr_rx.cpp and cell_rx.cpp, feed): their sessions split their blocks at the stretch's end. The
+// receivers have no flush, so at the end of input the session completes the last partial stretch with zeros, and the receiver
+// decodes what it holds. The last poll waits at most kFlushSec in all (--drop: first for a stretch still being decoded, then
+// for the padded one), and the session's end makes a stretch still being decoded give up at its next carrier.
 //
-// Their frames (TETRA's signalling blocks, GSM-R's BCCH blocks) go to OnAir's Wireshark hub as GSMTAP, from the worker; runPolled
-// collects them under the hub tap's lock.
+// Their frames (TETRA's signalling blocks, GSM-R's BCCH blocks, LTE's system information messages) go to OnAir's Wireshark hub
+// as GSMTAP, from the worker; runPolled collects them under the hub tap's lock.
 #include "poll.h"
+#include "dect2/cell/cell_rx.h"
+#include "dect2/cell/cell_tel.h"
 #include "dect2/gsmr/gsmr_rx.h"
 #include "dect2/gsmr/gsmr_tel.h"
 #include "dect2/tetra/tetra_rx.h"
@@ -39,6 +42,7 @@ namespace {
 
 constexpr double kFlushSec = 5;           // the last poll waits at most this long, for a stretch being decoded and the padded one
 constexpr double kGsmrStretchSec = 2.2;   // GsmrReceiver's stretch (gsmr_rx.cpp, kBlockSec), which its header does not export
+constexpr double kLteStretchSec = 0.2;    // CellReceiver's block (cell_rx.cpp, kBlockSec), which its header does not export either
 
 bool tooLow(const char* mode, double rate, double least, std::string* err) {
     char b[160];
@@ -106,7 +110,7 @@ private:
         std::string compared;
         uint64_t seen;   // the see() that last had it
     };
-    static constexpr size_t kMax = 400;   // twice the receivers' own table (kTetraMax, kGsmrMax)
+    static constexpr size_t kMax = 400;   // twice TETRA's and GSM-R's own table (kTetraMax, kGsmrMax), LTE's (kCellMax)
     std::vector<Cell> cells_;
     double same_;
     uint64_t gen_ = 0;
@@ -148,6 +152,22 @@ protected:
             pad -= k;
         }
         waitIdle(rx_, &until);
+    }
+    // For a receiver that gathers a stretch only while its worker is idle and drops the rest of the feed that completes one
+    // (GSM-R, LTE): the block is cut at the stretch's end and the worker waited for there, so it is idle at every feed and
+    // nothing is skipped. Under --drop the block goes in whole, as live.
+    void feedCut(const cf32* x, size_t n) {
+        if (drop_) { rx_.feed(x, n); return; }
+        while (n > 0) {
+            const size_t take = std::min(n, want_ - fill_);
+            rx_.feed(x, take);
+            x += take;
+            n -= take;
+            fill_ += take;
+            if (fill_ < want_) continue;
+            fill_ = 0;
+            waitIdle(rx_);
+        }
     }
     virtual void cells(std::vector<CellSeen>& now) = 0;   // what the snapshot says about each cell
     // the SNR as the line has it: dB to a tenth, left out when the receiver has not measured it (-99)
@@ -221,21 +241,8 @@ public:
         want_ = (size_t)(o.rate * kGsmrStretchSec);   // the receiver's own expression (configure()), so the same number
         return true;
     }
-    // The receiver gathers a stretch only while its worker is idle, and drops the rest of the feed that completes one. So the
-    // block is cut at the stretch's end and the worker waited for there: it is idle at every feed, and nothing is skipped.
-    void feed(const cf32* x, size_t n) override {
-        if (drop_) { rx_.feed(x, n); return; }
-        while (n > 0) {
-            const size_t take = std::min(n, want_ - fill_);
-            rx_.feed(x, take);
-            x += take;
-            n -= take;
-            fill_ += take;
-            if (fill_ < want_) continue;
-            fill_ = 0;
-            waitIdle(rx_);
-        }
-    }
+    // The receiver gathers a stretch only while its worker is idle, and drops the rest of the feed that completes one
+    void feed(const cf32* x, size_t n) override { feedCut(x, n); }
 
 private:
     void cells(std::vector<CellSeen>& now) override {
@@ -257,6 +264,59 @@ private:
     }
 };
 
+// --- LTE: CellReceiver searching the input for LTE carriers, told the radio frequency (--freq) so that it also looks for a cell on
+// every 100 kHz raster point the input holds (carriers side by side make one block in the spectrum) and each cell has its
+// raster frequency
+class LteSession : public CellSession<CellReceiver, CellTelemetry> {
+public:
+    LteSession() : CellSession(60e3) {}   // cell_rx.cpp, merge(): the same PCI within 60 kHz of a known cell is that cell
+    bool open(const Options& o, std::string* err) {
+        rx_.configure(o.rate);
+        if (!rx_.ready()) return tooLow("lte", o.rate, cellTuning().minSampleRate, err);
+        rx_.setCenterHz(o.freq);
+        drop_ = o.drop;
+        want_ = (size_t)(o.rate * kLteStretchSec);   // configure()'s own expression
+        return true;
+    }
+    // The receiver gathers a block only while its worker is idle, and drops the rest of the feed that completes one
+    void feed(const cf32* x, size_t n) override { feedCut(x, n); }
+
+private:
+    // the channel bandwidth of the MIB's resource block count (36.101 table 5.6-1), 0 for a count no bandwidth has
+    static long long bandwidthHz(int nRb) {
+        switch (nRb) {
+        case 6: return 1400000;
+        case 15: return 3000000;
+        case 25: return 5000000;
+        case 50: return 10000000;
+        case 75: return 15000000;
+        case 100: return 20000000;
+        default: return 0;
+        }
+    }
+    void cells(std::vector<CellSeen>& now) override {
+        for (const CellTower& c : tel_.cells) {
+            Json j, k;
+            j.num("freq_hz", std::llround(c.freqHz));   // the raster frequency of the cell's carrier
+            for (Json* m : {&j, &k}) {
+                m->num("pci", (long long)c.pci);
+                if (c.hasMib && bandwidthHz(c.nRb)) m->num("bandwidth_hz", bandwidthHz(c.nRb));
+                if (c.hasSib1 && c.mcc >= 0) {
+                    m->num("mcc", (long long)c.mcc).num("mnc", (long long)c.mnc);
+                    m->num("tac", (long long)c.tac).num("cell_id", (long long)c.cellId);
+                }
+                if (!c.sibsSeen.empty()) {   // ascending (the receiver keeps them sorted)
+                    std::string a;
+                    for (int n : c.sibsSeen) a += (a.empty() ? "[" : ",") + std::to_string(n);
+                    m->raw("sibs", a + "]");
+                }
+            }
+            snrDb(j, c.sinrDb);
+            now.push_back({std::to_string(c.pci), c.freqHz, k.done(), std::move(j)});
+        }
+    }
+};
+
 template <class S>
 std::unique_ptr<PollSession> openCell(const Options& o, std::string* err) {
     auto s = std::make_unique<S>();
@@ -268,5 +328,6 @@ std::unique_ptr<PollSession> openCell(const Options& o, std::string* err) {
 
 std::unique_ptr<PollSession> openTetra(const Options& o, std::string* err) { return openCell<TetraSession>(o, err); }
 std::unique_ptr<PollSession> openGsmr(const Options& o, std::string* err) { return openCell<GsmrSession>(o, err); }
+std::unique_ptr<PollSession> openLte(const Options& o, std::string* err) { return openCell<LteSession>(o, err); }
 
 } // namespace onair_rx

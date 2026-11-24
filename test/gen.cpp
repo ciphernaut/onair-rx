@@ -11,6 +11,8 @@
 //   onair-gen --mode video --rate HZ [--deviation HZ]
 //   onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi|wisun --rate HZ [--freq HZ]
 //   onair-gen --mode tetra|gsmr --rate HZ [--freq HZ]
+//   onair-gen --mode lte --rate HZ [--freq HZ] [--scene 0|1|2|3]
+//   onair-gen --mode dvbs --rate HZ [--encap gse|mpe|ule]
 //   onair-gen ... --sigmf STEM        any of the above into STEM.sigmf-data (ci16_le) and STEM.sigmf-meta instead of stdout
 //   onair-gen --selftest ais-join     onair-rx's AIS sentence joiner (src/ais.cpp) on sentences made here; exit 1 on a failure
 //   onair-gen --selftest sonde-id     onair-rx's sonde id spelling (src/bus.h, sondeId) on serials as OnAir writes them
@@ -71,6 +73,17 @@
 // 968, BSIC 1-2 and 1-5, MCC 1, MNC 1, LAC 4711, cells 12001 and 12002) around --freq (default 923.0 MHz, the middle of the two,
 // so that 2 MHz holds both). The cells stay on their frequencies. stderr also says what each cell inside the part of the input
 // the receiver searches broadcasts, as onair-rx's line names it: "cell N at F Hz: mcc 1, mnc 1, ...".
+// LTE, the same way (three of the receiver's 0.2 s blocks and 0.3 s more, 25 dB in the carrier): the test cell of OnAir's scene
+// (makeCellSynth, cellTestCell; --scene, default 1: the 5 MHz cell, PCI 301, on band 3 at 1815 MHz; 0 the 10 MHz cell, PCI 123,
+// band 20 at 806 MHz; 2 the 1.4 MHz cell, PCI 7, band 8 at 930 MHz; 3 the 20 MHz cell, PCI 450, band 1 at 2140 MHz), the test
+// network 001-01 with SIB1 to SIB5, on its own frequency around --freq (default that frequency, the cell at 0 Hz); stderr says
+// the cell: "cell 1 at F Hz: pci 301, bandwidth_hz 5000000, mcc 1, mnc 1, tac ..., cell_id ..., sibs 1 2 3 4 5".
+// DVB-S, 4 s of OnAir's transmitter chain (DvbsSignal, its synthetic source's defaults: 5 Msym/s or less when the rate cannot
+// carry it, roll-off 0.35, code rate 2/3, its own noise) carrying one UDP datagram over and over, from 192.0.2.1:40000 to
+// 198.51.100.7:5004, "ZETA DVB-S IP TEST" (--encap: gse, the default, DVB-S2 QPSK with the datagram in a GSE packet of every
+// BBFRAME; mpe, DVB-S QPSK with it in MPE sections of a transport stream; ule, DVB-S2 QPSK with it in ULE SNDUs of a
+// transport stream), the carrier at 0 Hz (--freq, default 1.5 GHz, OnAir's own, only goes into a --sigmf pair); stderr says the
+// datagram's bytes ("datagram <hex>") after the signal's own line ("DVB-S2 QPSK 2/3 at R symbol/s, the datagram in GSE").
 // --sigmf STEM writes the output as a SigMF pair instead of stdout: STEM.sigmf-data, ci16_le (each value times 32768, rounded and
 // clipped), and STEM.sigmf-meta, its sample rate, the centre frequency (--freq, or the mode's default above; left out for a mode
 // with neither) and an annotation per message, in the shape of iq/adsb1090.sigmf-meta.
@@ -94,9 +107,15 @@
 #include "dect2/ais/ais_proto.h"
 #include "dect2/ble/ble_gen.h"
 #include "dect2/ble/ble_rx.h"
+#include "dect2/cell/cell_gen.h"
+#include "dect2/cell/cell_rx.h"
 #include "dect2/dmr/dmr_gen.h"
 #include "dect2/dsp/exact_resampler.h"
 #include "dect2/dsp/gen_util.h"
+#include "dect2/dvbs/dvbs_gen.h"
+#include "dect2/dvbs/dvbs_ip.h"
+#include "dect2/dvbs/dvbs_rx.h"
+#include "dect2/dvbs/dvbs_s2.h"
 #include "dect2/dvbt/dvbt_gen.h"
 #include "dect2/fm/fm_gen.h"
 #include "dect2/fpv/fpv_gen.h"
@@ -136,6 +155,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -159,6 +179,8 @@ int usage() {
                     "       onair-gen --mode video --rate HZ [--deviation HZ] > iq\n"
                     "       onair-gen --mode ble|lorawan|zigbee|thread|zwave|wifi|wisun --rate HZ [--freq HZ] > iq\n"
                     "       onair-gen --mode tetra|gsmr --rate HZ [--freq HZ] > iq\n"
+                    "       onair-gen --mode lte --rate HZ [--freq HZ] [--scene 0|1|2|3] > iq\n"
+                    "       onair-gen --mode dvbs --rate HZ [--encap gse|mpe|ule] > iq\n"
                     "       onair-gen ... --sigmf STEM     (STEM.sigmf-data, ci16_le, and STEM.sigmf-meta instead of stdout)\n"
                     "       onair-gen --selftest ais-join|sonde-id|json-utf8|calls\n");
     return 2;
@@ -745,6 +767,90 @@ std::vector<cf32> cellSignal(const std::string& mode, double rate, double freq, 
     return x;
 }
 
+// --- LTE: the test cell of one of OnAir's scenes (makeCellSynth, cellTestCell) as a continuous downlink with the generator's
+// own noise (kSnrDb inside the carrier): its PSS and SSS, the MIB and SIB1 to SIB5 on SI-RNTI, test network 001-01. The scene's
+// cell is at 0 Hz of the generator's output on its own frequency (kLteSceneEarfcn, cell_gen.cpp's table); the carrier offset
+// moves it to that frequency less freq, so that freq is at 0 Hz and the cell stays on its frequency. Made for kCellStretches of
+// the receiver's blocks (0.2 s) and kCellMoreSec more. cells: the cell, as onair-rx's line names it
+constexpr int kLteSceneEarfcn[4] = {6300, 1300, 3500, 300};   // scenes 0 to 3: 10 MHz on band 20, 5 MHz on 3, 1.4 MHz on 8, 20 MHz on 1
+constexpr double kLteBlockSec = 0.2;                          // CellReceiver's block (cell_rx.cpp, kBlockSec), not in its header
+double lteSceneHz(int scene) { return lteEarfcnToHz(kLteSceneEarfcn[scene]); }
+long long lteBandwidthHz(int nRb) {   // the channel bandwidth of a resource block count (36.101 table 5.6-1)
+    switch (nRb) {
+    case 6: return 1400000;
+    case 15: return 3000000;
+    case 25: return 5000000;
+    case 50: return 10000000;
+    case 75: return 15000000;
+    case 100: return 20000000;
+    default: return 0;
+    }
+}
+std::vector<cf32> lteSignal(double rate, double freq, int scene, std::vector<CellText>* cells) {
+    SynthConfig c;
+    c.snrDb = kSnrDb;
+    c.modeOpt[0] = scene;
+    c.cfoHz = lteSceneHz(scene) - freq;
+    auto s = makeCellSynth(c, rate);
+    if (!s) return {};
+    std::vector<cf32> x((size_t)std::llround((kCellStretches * kLteBlockSec + kCellMoreSec) * rate));
+    s->generate(x.data(), x.size());
+    CellTestTruth t;
+    cellTestCell(scene, &t);
+    char b[200];
+    snprintf(b, sizeof b, "pci %d, bandwidth_hz %lld, mcc %d, mnc %d, tac %u, cell_id %u, sibs 1 2 3 4 5", t.pci, lteBandwidthHz(t.nRb),
+             t.mcc, t.mnc, (unsigned)t.tac, (unsigned)t.cellId);
+    cells->push_back({lteSceneHz(scene), b});
+    return x;
+}
+
+// --- DVB-S: OnAir's transmitter chain (dvbs_gen.h, DvbsSignal) for kDvbsSec with the defaults of its synthetic source
+// (dvbsConfigFromSynth: 5 Msym/s, or less when the rate cannot carry it; roll-off 0.35; code rate 2/3) and its own noise, carrying
+// dvbsDatagram(), one UDP datagram over and over. gse: DVB-S2 QPSK in a generic stream, the datagram in a GSE packet of every
+// BBFRAME (as OnAir's own test, tests/dvbs/test_dvbs_gse.cpp); mpe: DVB-S QPSK, the datagram in an MPE section on PID 0x0FA0;
+// ule: DVB-S2 QPSK carrying a transport stream, the datagram in a ULE SNDU on PID 0x0123 (each encapsulation as OnAir's own test
+// makes it). Es/N0 6 dB above the QEF threshold of DVB-S2 QPSK 2/3; 12 dB for DVB-S. The symbol rate is a whole ksym/s
+// (dvbsConfigFromSynth's limit for a low rate taken down to one); symbolRate: what it is
+constexpr double kDvbsSec = 4;
+std::vector<uint8_t> dvbsDatagram() {
+    const uint8_t src[4] = {192, 0, 2, 1}, dst[4] = {198, 51, 100, 7};   // documentation addresses (RFC 5737)
+    const char* text = "ZETA DVB-S IP TEST";
+    return dvbsip::buildUdpV4(src, dst, 40000, 5004, std::vector<uint8_t>(text, text + strlen(text)), true);
+}
+std::vector<cf32> dvbsSignal(double rate, const std::string& encap, double* symbolRate) {
+    SynthConfig sc;
+    sc.modeOpt[0] = encap == "mpe" ? 1 : 0;   // 1: DVB-S; 0: DVB-S2
+    dvbs::DvbsSignalConfig c = dvbs::dvbsConfigFromSynth(sc, rate);
+    c.tx.symbolRate = std::floor(c.tx.symbolRate / 1000) * 1000;
+    *symbolRate = c.tx.symbolRate;
+    c.snrDb = c.tx.standard == 1 ? 12 : dvbs::s2QefEsN0(c.tx.mod, c.tx.rate, c.tx.shortFrame) + 6;
+    const std::vector<uint8_t> ip = dvbsDatagram();
+    if (encap == "gse") {
+        auto enc = std::make_shared<dvbsip::GseEncapsulator>();
+        c.tx.gseField = [enc, ip](size_t bytes) {
+            if (enc->queued() == 0) enc->push(0x0800, dvbsip::Label(), ip);   // no label: broadcast
+            return enc->fill(bytes);
+        };
+    } else {
+        const uint8_t mac[6] = {2, 0, 0, 0, 0, 1};   // a locally administered unicast address
+        const std::vector<uint8_t> section = dvbsip::buildMpeSection(mac, ip), sndu = dvbsip::buildUleSndu(0x0800, ip);
+        auto queued = std::make_shared<std::deque<std::vector<uint8_t>>>();   // the transport stream's next packets
+        auto cc = std::make_shared<uint8_t>(0);                               // the PID's continuity counter
+        const bool mpe = encap == "mpe";
+        c.ts = [queued, cc, section, sndu, mpe](uint8_t* p) {
+            if (queued->empty())
+                for (auto& k : mpe ? dvbsip::packetizeSection(0x0FA0, *cc, section) : dvbsip::packetizeUle(0x0123, *cc, {sndu}))
+                    queued->push_back(std::move(k));
+            memcpy(p, queued->front().data(), 188);
+            queued->pop_front();
+        };
+    }
+    dvbs::DvbsSignal sig(c);
+    std::vector<cf32> x((size_t)std::llround(kDvbsSec * rate));
+    for (size_t at = 0; at < x.size(); at += kChunk) sig.generate(x.data() + at, std::min(kChunk, x.size() - at));
+    return x;
+}
+
 bool writeOut(const std::vector<cf32>& x, const std::string& stem, double rate, double centre, const std::vector<Span>& msgs) {
     if (stem.empty()) {
         if (fwrite(x.data(), sizeof(cf32), x.size(), stdout) != x.size() || fflush(stdout) != 0) {
@@ -970,8 +1076,9 @@ int main(int argc, char** argv) {
     std::string service = "ZETA TEST";
     bool haveText = false, haveInfo = false, haveStation = false, channel = false, haveService = false;
     std::string sigmf;   // --sigmf STEM: the SigMF pair instead of stdout
+    std::string encap;   // --encap (dvbs): gse, mpe or ule
     double rate = 0, freq = 0, deviation = 0, lead = 0;
-    int bandwidth = 0;
+    int bandwidth = 0, lteScene = -1;   // --scene (lte), -1 when not given
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         const bool val = i + 1 < argc;
@@ -988,6 +1095,8 @@ int main(int argc, char** argv) {
         else if (a == "--lead" && val) { lead = atof(argv[++i]); if (lead <= 0) return usage(); }
         else if (a == "--deviation" && val) { deviation = atof(argv[++i]); if (deviation <= 0) return usage(); }
         else if (a == "--sigmf" && val) { sigmf = argv[++i]; if (sigmf.empty()) return usage(); }
+        else if (a == "--scene" && val) { lteScene = atoi(argv[++i]); if (lteScene < 0 || lteScene > 3 || strlen(argv[i]) != 1) return usage(); }
+        else if (a == "--encap" && val) { encap = argv[++i]; if (encap != "gse" && encap != "mpe" && encap != "ule") return usage(); }
         else return usage();
     }
     if (rate <= 0) return usage();
@@ -997,14 +1106,16 @@ int main(int argc, char** argv) {
     const bool scene = mode == "ble" || mode == "lorawan" || mode == "zigbee" || mode == "thread" || mode == "zwave" || mode == "wifi" ||
                        mode == "wisun";   // a scene of OnAir's own: only --freq
     if (mode == "rds" ? freq || haveText || haveInfo : voice || tv ? freq || haveText || haveInfo || haveStation : haveStation) return usage();
-    const bool cells = mode == "tetra" || mode == "gsmr";   // a downlink of OnAir's own: only --freq
-    if ((scene || cells) && (haveText || haveInfo)) return usage();
+    const bool cells = mode == "tetra" || mode == "gsmr" || mode == "lte";   // a downlink of OnAir's own: only --freq (lte: --scene)
+    if ((scene || cells || mode == "dvbs") && (haveText || haveInfo)) return usage();
+    if (lteScene >= 0 && mode != "lte") return usage();
+    if (!encap.empty() && mode != "dvbs") return usage();
     if (channel && mode != "dmr" && mode != "p25") return usage();
     if ((bandwidth || haveService || lead) && mode != "dvbt") return usage();
     if (deviation && mode != "video") return usage();
     // the centre the pair records: --freq, or the mode's own (ACARS's channel, the middle of AIS 1 and 2, Bluetooth LE's channel
     // 37, the LoRaWAN scene's centre); 0 for a mode with neither. ACARS's default is also every other mode's freq, which they ignore
-    const bool ownCentre = mode == "acars" || mode == "ais" || scene || cells;
+    const bool ownCentre = mode == "acars" || mode == "ais" || scene || cells || mode == "dvbs";
     const double centre = freq ? freq : !ownCentre ? 0 : mode == "ais" ? 162e6 : mode == "ble" ? 2402e6
                                       : mode == "lorawan" ? lorawanPlanCentreMhz(lorawan::EU868) * 1e6
                                       : mode == "zigbee" || mode == "thread" ? 2425e6   // channel 15
@@ -1013,6 +1124,8 @@ int main(int argc, char** argv) {
                                       : mode == "wisun" ? wisunTuning().defMhz * 1e6     // the scene's own centre
                                       : mode == "tetra" ? kTetraTestCentreHz              // the scene's own centre
                                       : mode == "gsmr" ? kGsmrScene0MidHz                 // between scene 0's two cells
+                                      : mode == "lte" ? lteSceneHz(lteScene < 0 ? 1 : lteScene)   // the scene's cell
+                                      : mode == "dvbs" ? dvbsTuning().defMhz * 1e6         // OnAir's own default
                                       : 131.525e6;
     if (!freq) freq = centre ? centre : 131.525e6;
     if (mode == "rds" || tv) {   // a broadcast is written as it is made: no cut and no silence (rds's and video's noise are the generator's own)
@@ -1026,13 +1139,29 @@ int main(int argc, char** argv) {
     }
     if (cells) {   // a downlink is written as it is made, as a broadcast is (its noise is the generator's own)
         std::vector<CellText> seen;
-        const std::vector<cf32> x = cellSignal(mode, rate, freq, &seen);
+        const std::vector<cf32> x = mode == "lte" ? lteSignal(rate, freq, lteScene < 0 ? 1 : lteScene, &seen)
+                                                  : cellSignal(mode, rate, freq, &seen);
         if (x.empty()) { fprintf(stderr, "onair-gen: no %s signal at %.0f Hz\n", mode.c_str(), rate); return 1; }
         if (!writeOut(x, sigmf, rate, centre, {{0, x.size()}})) return 1;
         fprintf(stderr, "onair-gen: %s message from 0.000 s to %.3f s, %zu samples at %.0f Hz\n", mode.c_str(),
                 (double)x.size() / rate, x.size(), rate);
         for (size_t i = 0; i < seen.size(); i++)
             fprintf(stderr, "onair-gen: cell %zu at %.0f Hz: %s\n", i + 1, seen[i].hz, seen[i].text.c_str());
+        return 0;
+    }
+    if (mode == "dvbs") {   // a carrier is written as it is made (its noise is the generator's own); the datagram it carries on stderr
+        if (encap.empty()) encap = "gse";
+        double rs = 0;
+        const std::vector<cf32> x = dvbsSignal(rate, encap, &rs);
+        if (x.empty()) { fprintf(stderr, "onair-gen: no %s signal at %.0f Hz\n", mode.c_str(), rate); return 1; }
+        if (!writeOut(x, sigmf, rate, centre, {{0, x.size()}})) return 1;
+        fprintf(stderr, "onair-gen: %s message from 0.000 s to %.3f s, %zu samples at %.0f Hz\n", mode.c_str(),
+                (double)x.size() / rate, x.size(), rate);
+        fprintf(stderr, "onair-gen: %s QPSK 2/3 at %.0f symbol/s, the datagram in %s\n", encap == "mpe" ? "DVB-S" : "DVB-S2", rs,
+                encap == "gse" ? "GSE" : encap == "mpe" ? "MPE" : "ULE");
+        std::string hex;
+        for (uint8_t b : dvbsDatagram()) { char h[3]; snprintf(h, sizeof h, "%02x", b); hex += h; }
+        fprintf(stderr, "onair-gen: datagram %s\n", hex.c_str());
         return 0;
     }
     std::vector<cf32> msg;

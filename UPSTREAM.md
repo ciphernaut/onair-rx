@@ -1,6 +1,6 @@
 # What to offer upstream
 
-Four changes to OnAir, as the operator would send them. Nothing here has been sent. OnAir takes focused pull requests
+Changes to OnAir, as the operator would send them. Nothing here has been sent. OnAir takes focused pull requests
 with a test and a DCO sign-off (`git commit -s`), from the operator's account, one change to a request.
 
 Based on OnAir by Kristijonas Adomaitis - https://on-air.dev
@@ -103,6 +103,46 @@ Described only; not written here.
   it is would not.
 - **Test:** the receivers' own tests (`tests/tetra/test_tetra_rx.cpp`, `tests/gsmr/test_gsmr_rx.cpp`), fed without their
   `while (rx.busy()) sleep` pacing.
+
+## 6. LTE: an offline switch, a flush, and a search that can be told less
+
+Described only; not written here.
+
+- **Change:** `CellReceiver` (`cell/cell_rx.cpp`, `feed()`) is GSM-R's case again: it gathers a block (0.2 s, `kBlockSec`,
+  not in its header) only while its worker is idle and drops the rest of the `feed()` that completes one. A
+  `setOffline(true)` would have `feed()` wait for the worker. There is no `flush()` for the input after the last whole
+  block, and padding it with zeros is not neutral here: the cell search tracks the cell over the whole block, so a block
+  more than about a tenth zeros loses SIB2 and the SINR, and one under 0.16 s of signal in 0.2 s gives no cell. A
+  `flush()` that searches the partial block as it is would keep the tail. And the search costs more than real time at
+  every rate on a 12-core host (0.8 s a block at 4.6 Msps, 2.7 s at 20 Msps, on one worker thread), most of it the
+  raster probe that `setCenterHz` turns on (every 100 kHz point of the input, then every candidate decoded): a switch
+  that names the carriers to look at (a list of EARFCNs, or "the one at the dial frequency"), or the worker spread over
+  the candidates, would let a job that knows its cell keep real time.
+- **Why:** `onair-rx`'s `lte` mode waits on `busy()` at each block's end, where it cuts the block, so that a replay skips
+  nothing; it cannot keep real time without `--drop` (README, `lte`), and its read-ahead of two decodes does not fit the
+  256 MB cap at 20 Msps.
+- **Test:** `tests/cell/test_cell_rx.cpp`'s scenes through `CellReceiver` with no pacing, and a 0.1 s input.
+
+## 7. DVB-S: a bound on the symbol rate search, the GPU probe, and the generator in the receiver's link
+
+Described only; not written here.
+
+- **Change:** three small ones in `dvbs/`.
+  - A maximum symbol rate for the search (`setMaxSymbolRate`, beside `setSymbolRate`'s manual rate): today the only bound
+    is the input rate's (`dvbsMaxSymbolRate`), so `onair-rx --width` filters the input to the band instead (a
+    low-pass by overlap-save, 0.14 to 0.18 s of CPU a second at 10 Msps).
+  - `ComputeChoice`'s constructor (`dvbs_compute.h`) asks `GpuLdpc::instance().available()` even when the mode is
+    set to the CPU afterwards, so making a `DvbsReceiver` sets up Vulkan on the first graphics card and prints three
+    lines; `onair-rx` sets `DECT2_NOGPU` to keep the GPU untouched. Asking only when the mode is GPU or auto would do.
+  - `rrcAt` (the root raised cosine the receiver's matched filter uses, `dvbs_dsp.cpp`) is defined in `dvbs_gen.cpp`,
+    the test signal generator, which also holds `demoTsSource`, the test programme's video encoder: a program linking
+    the receiver alone links the generator and FFmpeg (`libavcodec`, `libavformat`, `libavutil`, `libswscale`). Since
+    0.4.0 `onair-rx` needs FFmpeg's libraries at run time for every mode, and starts with about 16 MB more shared
+    library pages resident. Moving `rrcAt` into `dvbs_dsp.cpp` would end it.
+- **Already there, no change needed:** `setBlocking(true)` and `flush()` give a replay its deterministic output, and MPE
+  and ULE work by handing the receiver's transport stream back through `feedTs` from its packet callback, which runs
+  outside the receiver's IP lock.
+- **Test:** `tests/dvbs/test_dvbs_gse.cpp` with a bound below the carrier's rate (no lock) and above it (the same lock).
 
 ## Dropped
 

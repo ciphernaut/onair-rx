@@ -27,37 +27,6 @@ using namespace dect2;
 
 namespace {
 
-constexpr double kStatusMostSec = 2;   // a status line at least this often, seconds of input
-
-// When a status line is due. The first waits for first lock or kStatusMostSec of input, whichever comes first (the poll of
-// the block that reaches it), as the row's own decoders' first event does: the node judges a job by its first event, so a
-// signal that locks by then is reported locked. Input that ends before either has its first line from the poll at the end.
-// After it, a poll comes every kStatusPollSec of input, after the block of
-// kPollBlock that reaches it; so a line is written at the last poll before the gap since the one before could pass
-// kStatusMostSec, and lines are never further apart than that, whatever block a poll lands on.
-class Cadence {
-public:
-    explicit Cadence(double rate)
-        : most_((uint64_t)std::llround(kStatusMostSec * rate)), slack_((uint64_t)std::llround(kStatusPollSec * rate) + kPollBlock) {}
-    void fed(size_t n) { now_ += n; }
-    // j, the line, is added to lines when it is due: the first once locked, at kStatusMostSec or at the end of input (last),
-    // so input that ends sooner without a lock still gives its one line (empty input gives none); then on a change of key
-    // (the state: the line's members without the measured ones) or when late
-    void offer(bool locked, bool last, const std::string& key, Json&& j, std::vector<Json>& lines) {
-        const bool late = now_ + slack_ > at_ + most_;   // the next poll could come more than kStatusMostSec after the last line
-        const bool ended = last && now_ > 0;
-        if (written_ ? key == key_ && !late : !locked && !ended && now_ < most_) return;
-        at_ = now_;
-        key_ = key;
-        written_ = true;
-        lines.push_back(std::move(j));
-    }
-private:
-    uint64_t most_, slack_, now_ = 0, at_ = 0;   // at_: the input fed when the last line was written (0 before the first)
-    std::string key_;
-    bool written_ = false;
-};
-
 // --- dvbt
 
 constexpr int kDvbtWidths[] = {8, 7, 6, 5};   // MHz, in the order they are tried (as the row's own program does)

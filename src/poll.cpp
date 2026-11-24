@@ -4,8 +4,9 @@
 // The receivers of these modes put nothing on the automation bus while they decode; what they know is in a snapshot
 // (telemetry()) the session reads. So the run only feeds and polls: the session decides what is new, and the run writes it
 // with the members every line has. A mode is a row: its name, its event, how often it is polled, how its session is made
-// (poll_<mode>.cpp), its hub channel (the cell modes hand their frames to OnAir's Wireshark hub) and whether it needs --freq.
-// stdin is read on a thread of its own (ReadAhead), so that a session waiting for its receiver never holds up the writer.
+// (poll_<mode>.cpp), its hub channel (the cell modes and dvbs hand their frames to OnAir's Wireshark hub), whether it needs
+// --freq and how far stdin is read ahead. stdin is read on a thread of its own (ReadAhead), so that a session waiting for its
+// receiver never holds up the writer.
 #include "poll.h"
 #include "hub_tap.h"
 #include "dect2/wirecap/wire.h"
@@ -134,6 +135,14 @@ const PollMode kPollModes[] = {
     // decoding of a stretch, so stdin is read ahead by two stretches (TetraReceiver::kCaptureSec, gsmr_rx.cpp's kBlockSec)
     {"tetra", "tetra.cell", 0.25, openTetra, wire::Tetra, true, 2 * 2.3},
     {"gsmr", "gsmr.cell", 0.25, openGsmr, wire::GsmR, true, 2 * 2.2},
+    // LTE decodes a block of 0.2 s at a time, but more slowly than it comes at every rate (on the build host 0.8 s for a block at
+    // 4.6 Msps, up to 2.8 s at 20 Msps): the read-ahead is two of the longest decodes, which the 256 MB cap cuts to 1.68 s
+    // at 20 Msps (README, "lte")
+    {"lte", "lte.cell", 0.25, openLte, wire::Lte, true, 2 * 2.8},
+    // a status line as dvbt's (poll_tv.cpp); the IP datagrams on the hub. Its session waits for the receiver's decoder threads
+    // (the blocking switch) and, at each poll, for what is queued; with its search and frame hunt, which run in feed, that held
+    // a block up to 111 ms on the build host (README, "dvbs"): stdin is read ahead by twice that and more
+    {"dvbs", "dvbs.status", kStatusPollSec, openDvbs, wire::DvbIp, false, 0.25},
 };
 const size_t kPollModeCount = sizeof kPollModes / sizeof kPollModes[0];
 
