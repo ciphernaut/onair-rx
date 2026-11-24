@@ -33,7 +33,7 @@ namespace {
 // blocks for a mode whose session does not wait); when it is full the reader waits, so the writer is held up then
 // (back-pressure, as without the thread) and no sample is dropped. Under --drop it never waits: a block that finds the
 // queue full is dropped and counted, and the block after it says how many samples went before it, so that the sample count
-// (t_sample) stays the index on the input. EOF and a read error (IqInput::error(), read by the caller once the run is
+// (t_sample) stays the index on the input and the session is told of the gap (PollSession::gap). EOF and a read error (IqInput::error(), read by the caller once the run is
 // over) end the blocks.
 class ReadAhead {
 public:
@@ -112,12 +112,15 @@ private:
     std::thread th_;       // last: it starts once the rest is made
 };
 
-// The read-ahead's blocks for a mode: two, or the mode's readAheadSec at the rate when its session waits for its receiver (and
-// not under --drop, where it does not); never more than kReadAheadMaxBytes, whatever the rate
+// The read-ahead's blocks for a mode: two, or the mode's readAheadSec at the rate when its session waits for its receiver.
+// Under --drop, where a full queue drops, it is sized by time: the mode's readAheadSec or kDropReadAheadSec, whichever is
+// longer, so that a writer that hands over its input in bursts larger than two blocks loses nothing while the session keeps
+// up on average. Never more than kReadAheadMaxBytes, whatever the rate
 constexpr size_t kReadAheadMaxBytes = (size_t)256 << 20;
 size_t readAheadBlocks(const PollMode& m, const Options& o) {
     size_t blocks = 2;
-    if (m.readAheadSec > 0 && !o.drop) blocks = std::max(blocks, (size_t)std::ceil(m.readAheadSec * o.rate / (double)kPollBlock));
+    const double sec = o.drop ? std::max(m.readAheadSec, kDropReadAheadSec) : m.readAheadSec;
+    if (sec > 0) blocks = std::max(blocks, (size_t)std::ceil(sec * o.rate / (double)kPollBlock));
     return std::min(blocks, kReadAheadMaxBytes / (kPollBlock * sizeof(cf32)));
 }
 
@@ -204,6 +207,7 @@ int runPolled(const PollMode& m, const Options& o, IqInput& in, Output& out) {
     ReadAhead ahead(in, readAheadBlocks(m, o), o.drop);
     std::vector<cf32> iq;
     while (ahead.next(iq, skipped)) {
+        if (skipped) s->gap(skipped);
         fed += skipped;
         first = fed;
         s->feed(iq.data(), iq.size());

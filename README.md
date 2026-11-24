@@ -71,10 +71,12 @@ sample of the block it was drained after) stands to the frame on the air.
     `SG`, `SG866`, `TH`, `VN`, `EU863`, `EU870`, `IN`, `CN470`, `CN779`, `CN920`, `WW` (in any case). Without it the
     receiver takes the plan for `--freq` (below).
   - `--drop` (`wisun`, `tetra`, `gsmr`, `lte`, `dvbs`): a receiver with a worker skips the input that comes while it is
-    busy (`dvbs`: drops the frames its decoder threads have no time for), as it does live, instead of being waited for
-    (below).
-  - `--width` (`dvbs`): the job's band, Hz, around 0 Hz: the input outside it is filtered off before the receiver, so the
-    carrier it finds has a symbol rate of at most the width (below).
+    busy (`tetra`, `gsmr`, `lte`: whole stretches; `dvbs`: drops the frames its decoder threads have no time for), as it
+    does live, instead of being waited for, and the writer is never held up (below).
+  - `--width` (`dvbs`): the job's band, Hz, around 0 Hz: the input outside it is filtered off before the receiver, so a
+    carrier it takes whole has a symbol rate of at most the width over one plus its roll-off, and one wider is cut
+    (below). A width wider than `--rate` exits 2 before reading any input with `onair-rx: dvbs: --width <W> is wider
+    than --rate <R>`.
 - **stdout, adsb:** one JSON object per decoded Mode S frame, flushed per line. A line carries only what its own frame
   established, as an SBS (BaseStation) line does, never a value remembered from an earlier frame. A member whose value
   is not known is absent, never null.
@@ -293,12 +295,16 @@ sample of the block it was drained after) stands to the frame on the air.
   mode's own (`PollMode::readAheadSec`), its longest waits on the build host for a mode whose session waits: two of its
   receiver's stretches (`tetra` 4.6 s, `gsmr` 4.4 s: 70 MB at 2 MHz; `lte` 0.4 s: 15 MB at 4.6 MHz, 64 MB at 20 MHz,
   **less than one of its decodes**, below), twice its longest hold and more (`dvbs`, 0.25 s: 20 MB at 10 MHz); two blocks
-  for the others and under `--drop`; never more than 256 MB. When it is full the
+  for the others. Under `--drop` it is sized by time: the mode's own, or 0.25 s of input if that is longer
+  (`kDropReadAheadSec`; `lte` 0.4 s, 64 MB at 20 MHz), so that a writer that hands its input over in bursts (ZetaSDR's
+  `capture_decode` writes 50 ms at a time, 4 MB of `cs16` at 20 MHz) loses nothing while the session keeps up on
+  average. Never more than 256 MB. When it is full the
   reader waits, and the writer with it (back-pressure; no sample is dropped), except under `--drop`: a block that finds
   the queue full is dropped, the samples after it keep their index on the input (`t_sample`), and at the end stderr says
-  `onair-rx: <mode>: <n> samples dropped` (only when some were). Peak RSS from a file: `dvbt` at 10 MHz 33 MB, as
+  `onair-rx: <mode>: <n> samples dropped` (only when some were). For a cell mode (`tetra`, `gsmr`, `lte`) such a drop
+  costs the whole stretch it falls in, never a hole inside one (the cell modes below). Peak RSS from a file: `dvbt` at 10 MHz 33 MB, as
   before the queue; `gsmr` at 2 MHz 177 MB (108 MB without the queue); `lte` 61 MB at 4.6 MHz and 178 MB at 20 MHz
-  (106 MB with `--drop`); `dvbs` at 10 MHz 87 MB. onair-rx links none of OnAir's signal generators, so none of FFmpeg
+  (142 MB with `--drop`: its read-ahead of 0.4 s and the stretch the session gathers); `dvbs` at 10 MHz 87 MB. onair-rx links none of OnAir's signal generators, so none of FFmpeg
   (`src/rrc.cpp`, How it works).
   `ONAIR_RX_TEST_BLOCK_DELAY_US` (a test knob,
   `test/only.sh`) sleeps that long after each block, to make a session slower than its writer. An interval shorter than a
@@ -468,13 +474,18 @@ sample of the block it was drained after) stands to the frame on the air.
     hundredths of a second of zeros reads less (on the 5 MHz scene at 4.6 MHz: 0.19 s of signal gives the whole cell,
     0.17 s loses SIB2 and the SINR, 0.16 s gives no cell). Input of at least one whole block (0.2 s) always has its
     blocks decoded as they are; only the tail after the last whole block is at stake. The last poll waits at
-    most 5 s in all, for the padded stretch (and, with `--drop`, first for a stretch still being decoded), then reports
-    what the snapshot has; the session's end then makes a stretch still being decoded give up at its next carrier, so the
-    program never waits on it. With `--drop` what the receiver holds is not known (it skipped), so a whole stretch of zeros
-    goes in, which completes it.
-    **`--drop`** runs the receiver as it runs live: the session does not wait, and the receiver skips what comes while it
-    decodes. Which stretches are decoded then depends on the worker's timing (from a file nearly all the input after the
-    first stretch goes), and so do the lines.
+    most 3 s in all (`kFlushSec`), for the padded stretch (and, with `--drop`, first for a stretch still being decoded),
+    then reports what the snapshot has; the session's end then makes a stretch still being decoded give up at its next
+    carrier, so the program never waits on it. That bound must stay under ZetaSDR's 5 s grace for a handler to exit once
+    its input is closed (`EXIT_GRACE` in `zeta-ext`), so that the lines of the end of input are written before the node
+    stops waiting (`lte --drop` at 20 MHz ends about 4.1 s after its input closes: the 3 s and the give-up).
+    **`--drop`** runs the receiver as it runs live: the session does not wait, and a stretch that comes while the worker
+    is busy is skipped. The session gathers the input into whole stretches itself and hands one over in one feed only when
+    the worker is idle, else drops it whole (the receivers' own rule live), so what the receiver decodes is contiguous
+    within each stretch; a gap the read-ahead makes (its queue full) drops the part of a stretch gathered before it, and
+    the next stretch starts after the gap. At the end of input the part of a stretch the session holds is completed with
+    zeros and decoded, as without `--drop`. Which stretches are decoded depends on the worker's timing (from a file the
+    first and the padded last), and so do the lines.
     **Packets** (`--pcap-port`): each signalling block the receiver decoded, as GSMTAP in IPv4 + UDP to port 4729 (link
     type 101), as OnAir's capture files have them: TETRA's synchronisation bursts and signalling blocks (GSMTAP type 5,
     TETRA I1; OnAir's encrypted signalling as received), GSM-R's BCCH blocks (type 1, Um; the CCCH is not published),
@@ -501,12 +512,15 @@ sample of the block it was drained after) stands to the frame on the air.
     **`--width HZ`**: the band the carrier is in, around 0 Hz (ZetaSDR passes the job's band). OnAir's receiver has no
     switch to bound its symbol rate search (only a manual rate, `setSymbolRate`), so the session cuts the input to the
     band before the receiver sees it: a linear-phase FIR low-pass (Blackman-windowed sinc, 5 % of the band as its
-    transition, inside the band's edge; at most 4095 taps) run by overlap-save on OnAir's FFT. Nothing outside the band
-    reaches the spectrum search, so the carrier it can take has a symbol rate of at most the width over one plus its
-    roll-off: at most the width. A carrier wider than the band is narrowed to it and does not lock (`--width 3000000`
-    on the 5 Msym/s test carrier: no lock). A width of the rate or more filters nothing. Without `--width` the
-    receiver's own search stands, up to its own limit, about the rate over 1.3 times one plus the roll-off (5.7 Msym/s
-    at 10 MHz). The filter costs 0.14 to 0.18 s of CPU a second at 10 MHz with an 8 MHz band; its delay, half the taps
+    transition, inside the band's edge; at most 4095 taps) run by overlap-save on OnAir's FFT. `--width` removes what
+    lies outside the band: nothing outside it reaches the spectrum search, so the carrier it can take whole has a symbol
+    rate of at most the width over one plus its roll-off. A carrier wider than the band is cut to it, and how much of
+    it survives decides whether the receiver still locks (`--width 3000000` on the 5 Msym/s test carrier, 6.75 MHz wide:
+    no lock). Whatever the width, the receiver's own search has a ceiling at a rate (`dvbsMaxSymbolRate`): about the
+    rate over 1.3 times one plus the roll-off, 5.7 Msym/s at 10 MHz for a roll-off of 0.35, so a carrier needs a rate of
+    about 1.75 times its symbol rate. A width equal to the rate filters nothing; **a width wider than the rate is
+    refused** (exit 2 before any input is read, `onair-rx: dvbs: --width <W> is wider than --rate <R>`): the input cannot
+    hold the band, so the receiver would search for a carrier it may not have whole. The filter costs 0.14 to 0.18 s of CPU a second at 10 MHz with an 8 MHz band; its delay, half the taps
     and up to one FFT's step, moves the receiver's view of the input by under half a millisecond there, and the end of
     input pushes the rest through.
     **Waiting:** the receiver drops frames when its decoder threads fall behind, as it does live. Without `--drop` it is
@@ -552,32 +566,35 @@ sample of the block it was drained after) stands to the frame on the air.
   - `tetra`, `gsmr`, `lte` and `dvbs`, re-measured for 0.4.0 (2026-11-24, the load average 3 to 4, another build
     finishing; three file runs each and one run paced at real time by a writer of 16384-sample blocks), on `onair-gen`'s
     scenes: user CPU and wall time per second of input, OnAir's threads and the feeding thread together. "Paced" is
-    when the run ended after its input and the longest a write held the writer up (the read-ahead's, the first write
-    included, which waits for the program to start).
+    when the run ended after its input closed and the longest a write held the writer up (the read-ahead's, the first
+    write included, which waits for the program to start). The `--drop` rows and the paced rows of `tetra`, `gsmr` and
+    `lte` were measured again once `--drop` kept whole stretches and its read-ahead was sized by time (2026-11-24, load
+    average 1.6 to 2.3, `cs16` input), and the `dvbs --drop` file row with them.
 
     | mode, input | user CPU a second | wall a second | keeps real time |
     |---|---|---|---|
     | `tetra` 2 MHz, file | 0.09 | 0.11 | yes (every stretch decoded) |
-    | `tetra --drop`, file | 0.04 to 0.05 | 0.05 | yes, but from a file the read-ahead drops most blocks: no stretch whole, no line |
-    | `tetra`, paced | | ends 0.16 s after the input; writes held 21 ms at most | yes |
-    | `tetra --drop`, paced | | ends 0.16 s after the input | yes (its cell read) |
+    | `tetra --drop`, file | 0.05 | 0.06 | yes (its cell read: from a file the first stretch and the padded last are decoded, the others skipped whole) |
+    | `tetra`, paced | | ends 0.17 s after the input; writes held 0.2 ms at most | yes |
+    | `tetra --drop`, paced | | ends 0.18 s after the input; nothing dropped by the read-ahead | yes (its cell read) |
     | `gsmr` 2 MHz, file | 0.58 | 0.62 | yes (every stretch decoded; Task 4 measured 0.43 to 0.45 and 0.48 to 0.50 under less load) |
-    | `gsmr --drop`, file | 0.15 to 0.16 | 0.17 | yes (both cells read here) |
-    | `gsmr`, paced | | ends 1.74 s after the input; writes held 22 ms at most | on average: the decode runs in series and the run ends late |
-    | `gsmr --drop`, paced | | ends 1.03 s after the input | yes (both cells read) |
+    | `gsmr --drop`, file | 0.28 to 0.29 | 0.31 to 0.32 | yes (both cells read) |
+    | `gsmr`, paced | | ends 1.79 s after the input; writes held 0.1 ms at most | on average: the decode runs in series and the run ends late |
+    | `gsmr --drop`, paced | | ends 1.82 to 1.86 s after the input (the padded last stretch's decode); nothing dropped by the read-ahead | yes (both cells read) |
     | `lte` 5 MHz cell at 4.6 MHz, file | 3.84 to 3.90 | 3.87 to 3.92 | **no**: 0.78 s of decoding for each 0.2 s block |
-    | `lte --drop` 4.6 MHz, file | 1.04 to 1.22 | 1.06 to 1.24 | from a file the read-ahead drops most blocks: the cell read in 2 of 3 runs |
-    | `lte` 4.6 MHz, paced | | ends 2.76 s after its 0.9 s of input | **no** |
-    | `lte --drop` 4.6 MHz, paced | | ends 0.50 s after the input (the last block's decode) | yes (its cell read; about one block in four decoded) |
+    | `lte --drop` 4.6 MHz, file | 1.49 to 1.51 | 1.50 to 1.54 | the cell read in 3 of 3 runs (the first block and the padded last decoded, the others skipped whole) |
+    | `lte` 4.6 MHz, paced | | 3.80 s for its 0.9 s of input, 1.99 s after the input closed; writes held up to 825 ms | **no** |
+    | `lte --drop` 4.6 MHz, paced | | ends 0.66 s after the input (the padded last block's decode); writes held 0.1 ms at most | yes (its cell read; about one block in four decoded) |
     | `lte` 5 MHz cell at 20 MHz, file | 13.9 to 14.2 | 13.9 to 14.2 | **no**: 2.8 s for each block |
     | `lte` 10 MHz cell at 20 MHz, file | 14.0 to 14.3 | 14.0 to 14.3 | **no** |
     | `lte` 20 MHz cell at 20 MHz, file | 14.2 to 14.6 | 14.3 to 14.6 | **no** |
-    | `lte --drop` 20 MHz, file (each scene) | 4.9 to 5.0 | 4.9 to 5.0 | from a file no line in 8 of 9 runs (the blocks dropped) |
-    | `lte` 10 MHz cell at 20 MHz, paced | | ends 11.8 s after its 0.9 s of input | **no** |
-    | `lte --drop` 10 MHz cell at 20 MHz, paced | | ends 4.0 s after the input (the last decodes, within the 5 s flush) | yes (its cell read; about one block in fourteen decoded) |
+    | `lte --drop` 10 MHz cell at 20 MHz, file | 5.16 to 5.18 | 5.20 to 5.26 | the cell read in 3 of 3 runs (the first block and the padded last decoded) |
+    | `lte` 10 MHz cell at 20 MHz, paced | | 12.9 s for its 0.9 s of input, 7.5 s after the input closed; writes held up to 2.6 s | **no** |
+    | `lte --drop` 10 MHz cell at 20 MHz, paced | | ends 4.1 s after the input (the 3 s flush, then the give-up); writes held 1.8 ms at most | yes (its cell read; about one block in fourteen decoded) |
+    | `lte --drop` 5 MHz cell at 20 MHz, paced in writes of 4 MB (`cs16`, 50 ms), looped to 7.2 s | | ends 1.1 s after the input; nothing dropped by the read-ahead | yes (the cell whole, `sibs` 1 to 5; the same with writes of 64 kB, 256 kB and 1 MB). 0.4.0 as first built (a read-ahead of two blocks under `--drop`) dropped 0.3 M, 2.5 M, 41.7 M and 57.7 M of the 144 M samples at those four sizes, from inside the blocks: the cell whole at 64 kB, SIB1 and 2 only at 256 kB, no line at 1 MB and 4 MB |
     | `dvbs` 10 MHz, `--width 8000000`, file | 1.03 to 1.04 | 0.48 | yes (the receiver's decoder threads; the band filter 0.18 s a second of it) |
     | `dvbs` 10 MHz, no `--width`, file | 0.85 to 0.87 | 0.32 to 0.33 | yes |
-    | `dvbs --drop`, file | 0.04 | 0.04 to 0.05 | from a file the read-ahead drops most blocks: one line |
+    | `dvbs --drop`, file | 0.12 to 0.13 | 0.10 | from a file the read-ahead drops most blocks (35 M of 40 M samples): one line, not locked |
     | `dvbs` MPE (DVB-S) 4 MHz, file | 0.27 to 0.28 | 0.18 to 0.19 | yes |
     | `dvbs` 10 MHz, 6 s of noise | 0.34 | 0.33 | yes |
     | `dvbs`, paced | | ends 0.01 s after the input; writes held 31 ms at most (the first) | yes |
@@ -590,8 +607,10 @@ sample of the block it was drained after) stands to the frame on the air.
     is slower than the input: a writer at real time is held up once the queue is full, and a larger queue would only
     put that off (up to the 256 MB cap, 1.68 s at 20 MHz, also less than one decode). With
     `--drop` it keeps real time and decodes the blocks its worker has time for: a cell that stays on the air is read
-    within a few blocks, so live it is the way to run it; a replay faster than real time under `--drop` loses most of
-    its input (ruling R10). The other three keep real time without `--drop`; `gsmr`'s run ends about a decode after its
+    within a few blocks, so live it is the way to run it; a replay paced at real time reads it too, also one written in
+    bursts of 50 ms (the read-ahead under `--drop` holds 0.4 s, and every block the receiver decodes is whole); a replay
+    faster than real time under `--drop` loses most of its input (ruling R10). The other three keep real time without
+    `--drop`; `gsmr`'s run ends about a decode after its
     input. On noise (`test/only.sh`): `lte` at 4.6 MHz 2.3 s a second (the raster search on every block), `tetra` and
     `gsmr` 0.01.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic
@@ -619,7 +638,10 @@ sample of the block it was drained after) stands to the frame on the air.
   until told); with another mode a decode a receiver still holds when stdin closes is not written, and a short
   replay (ZetaSDR's `capture_decode`) can lose its last message this way. A polled mode polls once more at EOF, so
   what its receiver's snapshot has by then is written; `tetra`, `gsmr` and `lte` first complete their last partial stretch
-  with zeros and decode it, within 5 s (LTE's search loses a tail of much under a block, `lte` above); `dvbs` pushes the
+  with zeros and decode it, within 3 s, which must stay under ZetaSDR's 5 s grace for a handler to exit after its input
+  closes (`EXIT_GRACE`, `crates/zeta-ext/src/proc.rs`; LTE's search loses a tail of much under a block, `lte` above);
+  a decode that takes longer is given up (at 20 MHz an LTE block takes 2.8 s, so the padded tail of a run without
+  `--drop` can be lost under load); `dvbs` pushes the
   rest of its band filter through and flushes its receiver (also with `--drop`).
   SIGTERM ends it at once.
 
@@ -640,7 +662,8 @@ test/only.sh                              # the modes only OnAir decodes (ble, l
                                           # onair-gen's --sigmf pair; wisun also cut short, run twice and on one CPU and
                                           # two (taskset); tetra, gsmr and lte run twice, on one CPU, through a pipe,
                                           # with --drop, cut shorter than a stretch and at real time through a pipe;
-                                          # dvbs the same with GSE, and MPE and ULE, --width, and noise (about 3.5 min)
+                                          # lte --drop at 20 MHz from a writer of 4 MB writes; dvbs the same with GSE,
+                                          # and MPE and ULE, --width (one over the rate refused), and noise (about 3.5 min)
 ```
 
 The wrapper's headers are on the quoted include path only (`-iquote`), so that `src/poll.h` does not stand in for the

@@ -180,6 +180,14 @@ std::unique_ptr<PollSession> openDvbs(const Options& o, std::string* err) {
         *err = b;
         return nullptr;
     }
+    // A band wider than the input cannot be cut out of it: the receiver would search the whole input instead, for a carrier
+    // the input may not hold whole
+    if (o.width > o.rate) {
+        char b[160];
+        snprintf(b, sizeof b, "dvbs: --width %.0f is wider than --rate %.0f", o.width, o.rate);
+        *err = b;
+        return nullptr;
+    }
     // The receiver's decoders run on the CPU (setComputeMode(0)), but making one opens OnAir's GPU decoder all the same (its
     // ComputeChoice asks whether there is a GPU, which sets up Vulkan on the first graphics card): OnAir's own switch for that,
     // DECT2_NOGPU, keeps the GPU untouched. OnAir says so on stderr once.

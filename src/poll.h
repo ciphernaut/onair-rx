@@ -25,6 +25,9 @@ struct PollSession {
     // dvbs's receiver waits for its own decoder threads instead (its blocking switch), and its session for what is queued at
     // each poll.
     virtual void feed(const cf32* x, size_t n) = 0;
+    // Under --drop: n samples of the input were dropped by the read-ahead (its queue was full) before the block fed next. A
+    // cell mode's session drops the part of a stretch it holds, so that the receiver never decodes a stretch with a hole in it
+    virtual void gap(uint64_t n) { (void)n; }
     // The lines for what is new or changed since the last poll. last: the input has ended.
     // A line has neither "event" nor "t_sample": runPolled adds both.
     virtual void poll(bool last, std::vector<Json>& lines) = 0;
@@ -38,7 +41,8 @@ struct PollMode {
     int chan = -1;            // a dect2::wire::Chan, or -1: no packets (--pcap-port is refused)
     bool needsFreq = false;   // the receiver is told the radio frequency of the input: --freq is required
     // seconds of stdin read ahead (runPolled's read-ahead thread), at least the longest wait of a session that waits for its
-    // receiver; 0: two blocks, for a session that never waits. Two blocks under --drop, and never more than 256 MB
+    // receiver; 0: two blocks, for a session that never waits. Under --drop this or kDropReadAheadSec, whichever is longer,
+    // so that a writer's bursts fit; never more than 256 MB
     double readAheadSec = 0;
 };
 extern const PollMode kPollModes[];
@@ -47,6 +51,9 @@ extern const size_t kPollModeCount;
 constexpr size_t kPollBlock = 1 << 14;    // runPolled's block, samples
 constexpr double kStatusPollSec = 0.25;   // the status modes' (dvbt, video, dvbs) poll interval
 constexpr double kStatusMostSec = 2;      // a status line at least this often, seconds of input
+// The least read-ahead under --drop, seconds of input: a writer that hands over its input in bursts (ZetaSDR's capture_decode
+// writes 50 ms at a time) is never cut short by a full queue while the session keeps up on average
+constexpr double kDropReadAheadSec = 0.25;
 
 // When a status line is due (the status modes: dvbt and video in poll_tv.cpp, dvbs in poll_dvbs.cpp). The first waits for first
 // lock or kStatusMostSec of input, whichever comes first (the poll of the block that reaches it), as the row's own decoders'

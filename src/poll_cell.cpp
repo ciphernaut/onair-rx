@@ -19,6 +19,11 @@
 // decodes what it holds. The last poll waits at most kFlushSec in all (--drop: first for a stretch still being decoded, then
 // for the padded one), and the session's end makes a stretch still being decoded give up at its next carrier.
 //
+// Under --drop the session does not wait, and what the receiver decodes is still contiguous within each stretch: the session
+// gathers the input into whole stretches itself and hands one over only when the worker is idle, else drops it whole, as the
+// receivers do live; a gap the read-ahead makes (its queue full, PollSession::gap) drops the part of a stretch gathered
+// before it, and the next stretch starts after the gap.
+//
 // Their frames (TETRA's signalling blocks, GSM-R's BCCH blocks, LTE's system information messages) go to OnAir's Wireshark hub
 // as GSMTAP, from the worker; runPolled collects them under the hub tap's lock.
 #include "poll.h"
@@ -40,7 +45,9 @@ using namespace dect2;
 
 namespace {
 
-constexpr double kFlushSec = 5;           // the last poll waits at most this long, for a stretch being decoded and the padded one
+// the last poll waits at most this long, for a stretch being decoded and the padded one: under ZetaSDR's 5 s grace for a
+// handler to exit once its input is closed (zeta-ext, EXIT_GRACE), so that the lines of the end of input are written first
+constexpr double kFlushSec = 3;
 constexpr double kGsmrStretchSec = 2.2;   // GsmrReceiver's stretch (gsmr_rx.cpp, kBlockSec), which its header does not export
 constexpr double kLteStretchSec = 0.2;    // CellReceiver's block (cell_rx.cpp, kBlockSec), which its header does not export either
 
@@ -134,15 +141,24 @@ public:
     }
 
 protected:
+    void gap(uint64_t) override { part_.clear(); }   // only under --drop: the part of a stretch before the gap goes
     // The end of input: the last partial stretch is completed with zeros, so that the receiver decodes what it holds, and
     // waited for, all within kFlushSec. Without --drop the worker is idle and what the receiver holds is known (fill_): nothing
     // is padded when the input ended with a whole stretch. With --drop a stretch may still be being decoded (it is waited
-    // for first) and what the receiver holds is not known, since it skipped: a whole stretch of zeros goes in, which
-    // completes what it holds.
+    // for first); the receiver holds nothing, and the part of a stretch the session gathered (part_) is completed with zeros
+    // and handed over.
     void flush() {
         const Clock::time_point until = Clock::now() + std::chrono::milliseconds(std::llround(kFlushSec * 1000));
         if (!waitIdle(rx_, &until)) return;
-        size_t pad = drop_ ? want_ : fill_ ? want_ - fill_ : 0;
+        if (drop_) {
+            if (part_.empty()) return;
+            part_.resize(want_);   // the rest zeros
+            rx_.feed(part_.data(), part_.size());
+            part_.clear();
+            waitIdle(rx_, &until);
+            return;
+        }
+        size_t pad = fill_ ? want_ - fill_ : 0;
         fill_ = 0;
         if (pad == 0) return;
         static const std::vector<cf32> zeros(kPollBlock);
@@ -153,11 +169,25 @@ protected:
         }
         waitIdle(rx_, &until);
     }
+    // --drop: the input gathered into whole stretches (part_); a whole one goes to the receiver when its worker is idle and is
+    // dropped whole when it is busy (as the receivers drop live), so that the receiver is never held up and never decodes a
+    // stretch with a hole in it. The receiver then gathers it at once, in one feed, and holds nothing between two of them.
+    void feedDrop(const cf32* x, size_t n) {
+        while (n > 0) {
+            const size_t take = std::min(n, want_ - part_.size());
+            part_.insert(part_.end(), x, x + take);
+            x += take;
+            n -= take;
+            if (part_.size() < want_) continue;
+            if (!rx_.busy()) rx_.feed(part_.data(), part_.size());
+            part_.clear();
+        }
+    }
     // For a receiver that gathers a stretch only while its worker is idle and drops the rest of the feed that completes one
     // (GSM-R, LTE): the block is cut at the stretch's end and the worker waited for there, so it is idle at every feed and
-    // nothing is skipped. Under --drop the block goes in whole, as live.
+    // nothing is skipped. Under --drop the stretches are gathered by the session (feedDrop).
     void feedCut(const cf32* x, size_t n) {
-        if (drop_) { rx_.feed(x, n); return; }
+        if (drop_) { feedDrop(x, n); return; }
         while (n > 0) {
             const size_t take = std::min(n, want_ - fill_);
             rx_.feed(x, take);
@@ -172,8 +202,14 @@ protected:
     virtual void cells(std::vector<CellSeen>& now) = 0;   // what the snapshot says about each cell
     // the SNR as the line has it: dB to a tenth, left out when the receiver has not measured it (-99)
     static void snrDb(Json& j, float db) { if (std::isfinite(db) && db > -99) j.num("snr_db", (double)db, 1); }
+    // --drop, once want_ is known: the session gathers the stretches (part_)
+    void setDrop(bool drop) {
+        drop_ = drop;
+        if (drop_) part_.reserve(want_);
+    }
     bool drop_ = false;
     size_t want_ = 0, fill_ = 0;   // a stretch's samples (the receiver's own expression); those of the current one fed so far
+    std::vector<cf32> part_;       // --drop: the stretch being gathered
     Rx rx_;
     Tel tel_;
     uint64_t seq_ = 0;
@@ -189,15 +225,15 @@ public:
         rx_.configure(o.rate);
         if (!rx_.ready()) return tooLow("tetra", o.rate, tetraTuning().minSampleRate, err);
         rx_.setCenterHz(o.freq);
-        drop_ = o.drop;
         want_ = (size_t)(o.rate * TetraReceiver::kCaptureSec);   // configure()'s own expression
+        setDrop(o.drop);
         return true;
     }
     // The receiver gathers the next stretch while it decodes one, and skips what comes once that one is full and the worker
     // still busy. One block never holds two stretches' ends, so waiting after each block is enough for it never to skip.
     void feed(const cf32* x, size_t n) override {
+        if (drop_) { feedDrop(x, n); return; }
         rx_.feed(x, n);
-        if (drop_) return;
         fill_ += n;
         if (fill_ >= want_) fill_ -= want_;
         waitIdle(rx_);
@@ -237,8 +273,8 @@ public:
         rx_.configure(o.rate);
         if (!rx_.ready()) return tooLow("gsmr", o.rate, gsmrTuning().minSampleRate, err);
         rx_.setCenterHz(o.freq);
-        drop_ = o.drop;
         want_ = (size_t)(o.rate * kGsmrStretchSec);   // the receiver's own expression (configure()), so the same number
+        setDrop(o.drop);
         return true;
     }
     // The receiver gathers a stretch only while its worker is idle, and drops the rest of the feed that completes one
@@ -274,8 +310,8 @@ public:
         rx_.configure(o.rate);
         if (!rx_.ready()) return tooLow("lte", o.rate, cellTuning().minSampleRate, err);
         rx_.setCenterHz(o.freq);
-        drop_ = o.drop;
         want_ = (size_t)(o.rate * kLteStretchSec);   // configure()'s own expression
+        setDrop(o.drop);
         return true;
     }
     // The receiver gathers a block only while its worker is idle, and drops the rest of the feed that completes one

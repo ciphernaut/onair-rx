@@ -17,10 +17,12 @@
 # and ends, 1.5 s of input (under one stretch, padded at its end) gives the cells, a writer at real time is never held up
 # 0.2 s, input of exactly three stretches skips nothing, their GSMTAP packets, --freq missing, a rate too low, and noise alone.
 # LTE (a polled cell mode as well, decoded 0.2 s at a time; makeCellSynth's 5 MHz cell at 4.6 Msps, the lowest rate whose
-# input holds the cell) the same way, with 0.19 s of input for the short cut. DVB-S (a polled status mode; OnAir's transmitter
+# input holds the cell) the same way, with 0.19 s of input for the short cut, and --drop at 20 MHz from a writer at real time
+# in writes of 4 MB (the cell read whole). DVB-S (a polled status mode; OnAir's transmitter
 # chain carrying one known UDP datagram in GSE, in MPE and in ULE): a status line at first lock or 2 s, then on a change and at
 # least every 2 s, the datagrams counted and on the pcap port byte for byte, --width bounding the carrier the receiver takes,
-# the same bytes from runs on one CPU, through a pipe and from a writer at real time, a cut input, --drop, and noise alone.
+# the same bytes from runs on one CPU, through a pipe and from a writer at real time, a cut input, --drop, a --width wider
+# than the rate refused, and noise alone.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -132,6 +134,8 @@ refuses "onair-rx: lte needs --freq HZ" --mode lte --rate "$lte_rate" || fail "l
 refuses "onair-rx: 1000000 Hz is too low for lte (at least 1920000 Hz)" --mode lte --rate 1000000 --freq "$lte_hz" ||
   fail "lte at 1 MHz"
 refuses "onair-rx: 1000000 Hz is too low for dvbs (at least 2000000 Hz)" --mode dvbs --rate 1000000 || fail "dvbs at 1 MHz"
+refuses "onair-rx: dvbs: --width 12000000 is wider than --rate 10000000" --mode dvbs --rate 10000000 --width 12000000 ||
+  fail "dvbs with a --width wider than its --rate"
 
 # --- the options a mode does not take: every mode before this plan refuses all four; ble, zigbee, thread and wifi all four;
 # lorawan all but --plan; zwave all but --region; wisun --width and --plan; tetra, gsmr and lte --width, --plan and
@@ -746,6 +750,49 @@ pcap gsmr 101 --mode gsmr --rate 2000000 --freq "$gr_hz" || fail "gsmr on the pc
 # cell over the whole block, so a block padded with more zeros loses it (0.17 s reads SIB2 no more, 0.16 s no cell; README)
 CELLRUN_SLOW=1 cellrun lte "$lte_hz" 0.2 "$lte_rate" $((lte_rate * 19 / 100))
 pcap lte 101 --mode lte --rate "$lte_rate" --freq "$lte_hz" || fail "lte on the pcap port"
+# lte --drop at 20 MHz, the rate of ZetaSDR's entry, from a writer at real time that hands its input over in writes of 4 MB
+# (cs16: 50 ms, the blocks a capture_decode replay writes): the scene looped to 7.2 s. The read-ahead holds such bursts
+# (under --drop it is sized by time, at least 0.25 s), and what the receiver decodes is contiguous within each of its
+# blocks, so the cell is read whole: at least one line with mcc, mnc and the SIBs. (0.4.0 as first built dropped a block of
+# 16384 samples from inside nearly every 0.2 s block at this write size: no line at all.)
+"$gen" --mode lte --rate 20000000 --freq "$lte_hz" --sigmf "$d/lte20" 2>"$d/lte20.gen" || fail "onair-gen --mode lte at 20 MHz: $(cat "$d/lte20.gen")"
+python3 -I - "$bin" "$d/lte20.sigmf-data" "$lte_hz" <<'EOF' || fail "lte --drop at 20 MHz from a writer of 4 MB writes"
+import json, re, subprocess, sys, threading, time
+binary, path, hz = sys.argv[1:4]
+rate, wb, secs = 20000000.0, 4 << 20, 7.2
+data = open(path, "rb").read()
+total = int(secs * rate) * 4
+p = subprocess.Popen([binary, "--format", "cs16", "--mode", "lte", "--rate", "20000000", "--freq", hz, "--drop"],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+got = {}
+ths = [threading.Thread(target=lambda k=k, f=f: got.__setitem__(k, f.read())) for k, f in (("out", p.stdout), ("err", p.stderr))]
+for th in ths: th.start()
+t0, off = time.monotonic(), 0
+while off < total:
+    due = t0 + (off / 4) / rate
+    now = time.monotonic()
+    if now < due:
+        time.sleep(due - now)
+    n = min(wb, total - off)
+    i = off % len(data)
+    chunk = data[i:i + n]
+    if len(chunk) < n:
+        chunk += data[:n - len(chunk)]
+    p.stdin.write(chunk); p.stdin.flush()
+    off += n
+p.stdin.close()
+for th in ths: th.join(60)
+p.wait(60)
+err = got["err"].decode(errors="replace")
+assert p.returncode == 0, f"exit {p.returncode}: {err}"
+ls = [json.loads(l) for l in got["out"].splitlines()]
+g = re.search(r"onair-rx: lte: (\d+) samples dropped", err)
+whole = [o for o in ls if "mcc" in o and "mnc" in o and o.get("sibs")]
+assert whole, f"no line with mcc, mnc and sibs ({g.group(1) if g else 0} samples dropped): {ls!r}"
+print(f"ok: lte --drop at 20 MHz, 7.2 s at real time in writes of 4 MB: {len(ls)} line(s), the cell whole "
+      f"(sibs {whole[0]['sibs']}); {g.group(1) if g else 0} samples dropped by the read-ahead")
+EOF
+rm -f "$d"/lte20.sigmf-*
 
 # --- DVB-S: a polled status mode. onair-gen plays OnAir's transmitter chain for 4 s carrying one UDP datagram over and over
 # (gse: DVB-S2 QPSK 2/3, the datagram in a GSE packet of every BBFRAME; mpe: DVB-S QPSK 2/3, in MPE sections; ule: DVB-S2
@@ -906,14 +953,14 @@ fi
 rss=$(cat "$d/rss")
 [ "$rss" -le $((107824 + 256 * 1024)) ] || fail "gsmr from a file: peak RSS $rss kB, 107824 kB before the read-ahead"
 echo "ok: gsmr from a file: peak RSS $rss kB (107824 kB before the read-ahead)"
-# --drop: the read-ahead never waits. A writer at 4 times real time, with the session slowed to 5 ms a block
-# (ONAIR_RX_TEST_BLOCK_DELAY_US, a test knob, so that the queue fills), is never held up 0.2 s; the blocks that find the
-# queue full are dropped (whole blocks, and the short last one) and said on stderr, and t_sample stays a block's index on
-# the input
-python3 -I - "$bin" "$d/gsmr.iq" "$gr_hz" <<'EOF' || fail "gsmr --drop, a writer at 4 times real time"
+# --drop: the read-ahead never waits. A writer at 8 times real time, with the session slowed to 5 ms a block
+# (ONAIR_RX_TEST_BLOCK_DELAY_US, a test knob, so that the queue fills: under --drop it holds gsmr's two stretches, 4.4 s),
+# is never held up 0.2 s; the blocks that find the queue full are dropped (whole blocks, and the short last one) and said
+# on stderr, and t_sample stays a block's index on the input
+python3 -I - "$bin" "$d/gsmr.iq" "$gr_hz" <<'EOF' || fail "gsmr --drop, a writer at 8 times real time"
 import json, os, re, subprocess, sys, threading, time
 binary, iq, hz = sys.argv[1:4]
-rate, chunk = 4 * 2000000.0, 16384 * 8
+rate, chunk = 8 * 2000000.0, 16384 * 8
 data = open(iq, "rb").read()
 env = dict(os.environ, ONAIR_RX_TEST_BLOCK_DELAY_US="5000")
 p = subprocess.Popen([binary, "--format", "cf32", "--mode", "gsmr", "--rate", "2000000", "--freq", hz, "--drop"],
@@ -942,7 +989,7 @@ nsamp = len(data) // 8
 for l in got["out"].splitlines():
     t = json.loads(l)["t_sample"]
     assert t % 16384 == 0 and 0 <= t < nsamp, f"t_sample {t}"
-print(f"stall: gsmr --drop at 4 times real time: the writer held up at most {worst * 1000:.1f} ms by a write; "
+print(f"stall: gsmr --drop at 8 times real time: the writer held up at most {worst * 1000:.1f} ms by a write; "
       f"{g.group(1)} samples dropped")
 assert worst < 0.2, f"a write held the writer up {worst:.3f} s"
 EOF
