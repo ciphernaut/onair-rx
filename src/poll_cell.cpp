@@ -13,9 +13,10 @@
 // would depend on the worker's timing. So, unless --drop, a session waits for the worker after each stretch it hands over, and
 // the receiver skips nothing: the stretches follow each other from sample 0, each decoded before the next sample is fed, so
 // every snapshot and every line depends on the input alone. GSM-R's receiver also drops the rest of the feed that completes a
-// stretch (gsmr_rx.cpp, feed): its session splits its blocks at the stretch's end. The input after the last whole stretch is
-// never decoded (the receivers have no flush). At the end of input the last poll waits at most kFlushSec for a stretch still
-// being decoded (--drop), and the session's end makes such a stretch give up at its next carrier.
+// stretch (gsmr_rx.cpp, feed): its session splits its blocks at the stretch's end. The receivers have no flush, so at the end
+// of input the session completes the last partial stretch with zeros, and the receiver decodes what it holds. The last poll
+// waits at most kFlushSec in all (--drop: first for a stretch still being decoded, then for the padded one), and the session's
+// end makes a stretch still being decoded give up at its next carrier.
 //
 // Their frames (TETRA's signalling blocks, GSM-R's BCCH blocks) go to OnAir's Wireshark hub as GSMTAP, from the worker; runPolled
 // collects them under the hub tap's lock.
@@ -36,7 +37,7 @@ using namespace dect2;
 
 namespace {
 
-constexpr double kFlushSec = 5;           // the last poll waits at most this long for a stretch still being decoded
+constexpr double kFlushSec = 5;           // the last poll waits at most this long, for a stretch being decoded and the padded one
 constexpr double kGsmrStretchSec = 2.2;   // GsmrReceiver's stretch (gsmr_rx.cpp, kBlockSec), which its header does not export
 
 bool tooLow(const char* mode, double rate, double least, std::string* err) {
@@ -46,13 +47,14 @@ bool tooLow(const char* mode, double rate, double least, std::string* err) {
     return false;
 }
 
-// Waits until the receiver's worker is idle with no stretch waiting for it; at most maxSec (< 0: as long as it takes, which a
-// stretch's decoding always ends). False when it is still busy.
+using Clock = std::chrono::steady_clock;
+
+// Waits until the receiver's worker is idle with no stretch waiting for it, at most until the deadline (none: as long as it
+// takes, which a stretch's decoding always ends). False when it is still busy.
 template <class Rx>
-bool waitIdle(const Rx& rx, double maxSec) {
-    const auto until = std::chrono::steady_clock::now() + std::chrono::duration<double>(maxSec < 0 ? 0 : maxSec);
+bool waitIdle(const Rx& rx, const Clock::time_point* until = nullptr) {
     while (rx.busy()) {
-        if (maxSec >= 0 && std::chrono::steady_clock::now() >= until) return false;
+        if (until && Clock::now() >= *until) return false;
         std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
     return true;
@@ -119,7 +121,7 @@ public:
     // then joins its worker at once
     ~CellSession() override { rx_.reset(); }
     void poll(bool last, std::vector<Json>& lines) override {
-        if (last) waitIdle(rx_, kFlushSec);   // without --drop the worker is idle already
+        if (last) flush();
         if (!rx_.telemetry(tel_, seq_)) return;   // between two snapshots the last one stands: nothing new to say
         seq_ = tel_.seq;
         std::vector<CellSeen> now;
@@ -128,10 +130,30 @@ public:
     }
 
 protected:
+    // The end of input: the last partial stretch is completed with zeros, so that the receiver decodes what it holds, and
+    // waited for, all within kFlushSec. Without --drop the worker is idle and what the receiver holds is known (fill_): nothing
+    // is padded when the input ended with a whole stretch. With --drop a stretch may still be being decoded (it is waited
+    // for first) and what the receiver holds is not known, since it skipped: a whole stretch of zeros goes in, which
+    // completes what it holds.
+    void flush() {
+        const Clock::time_point until = Clock::now() + std::chrono::milliseconds(std::llround(kFlushSec * 1000));
+        if (!waitIdle(rx_, &until)) return;
+        size_t pad = drop_ ? want_ : fill_ ? want_ - fill_ : 0;
+        fill_ = 0;
+        if (pad == 0) return;
+        static const std::vector<cf32> zeros(kPollBlock);
+        while (pad > 0) {
+            const size_t k = std::min(pad, zeros.size());
+            rx_.feed(zeros.data(), k);
+            pad -= k;
+        }
+        waitIdle(rx_, &until);
+    }
     virtual void cells(std::vector<CellSeen>& now) = 0;   // what the snapshot says about each cell
     // the SNR as the line has it: dB to a tenth, left out when the receiver has not measured it (-99)
     static void snrDb(Json& j, float db) { if (std::isfinite(db) && db > -99) j.num("snr_db", (double)db, 1); }
     bool drop_ = false;
+    size_t want_ = 0, fill_ = 0;   // a stretch's samples (the receiver's own expression); those of the current one fed so far
     Rx rx_;
     Tel tel_;
     uint64_t seq_ = 0;
@@ -148,13 +170,17 @@ public:
         if (!rx_.ready()) return tooLow("tetra", o.rate, tetraTuning().minSampleRate, err);
         rx_.setCenterHz(o.freq);
         drop_ = o.drop;
+        want_ = (size_t)(o.rate * TetraReceiver::kCaptureSec);   // configure()'s own expression
         return true;
     }
     // The receiver gathers the next stretch while it decodes one, and skips what comes once that one is full and the worker
     // still busy. One block never holds two stretches' ends, so waiting after each block is enough for it never to skip.
     void feed(const cf32* x, size_t n) override {
         rx_.feed(x, n);
-        if (!drop_) waitIdle(rx_, -1);
+        if (drop_) return;
+        fill_ += n;
+        if (fill_ >= want_) fill_ -= want_;
+        waitIdle(rx_);
     }
 
 private:
@@ -207,7 +233,7 @@ public:
             fill_ += take;
             if (fill_ < want_) continue;
             fill_ = 0;
-            waitIdle(rx_, -1);
+            waitIdle(rx_);
         }
     }
 
@@ -229,7 +255,6 @@ private:
             now.push_back({id, c.freqHz, k.done(), std::move(j)});
         }
     }
-    size_t want_ = 0, fill_ = 0;   // a stretch's samples; those of the current one fed so far
 };
 
 template <class S>

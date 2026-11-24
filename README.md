@@ -263,7 +263,10 @@ modes ZetaSDR has no decoder of its own for: their point is their packets, which
 - **stdout, polled modes:** some OnAir receivers put nothing on the bus and offer only a snapshot of their state
   (`telemetry()`). A polled mode feeds its receiver blocks of 16384 samples, each one whole however the input arrives
   (only the last may be short), and polls at the multiples of the mode's poll interval from sample 0, each after the
-  block that reaches one, so a replay gives the same lines as a live run, byte for byte. An interval shorter than a
+  block that reaches one, so a replay gives the same lines as a live run, byte for byte. stdin is read on a thread of
+  its own into a queue of 4 s of input at the rate (at least two blocks), from which the blocks are taken: a session
+  that waits for its receiver (`tetra`, `gsmr`) does not hold up the writer meanwhile. When the queue is full the reader
+  waits, and the writer with it (back-pressure; no sample is dropped). An interval shorter than a
   block is a poll after every block: `dmr` at 48 kHz (0.25 s is 12000 samples) is polled every block, each 0.34 s
   of input. A poll writes one JSON object
   per line for what is new or has changed since the last poll; one more poll runs at the end of input, so that what
@@ -408,10 +411,14 @@ modes ZetaSDR has no decoder of its own for: their point is their packets, which
     stretch's end, where it cuts the block (GSM-R): the receiver skips nothing, the stretches follow each other from sample
     0, each is decoded before the next sample is fed, and every line depends on the input alone (two runs, one CPU or
     several, a file or a pipe give the same bytes). A stretch's lines come at the first poll after the block that ends
-    it: at most 0.25 s of input and one block later. The input after the last whole stretch is never decoded (the
-    receivers have no flush), so input shorter than 2.3 s (2.2 s) gives no line. At the end of input the last poll waits
-    at most 5 s for a stretch still being decoded (only with `--drop` is there one), then reports what the snapshot has;
-    the session's end then makes such a stretch give up at its next carrier, so the program never waits on it.
+    it: at most 0.25 s of input and one block later. stdin is read meanwhile (the read-ahead thread above), so a writer
+    at real time is not held up by the wait. The receivers have no flush, so at the end of input the session completes
+    the last partial stretch with zeros and the receiver decodes what it held: input shorter than one stretch (1.5 s of
+    the scene) gives its cells' lines too, and input that ends with a whole stretch pads nothing. The last poll waits at
+    most 5 s in all, for the padded stretch (and, with `--drop`, first for a stretch still being decoded), then reports
+    what the snapshot has; the session's end then makes a stretch still being decoded give up at its next carrier, so the
+    program never waits on it. With `--drop` what the receiver holds is not known (it skipped), so a whole stretch of zeros
+    goes in, which completes it.
     **`--drop`** runs the receiver as it runs live: the session does not wait, and the receiver skips what comes while it
     decodes. Which stretches are decoded then depends on the worker's timing (from a file nearly all the input after the
     first stretch goes), and so do the lines.
@@ -455,16 +462,18 @@ modes ZetaSDR has no decoder of its own for: their point is their packets, which
     |---|---|---|---|
     | `tetra`, file | 0.07 | 0.09 to 0.10 | yes (every stretch decoded) |
     | `tetra --drop`, file | 0.03 | 0.03 | yes, but it decoded 1 of the 3 stretches here |
-    | `tetra`, paced at real time | 0.05 to 0.08 | ends 0.1 to 0.2 s after the input | yes; its input stops for up to 0.2 to 0.3 s at each stretch's end |
+    | `tetra`, paced at real time | 0.05 to 0.08 | ends 0.1 to 0.2 s after the input | yes; a writer of 16384-sample blocks is held up 4 ms at most |
     | `tetra --drop`, paced at real time | 0.08 | ends with the input | yes (every stretch decoded) |
     | `gsmr`, file | 0.43 to 0.45 | 0.48 to 0.50 | yes (every stretch decoded) |
     | `gsmr --drop`, file | 0.15 | 0.17 | yes, but it decoded 1 of the 3 stretches here |
-    | `gsmr`, paced at real time | 0.44 to 0.49 | ends 0.9 to 1.0 s after the input | on average; its input stops for up to 1.0 to 1.4 s at each stretch's end |
+    | `gsmr`, paced at real time | 0.44 to 0.49 | ends 0.9 to 1.0 s after the input | yes; a writer of 16384-sample blocks is held up 10 ms at most |
     | `gsmr --drop`, paced at real time | 0.27 to 0.31 | ends with the input | yes, but it skips about a second after each stretch (2 of 3 decoded) |
 
-    Without `--drop` the session's wait stops the reading of stdin while a stretch is decoded, so a writer feeding at
-    real time is held up that long (the pipe fills) and catches up after. The node's writer skips frames when its own
-    queue overflows, so a GSM-R job at real time needs a queue that holds 1.4 s of input, or `--drop`.
+    Without `--drop` the session waits while a stretch is decoded; the read-ahead thread keeps reading stdin meanwhile
+    (before it, a writer at real time was held up 0.17 to 0.31 s by TETRA's wait and 1.0 to 1.4 s by GSM-R's), and the
+    session catches up on the queued input after. The queue's 4 s is well above a stretch's decoding here; a band whose
+    stretch takes longer to decode than it lasts cannot keep real time without `--drop`. The paced figures (input end
+    and CPU) are from before the read-ahead thread.
 - **`--pcap-port PORT`:** listens on 127.0.0.1:PORT before reading stdin and serves one client at a time a classic
   pcap stream: the file header, then one record per frame. ADS-B: 7 or 14 bytes, link type 147 (USER0), and every
   JSON line has exactly one record. APRS: the AX.25 frame as OnAir's Wireshark hub gets it (link type 3), also a
@@ -488,8 +497,8 @@ modes ZetaSDR has no decoder of its own for: their point is their packets, which
   Only `wisun` flushes its receiver at the end of input (a bus row's `flushAtEnd`, below, is for one that holds frames
   until told); with another mode a decode a receiver still holds when stdin closes is not written, and a short
   replay (ZetaSDR's `capture_decode`) can lose its last message this way. A polled mode polls once more at EOF, so
-  what its receiver's snapshot has by then is written; `tetra` and `gsmr` never decode the input after their last whole
-  stretch, and with `--drop` the last poll waits at most 5 s for a stretch still being decoded.
+  what its receiver's snapshot has by then is written; `tetra` and `gsmr` first complete their last partial stretch with
+  zeros and decode it, within 5 s.
   SIGTERM ends it at once.
 
 ## Build
@@ -507,8 +516,8 @@ test/only.sh                              # the modes only OnAir decodes (ble, l
                                           # wisun, tetra, gsmr) on OnAir's own scenes, their packets, the options each
                                           # mode refuses, noise alone (it prints each mode's user CPU), onair-gen's
                                           # --sigmf pair; wisun also cut short, run twice and on one CPU and two
-                                          # (taskset); tetra and gsmr run twice, on one CPU, through a pipe, with --drop
-                                          # and on 1 s of input
+                                          # (taskset); tetra and gsmr run twice, on one CPU, through a pipe, with --drop,
+                                          # on 1.5 s of input and at real time through a pipe
 ```
 
 The wrapper's headers are on the quoted include path only (`-iquote`), so that `src/poll.h` does not stand in for the

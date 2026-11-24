@@ -14,7 +14,8 @@
 # pcap port, and onair-gen's --sigmf pair read back. TETRA and GSM-R (polled cells, decoded a stretch at a time on the
 # receiver's worker; makeTetraSynth and makeGsmrSynth, scene 0, three stretches long, the generator's own noise): one line per
 # cell with the scene's identity and no second one, the same bytes from two runs, on one CPU and through a pipe, --drop runs
-# and ends, 1 s of input ends within 8 s with no line, their GSMTAP packets, --freq missing, a rate too low, and noise alone.
+# and ends, 1.5 s of input (under one stretch, padded at its end) gives the cells, a writer at real time is never held up
+# 0.2 s, input of exactly three stretches skips nothing, their GSMTAP packets, --freq missing, a rate too low, and noise alone.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 bin=${ONAIR_RX:-$here/onair-rx}
@@ -616,9 +617,11 @@ cellrun() {
     fail "$m through a pipe: $(tail -n 3 "$d/$m-pipe.err")"
   cmp -s "$d/$m-1.jsonl" "$d/$m-pipe.jsonl" || fail "$m through a pipe gives other bytes"
   echo "ok: $m: two runs, a run on CPU 0 and one through a pipe give the same bytes"
-  # nothing skipped: the input cut to exactly three stretches gives the packets and the lines of the whole input, which holds
-  # the same three stretches and 0.3 s more (a receiver that skipped input at a stretch's end would not complete the third).
-  # The packets are counted with a pcap port no client connects to (stderr's "<n> packets")
+  # nothing skipped: the input cut to exactly three stretches gives the packets and the lines of the same input with 0.05 s of
+  # zeros after it. That is three whole stretches and then a last partial one of zeros, which the end of input pads and
+  # decodes (no carrier, no packet). A receiver that skipped input at a stretch's end would hold the third stretch
+  # incomplete at the end of the exact cut, whose end then pads nothing, while the zeros complete it. The packets are counted
+  # with a pcap port no client connects to (stderr's "<n> packets")
   python3 -I - "$bin" "$d/$m.iq" "$m" "$hz" "$stretch" <<'EOF' || fail "$m on exactly three stretches"
 import re, socket, subprocess, sys
 binary, iq, m, hz, stretch = sys.argv[1:6]
@@ -633,11 +636,39 @@ def run(raw):
     g = re.search(rb": \d+ lines, (\d+) packets", p.stderr)
     assert g, f"no packet count: {p.stderr.decode(errors='replace')}"
     return int(g.group(1)), p.stdout
-whole, wl = run(data)
 cut, cl = run(data[:n * 8])
-assert whole > 0 and cut == whole, f"{cut} packets from exactly three stretches, {whole} from the whole input"
-assert cl == wl, "the lines differ"
-print(f"ok: {m}: the input cut to exactly three stretches ({n} samples): its {cut} packets and its lines")
+zeros, zl = run(data[:n * 8] + bytes(100000 * 8))
+assert cut > 0 and cut == zeros, f"{cut} packets from exactly three stretches, {zeros} with 0.05 s of zeros after them"
+assert cl == zl, "the lines differ"
+print(f"ok: {m}: the input cut to exactly three stretches ({n} samples): the {cut} packets and the lines of it with zeros after")
+EOF
+  # the reading of stdin never waits for the receiver: a writer at real time in blocks of 16384 samples is never held up
+  # by a write for 0.2 s or more, while every stretch is still decoded (the lines of the run from a file)
+  python3 -I - "$bin" "$d/$m.iq" "$m" "$hz" "$d/$m-1.jsonl" <<'EOF' || fail "$m: a writer at real time is held up"
+import subprocess, sys, time
+binary, iq, m, hz, ref = sys.argv[1:6]
+rate, chunk = 2000000.0, 16384 * 8
+data = open(iq, "rb").read()
+p = subprocess.Popen([binary, "--format", "cf32", "--mode", m, "--rate", "2000000", "--freq", hz],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+import threading
+got = []
+th = threading.Thread(target=lambda: got.append(p.stdout.read())); th.start()
+t0, worst = time.monotonic(), 0.0
+for i in range(0, len(data), chunk):
+    due = t0 + (i / 8) / rate
+    now = time.monotonic()
+    if now < due:
+        time.sleep(due - now)
+    w = time.monotonic()
+    p.stdin.write(data[i:i + chunk]); p.stdin.flush()
+    worst = max(worst, time.monotonic() - w)
+p.stdin.close()
+th.join(60); p.wait(60)
+assert p.returncode == 0, f"exit {p.returncode}"
+assert got[0] == open(ref, "rb").read(), "the lines differ from the run from a file"
+print(f"stall: {m}: a writer at real time held up at most {worst * 1000:.1f} ms by a write")
+assert worst < 0.2, f"a write held the writer up {worst:.3f} s"
 EOF
   # --drop: the receiver skips the input that comes while its worker is busy, as it does live; it runs and ends (its lines
   # depend on the worker's timing and are not compared)
@@ -645,17 +676,25 @@ EOF
     <"$d/$m.iq" >"$d/$m-drop.jsonl" 2>"$d/$m-drop.err" || fail "$m --drop: onair-rx exited $?: $(tail -n 3 "$d/$m-drop.err")"
   read -r user wall <"$d/$m.cpu"
   echo "ok: $m --drop runs and ends: $(wc -l <"$d/$m-drop.jsonl") line(s); cpu $user s user, $wall s wall over $secs s of input"
-  # the input cut to 1 s, shorter than a stretch: exit 0 within 8 s, and no line (the receiver decodes whole stretches only)
-  head -c $((2000000 * 8)) "$d/$m.iq" >"$d/$m-cut.iq"
+  # the input cut to 1.5 s, shorter than a stretch: the end of input pads it, so the receiver decodes it. Exit 0 within 8 s
+  # with and without --drop, and without it the scene's cells, each with what the run of the whole scene said of it
+  head -c $((3000000 * 8)) "$d/$m.iq" >"$d/$m-cut.iq"
   for extra in "" --drop; do
     st=0
     # shellcheck disable=SC2086
     timeout 8 "$bin" --format cf32 --mode "$m" --rate 2000000 --freq "$hz" $extra <"$d/$m-cut.iq" >"$d/$m-cut.jsonl" \
       2>"$d/$m-cut.err" || st=$?
-    [ "$st" = 0 ] || fail "$m $extra on 1 s of input: exit $st (124: not within 8 s): $(tail -n 3 "$d/$m-cut.err")"
-    [ ! -s "$d/$m-cut.jsonl" ] || fail "$m $extra on 1 s of input: a line: $(head -n 1 "$d/$m-cut.jsonl")"
+    [ "$st" = 0 ] || fail "$m $extra on 1.5 s of input: exit $st (124: not within 8 s): $(tail -n 3 "$d/$m-cut.err")"
   done
-  echo "ok: $m on 1 s of input, with and without --drop: exit 0 within 8 s, no line"
+  rx "$m-cut" --mode "$m" --rate 2000000 --freq "$hz"
+  python3 -I -c '
+import json, sys
+strip = lambda p: sorted(({k: v for k, v in json.loads(l).items() if k not in ("t_sample", "snr_db")} for l in open(p, "rb")),
+                         key=lambda o: o["freq_hz"])
+a, b = strip(sys.argv[1]), strip(sys.argv[2])
+assert a and a == b, f"1.5 s gives {b!r}; the whole scene {a!r}"
+print(f"ok: {sys.argv[3]} on 1.5 s of input (shorter than a stretch), with and without --drop: exit 0 within 8 s; the {len(b)} cell line(s) of the scene")' \
+    "$d/$m-1.jsonl" "$d/$m-cut.jsonl" "$m" || fail "$m on 1.5 s of input"
 }
 cellrun tetra "$te_hz" 2.3
 pcap tetra 101 --mode tetra --rate 2000000 --freq "$te_hz" || fail "tetra on the pcap port"

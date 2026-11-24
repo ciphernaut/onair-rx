@@ -93,12 +93,14 @@ Described only; not written here.
   comes while their worker decodes a stretch; GSM-R also drops the rest of the `feed()` that completes a stretch, even with
   its worker idle. A `setOffline(true)`, as `WisunReceiver` has, would make `feed()` wait for the worker instead and keep
   every sample. GSM-R's stretch (`kBlockSec`, 2.2 s) is not in its header, as TETRA's `kCaptureSec` is. Neither has a
-  `flush()` for the input after the last whole stretch.
+  `flush()` for the input after the last whole stretch: `onair-rx` completes it with zeros.
 - **Why:** `onair-rx`'s `tetra` and `gsmr` modes (`src/poll_cell.cpp`) wait on `busy()` after each block (GSM-R: at each
   stretch's end, where they cut the block, with the stretch's length copied from the source), so that a replay faster
-  than real time skips nothing and gives the lines of a live run. A switch inside the receiver would let it go on
-  reading the next stretch while it decodes (TETRA already gathers it), so a caller's input would not stall for the
-  decoding time (up to 1.4 s on GSM-R's two-cell scene). A replay shorter than one stretch gives nothing today.
+  than real time skips nothing and gives the lines of a live run. `onair-rx` reads stdin on a thread of its own so that
+  its writer is not held up meanwhile (before that, up to 1.4 s on GSM-R's two-cell scene). A switch inside the receiver
+  would let it go on gathering the next stretch while it decodes (TETRA already does), with no wait at all. Padding
+  with zeros changes the spectrum of the last stretch the carrier search sees; a `flush()` that decodes what is held as
+  it is would not.
 - **Test:** the receivers' own tests (`tests/tetra/test_tetra_rx.cpp`, `tests/gsmr/test_gsmr_rx.cpp`), fed without their
   `while (rx.busy()) sleep` pacing.
 

@@ -5,16 +5,82 @@
 // (telemetry()) the session reads. So the run only feeds and polls: the session decides what is new, and the run writes it
 // with the members every line has. A mode is a row: its name, its event, how often it is polled, how its session is made
 // (poll_<mode>.cpp), its hub channel (the cell modes hand their frames to OnAir's Wireshark hub) and whether it needs --freq.
+// stdin is read on a thread of its own (ReadAhead), so that a session waiting for its receiver never holds up the writer.
 #include "poll.h"
 #include "hub_tap.h"
 #include "dect2/wirecap/wire.h"
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 namespace onair_rx {
 
 namespace wire = dect2::wire;
+
+namespace {
+
+// stdin read ahead on a thread of its own into a bounded queue: while a session waits for its receiver's worker (tetra,
+// gsmr), stdin is still drained, so a writer feeding at real time is not held up for the decoding. The queue holds
+// kReadAheadSec of input at the rate (at least two blocks); when it is full the reader waits, so the writer is held up then
+// (back-pressure, as without the thread) and no sample is ever dropped, with --drop too (there the receiver skips, as it
+// does live, and the session does not wait, so the queue does not fill). The samples come out in the order they were read;
+// EOF and a read error (IqInput::error(), read by the caller once the run is over) end them.
+constexpr double kReadAheadSec = 4;
+class ReadAhead {
+public:
+    ReadAhead(IqInput& in, size_t capacity) : in_(in), cap_(capacity), th_([this] { run(); }) {}
+    ~ReadAhead() {   // the run reads to EOF, so the reader has ended; it is only told to stop should it still wait for room
+        { std::lock_guard<std::mutex> lk(mu_); stop_ = true; }
+        cv_.notify_all();
+        th_.join();
+    }
+    ReadAhead(const ReadAhead&) = delete;
+    ReadAhead& operator=(const ReadAhead&) = delete;
+    // The next samples, at most n, into x, as soon as any are there; 0 at the end of input
+    size_t read(cf32* x, size_t n) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this] { return !q_.empty() || eof_; });
+        if (q_.empty()) return 0;
+        const std::vector<cf32>& c = q_.front();
+        const size_t k = std::min(n, c.size() - at_);
+        std::copy(c.begin() + (long)at_, c.begin() + (long)(at_ + k), x);
+        at_ += k;
+        queued_ -= k;
+        if (at_ == c.size()) { q_.pop_front(); at_ = 0; }
+        cv_.notify_all();
+        return k;
+    }
+
+private:
+    void run() {
+        std::vector<cf32> buf(kPollBlock);
+        for (;;) {
+            const size_t n = in_.read(buf);   // outside the lock: what stdin has, up to a block
+            std::unique_lock<std::mutex> lk(mu_);
+            if (n == 0) { eof_ = true; cv_.notify_all(); return; }
+            cv_.wait(lk, [&] { return stop_ || queued_ == 0 || queued_ + n <= cap_; });
+            if (stop_) return;
+            q_.emplace_back(buf.begin(), buf.begin() + (long)n);
+            queued_ += n;
+            cv_.notify_all();
+        }
+    }
+    IqInput& in_;
+    const size_t cap_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::vector<cf32>> q_;
+    size_t at_ = 0;        // samples of q_.front() already taken
+    size_t queued_ = 0;    // samples in q_ not yet taken
+    bool eof_ = false, stop_ = false;
+    std::thread th_;       // last: it starts once the rest is made
+};
+
+} // namespace
 
 const PollMode kPollModes[] = {
     {"rds", "rds.group", 0, openRds},
@@ -75,20 +141,19 @@ int runPolled(const PollMode& m, const Options& o, IqInput& in, Output& out) {
     };
 
     // Every block is a whole 16384 samples (only the last may be short), however the input arrives: a read of a pipe returns
-    // what happens to be there. So the blocks, every t_sample and where each poll lands depend on the input alone, and a
-    // replay gives the same lines as a live run. The polls are at the multiples of the interval from sample 0, each after the
+    // what happens to be there, and the read-ahead hands on what it has. So the blocks, every t_sample and where each poll
+    // lands depend on the input alone, and a replay gives the same lines as a live run. The polls are at the multiples of the interval from sample 0, each after the
     // block that reaches one, so they do not drift.
     constexpr size_t kBlock = kPollBlock;
     const uint64_t every = (uint64_t)std::llround(m.pollSec * o.rate);   // 0: every block
     uint64_t fed = 0, first = 0, due = every;
-    std::vector<cf32> iq(kBlock), part;
+    ReadAhead ahead(in, std::max<size_t>(2 * kBlock, (size_t)std::ceil(kReadAheadSec * o.rate)));
+    std::vector<cf32> iq(kBlock);
     for (bool eof = false; !eof;) {
         size_t have = 0;
         while (have < kBlock) {
-            part.resize(kBlock - have);
-            const size_t n = in.read(part);
+            const size_t n = ahead.read(iq.data() + have, kBlock - have);
             if (n == 0) { eof = true; break; }
-            std::copy(part.begin(), part.begin() + (long)n, iq.begin() + (long)have);
             have += n;
         }
         if (have == 0) break;
