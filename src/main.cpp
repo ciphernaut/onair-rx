@@ -137,6 +137,7 @@ int main(int argc, char** argv) {
             if (!*argv[i] || *end || p < 1 || p > 65535) { fprintf(stderr, "onair-rx: bad --pcap-port %s\n", argv[i]); return 2; }
             o.pcapPort = (int)p;
         }
+        else if (a == "--ts-out" && val) o.tsOut = argv[++i];   // spike: dvbt's transport stream, as decoded
         else if (a == "--bandwidth" && val) {
             char* end = nullptr;
             const long w = strtol(argv[++i], &end, 10);
@@ -184,6 +185,7 @@ int main(int argc, char** argv) {
     if (bus && bus->needsFreq && o.freq <= 0) { fprintf(stderr, "onair-rx: %s needs --freq HZ\n", bus->name); return 2; }
     if (polled && polled->needsFreq && o.freq <= 0) { fprintf(stderr, "onair-rx: %s needs --freq HZ\n", polled->name); return 2; }
     if (bus && bus->chan < 0 && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", bus->name); return 2; }
+    if (!o.tsOut.empty() && o.mode != "dvbt") { fprintf(stderr, "onair-rx: %s has no --ts-out (dvbt only)\n", o.mode.c_str()); return 2; }
     if (o.bandwidthMhz && o.mode != "dvbt") { fprintf(stderr, "onair-rx: %s has no --bandwidth (dvbt only)\n", o.mode.c_str()); return 2; }
     if (polled && polled->chan < 0 && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", polled->name); return 2; }
 

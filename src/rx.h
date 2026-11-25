@@ -26,6 +26,7 @@ struct Options {
     double freq = 0;               // --freq: the radio frequency at 0 Hz of the input, Hz (0 when not given)
     int bandwidthMhz = 0;          // --bandwidth: dvbt's channel width, MHz (8, 7, 6 or 5; 0 when not given: each is tried)
     int pcapPort = 0;              // 0: no pcap port
+    std::string tsOut;             // --ts-out FILE (spike): dvbt writes the receiver's transport packets there as they come
     // the options only some modes take (main.cpp's kOnlySome says which; another mode refuses each)
     double width = 0;              // --width HZ: the job's band, Hz (0 when not given)
     std::string plan;              // --plan NAME: lorawan's channel plan (empty: the one with most channels in the input)

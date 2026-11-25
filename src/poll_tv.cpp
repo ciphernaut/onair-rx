@@ -17,8 +17,10 @@
 #include "dect2/dvbt/dvbt_rx.h"
 #include "dect2/t2/t2.h"
 #include "dect2/tv/ts.h"
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace onair_rx {
@@ -81,12 +83,41 @@ public:
         // the packets go to the demultiplexer, for the service list, and nowhere else. The receiver is not pipelined (its error
         // correction runs inside feed(), OnAir's default: a pipelined one costs the same CPU and only spreads it over a second
         // thread), so this runs on this thread and the packets of a block are read before its poll.
+        // Spike (--ts-out): the same packets, whole and in order, to a file as they come. Packets the receiver could not repair
+        // are written too, with the transport_error_indicator it set; they are counted, with the packets written, on stderr
+        // at the end. A write that fails stops the output and says so once; the status lines go on.
+        if (!o.tsOut.empty()) {
+            tsOut_ = fopen(o.tsOut.c_str(), "wb");
+            if (!tsOut_) {
+                *err = "cannot open --ts-out " + o.tsOut + ": " + strerror(errno);
+                return false;
+            }
+        }
         rx_.setPacketCallback([this](const uint8_t* p, size_t n, double sec) {
             for (size_t i = 0; i < n; i++) ts_.feed(p + i * 188);
+            if (tsOut_) {
+                if (!tsPackets_) tsFirstSec_ = sec;
+                for (size_t i = 0; i < n; i++) {
+                    if (p[i * 188] != 0x47) tsNoSync_++;
+                    if (p[i * 188 + 1] & 0x80) tsTei_++;
+                }
+                tsPackets_ += n;
+                if (fwrite(p, 188, n, tsOut_) != n) {
+                    fprintf(stderr, "onair-rx: dvbt: --ts-out: %s; output stopped\n", strerror(errno));
+                    fclose(tsOut_);
+                    tsOut_ = nullptr;
+                }
+            }
             ts_.advance(sec);
         });
         use(0);
         return true;
+    }
+    ~DvbtSession() override {
+        if (!tsPackets_ && !tsOut_) return;
+        if (tsOut_) fclose(tsOut_);
+        fprintf(stderr, "onair-rx: dvbt: ts-out: %llu packets, %llu with the error indicator, %llu without the sync byte, first at %.3f s\n",
+                (unsigned long long)tsPackets_, (unsigned long long)tsTei_, (unsigned long long)tsNoSync_, tsFirstSec_);
     }
     void feed(const cf32* x, size_t n) override {
         rx_.feed(x, n);
@@ -155,6 +186,9 @@ private:
     }
 
     TsDemux ts_;
+    FILE* tsOut_ = nullptr;     // --ts-out (spike)
+    uint64_t tsPackets_ = 0, tsTei_ = 0, tsNoSync_ = 0;
+    double tsFirstSec_ = 0;     // the callback's time at the first packet
     DvbtReceiver rx_;
     RxTelemetry tel_;
     uint64_t seq_ = 0;          // the snapshot tel_ is (OnAir's seq never restarts, not on configure either)
