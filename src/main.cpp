@@ -28,7 +28,7 @@ namespace onair_rx {
 
 namespace wire = dect2::wire;
 
-static const char* kVersion = "0.4.0";
+static const char* kVersion = "0.5.0";
 
 // The modes with a run function of their own: each is one OnAir receiver. The modes read from OnAir's automation bus are
 // rows of the bus mode table (bus.cpp) instead, and the modes that poll their receiver's state rows of the polled mode table
@@ -45,7 +45,9 @@ struct OnlySome {
     bool (*given)(const Options& o);
 };
 static const OnlySome kOnlySome[] = {
-    {"width", "dvbs", [](const Options& o) { return o.width > 0; }},
+    {"width", "dvbs dvbt", [](const Options& o) { return o.width > 0; }},
+    {"ts-port", "dvbt", [](const Options& o) { return o.tsPort != 0; }},
+    {"ts-buffer", "dvbt", [](const Options& o) { return o.tsBuffer != 0; }},
     {"plan", "lorawan", [](const Options& o) { return !o.plan.empty(); }},
     {"region", "zwave wisun", [](const Options& o) { return !o.region.empty(); }},
     {"drop", "wisun tetra gsmr lte dvbs", [](const Options& o) { return o.drop; }},
@@ -97,7 +99,7 @@ void Output::line(const std::string& json) {
 using namespace onair_rx;
 
 static void usage(FILE* f) {
-    fprintf(f, "usage: onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] [--bandwidth MHZ]\n"
+    fprintf(f, "usage: onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] [--bandwidth MHZ] [--ts-port PORT [--ts-buffer PACKETS]]\n"
                "                [--width HZ] [--plan NAME] [--region NAME] [--drop] < iq\n"
                "       onair-rx --lua      OnAir's Wireshark Lua dissector (USER0 is Mode S)\n"
                "       onair-rx --version\n"
@@ -131,13 +133,20 @@ int main(int argc, char** argv) {
             if (!*argv[i] || *end || !std::isfinite(hz) || hz <= 0) { fprintf(stderr, "onair-rx: bad --freq %s\n", argv[i]); return 2; }
             o.freq = hz;
         }
-        else if (a == "--pcap-port" && val) {
+        else if ((a == "--pcap-port" || a == "--ts-port") && val) {
             char* end = nullptr;
             const long p = strtol(argv[++i], &end, 10);
-            if (!*argv[i] || *end || p < 1 || p > 65535) { fprintf(stderr, "onair-rx: bad --pcap-port %s\n", argv[i]); return 2; }
-            o.pcapPort = (int)p;
+            if (!*argv[i] || *end || p < 1 || p > 65535) { fprintf(stderr, "onair-rx: bad %s %s\n", a.c_str(), argv[i]); return 2; }
+            if (a == "--ts-port") o.tsPort = (int)p;
+            else o.pcapPort = (int)p;
         }
-        else if (a == "--ts-out" && val) o.tsOut = argv[++i];   // spike: dvbt's transport stream, as decoded
+        else if (a == "--ts-buffer" && val) {
+            char* end = nullptr;
+            errno = 0;
+            long packets = strtol(argv[++i], &end, 10);
+            if (errno || !*argv[i] || *end || packets <= 0) { fprintf(stderr, "onair-rx: bad --ts-buffer %s\n", argv[i]); return 2; }
+            o.tsBuffer = size_t(packets);
+        }
         else if (a == "--bandwidth" && val) {
             char* end = nullptr;
             const long w = strtol(argv[++i], &end, 10);
@@ -185,7 +194,7 @@ int main(int argc, char** argv) {
     if (bus && bus->needsFreq && o.freq <= 0) { fprintf(stderr, "onair-rx: %s needs --freq HZ\n", bus->name); return 2; }
     if (polled && polled->needsFreq && o.freq <= 0) { fprintf(stderr, "onair-rx: %s needs --freq HZ\n", polled->name); return 2; }
     if (bus && bus->chan < 0 && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", bus->name); return 2; }
-    if (!o.tsOut.empty() && o.mode != "dvbt") { fprintf(stderr, "onair-rx: %s has no --ts-out (dvbt only)\n", o.mode.c_str()); return 2; }
+    if (o.tsBuffer && !o.tsPort) { fprintf(stderr, "onair-rx: --ts-buffer requires --ts-port\n"); return 2; }
     if (o.bandwidthMhz && o.mode != "dvbt") { fprintf(stderr, "onair-rx: %s has no --bandwidth (dvbt only)\n", o.mode.c_str()); return 2; }
     if (polled && polled->chan < 0 && o.pcapPort) { fprintf(stderr, "onair-rx: %s has no packets (no --pcap-port)\n", polled->name); return 2; }
 

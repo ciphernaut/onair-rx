@@ -12,6 +12,8 @@
 // decodes goes to OnAir's demultiplexer (TsDemux) only, for the service list; nothing else takes the packets.
 // video: OnAir's AtvReceiver in its FM video mode (analog FPV links, what the node's video row decodes). No picture is taken.
 #include "poll.h"
+#include "ts_port.h"
+#include <algorithm>
 #include "dect2/atv/atv_rx.h"
 #include "dect2/dsp/resampler.h"
 #include "dect2/dvbt/dvbt_rx.h"
@@ -80,46 +82,22 @@ public:
         // DvbtReceiver opens no sound device. The Viterbi on the CPU, as on every computer OnAir has no GPU decoder for: the
         // same lines everywhere.
         rx_.setComputeMode(0);
-        // the packets go to the demultiplexer, for the service list, and nowhere else. The receiver is not pipelined (its error
-        // correction runs inside feed(), OnAir's default: a pipelined one costs the same CPU and only spreads it over a second
-        // thread), so this runs on this thread and the packets of a block are read before its poll.
-        // Spike (--ts-out): the same packets, whole and in order, to a file as they come. Packets the receiver could not repair
-        // are written too, with the transport_error_indicator it set; they are counted, with the packets written, on stderr
-        // at the end. A write that fails stops the output and says so once; the status lines go on.
-        if (!o.tsOut.empty()) {
-            tsOut_ = fopen(o.tsOut.c_str(), "wb");
-            if (!tsOut_) {
-                *err = "cannot open --ts-out " + o.tsOut + ": " + strerror(errno);
-                return false;
-            }
+        if (o.width) {
+            auto preferred = std::find_if(widths_.begin(), widths_.end(), [&](int w) { return w * 1e6 <= o.width; });
+            if (preferred != widths_.end()) std::rotate(widths_.begin(), preferred, preferred + 1);
         }
+        if (o.tsPort && !transport_.open(o.tsPort, rate_, o.tsBuffer, *err)) return false;
+        sendTransport_ = o.tsPort != 0;
         rx_.setPacketCallback([this](const uint8_t* p, size_t n, double sec) {
             for (size_t i = 0; i < n; i++) ts_.feed(p + i * 188);
-            if (tsOut_) {
-                if (!tsPackets_) tsFirstSec_ = sec;
-                for (size_t i = 0; i < n; i++) {
-                    if (p[i * 188] != 0x47) tsNoSync_++;
-                    if (p[i * 188 + 1] & 0x80) tsTei_++;
-                }
-                tsPackets_ += n;
-                if (fwrite(p, 188, n, tsOut_) != n) {
-                    fprintf(stderr, "onair-rx: dvbt: --ts-out: %s; output stopped\n", strerror(errno));
-                    fclose(tsOut_);
-                    tsOut_ = nullptr;
-                }
-            }
+            if (sendTransport_) transport_.packets(p, n, sample_);
             ts_.advance(sec);
         });
         use(0);
         return true;
     }
-    ~DvbtSession() override {
-        if (!tsPackets_ && !tsOut_) return;
-        if (tsOut_) fclose(tsOut_);
-        fprintf(stderr, "onair-rx: dvbt: ts-out: %llu packets, %llu with the error indicator, %llu without the sync byte, first at %.3f s\n",
-                (unsigned long long)tsPackets_, (unsigned long long)tsTei_, (unsigned long long)tsNoSync_, tsFirstSec_);
-    }
     void feed(const cf32* x, size_t n) override {
+        sample_ += n;
         rx_.feed(x, n);
         cad_.fed(n);
     }
@@ -132,6 +110,8 @@ public:
         if (rx_.telemetry(tel_, seq_)) seq_ = tel_.seq;
         const RxTelemetry::Dvbt& t = tel_.dvbt;
         const bool locked = t.tpsOk;
+        if (hadLock_ && !locked && sendTransport_) transport_.gap();
+        hadLock_ = locked;
         const std::string services = locked ? serviceList() : std::string();
         auto line = [&](bool measured) {
             Json j;
@@ -186,9 +166,9 @@ private:
     }
 
     TsDemux ts_;
-    FILE* tsOut_ = nullptr;     // --ts-out (spike)
-    uint64_t tsPackets_ = 0, tsTei_ = 0, tsNoSync_ = 0;
-    double tsFirstSec_ = 0;     // the callback's time at the first packet
+    TsPort transport_;
+    uint64_t sample_ = 0;
+    bool hadLock_ = false, sendTransport_ = false;
     DvbtReceiver rx_;
     RxTelemetry tel_;
     uint64_t seq_ = 0;          // the snapshot tel_ is (OnAir's seq never restarts, not on configure either)
