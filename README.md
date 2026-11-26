@@ -15,7 +15,7 @@ attribution term (its `ADDITIONAL-TERMS.md`), which the two lines above and `ona
 
 ```
 onair-rx --mode MODE --rate HZ [--format cf32|cs16] [--freq HZ] [--pcap-port PORT] [--bandwidth MHZ]
-         [--width HZ] [--plan NAME] [--region NAME] [--drop] < iq
+         [--ts-port PORT [--ts-buffer PACKETS]] [--width HZ] [--plan NAME] [--region NAME] [--drop] < iq
 onair-rx --lua > onair.lua     # OnAir's Wireshark Lua dissector (USER0 is Mode S)
 onair-rx --version
 ```
@@ -77,6 +77,17 @@ sample of the block it was drained after) stands to the frame on the air.
     carrier it takes whole has a symbol rate of at most the width over one plus its roll-off, and one wider is cut
     (below). A width wider than `--rate` exits 2 before reading any input with `onair-rx: dvbs: --width <W> is wider
     than --rate <R>`.
+  - `--width` (`dvbt`): a tuning hint, the job's band, Hz: the widest channel of 8, 7, 6 and 5 MHz that fits in it is
+    tried first, then the others in turn as without it. Nothing is filtered. `--bandwidth` still fixes the width.
+- **`--ts-port PORT`, `--ts-buffer PACKETS`:** `dvbt` only. The receiver's transport stream, whole 188-byte packets in
+  order (the transport error indicator as the receiver set it), served on 127.0.0.1:PORT to one reader at a time, with
+  timing and gap marks as tagged null packets: the byte format is ZetaSDR's `docs/handler-mpegts.md`. A time mark
+  (the input sample count) opens each connection and comes at least every quarter second of input; a gap mark comes
+  when lock is lost (count 0) and when the queue overflowed (the count of packets dropped). The queue between the
+  receiver and the writer holds two seconds of input, or `--ts-buffer` packets; on overflow the oldest packets go. A
+  reader that stops reading is dropped after 0.2 s, and the queue is cleared on a disconnect, so a stalled reader never
+  holds up the receiver or its status lines. `--ts-buffer` without `--ts-port` exits 2 with `onair-rx: --ts-buffer
+  requires --ts-port`; either with another mode with `onair-rx: <mode> takes no --<option>`.
 - **stdout, adsb:** one JSON object per decoded Mode S frame, flushed per line. A line carries only what its own frame
   established, as an SBS (BaseStation) line does, never a value remembered from an earlier frame. A member whose value
   is not known is absent, never null.

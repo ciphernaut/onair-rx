@@ -139,7 +139,7 @@ refuses "onair-rx: dvbs: --width 12000000 is wider than --rate 10000000" --mode 
 
 # --- the options a mode does not take: every mode before this plan refuses all four; ble, zigbee, thread and wifi all four;
 # lorawan all but --plan; zwave all but --region; wisun --width and --plan; tetra, gsmr and lte --width, --plan and
-# --region; dvbs --plan and --region. Each mode gets the rate and the --freq it needs, so that the option is the only thing wrong
+# --region; dvbs --plan and --region; dvbt --plan, --region and --drop. Each mode gets the rate and the --freq it needs, so that the option is the only thing wrong
 for row in "adsb 2400000" "pocsag 1000000" "flex 1000000" "acars 1000000 131525000" "aprs 240000" "ais 250000 162000000" \
   "vdl2 250000 136975000" "hfdl 24000 8927000" "rs41 2000000" "dfm 2000000" "m20 2000000" "rds 500000" "dmr 48000" \
   "p25 250000" "m17 250000" "dvbt 10000000" "video 8000000" "ble 4000000" "lorawan 2000000 $lora_hz" \
@@ -151,14 +151,19 @@ for row in "adsb 2400000" "pocsag 1000000" "flex 1000000" "acars 1000000 1315250
   for opt in "width 2000000" "plan EU868" "region EU" "drop"; do
     read -r o v <<<"$opt"
     case "$m/$o" in lorawan/plan | zwave/region | wisun/region | wisun/drop | tetra/drop | gsmr/drop | lte/drop | dvbs/width | \
-      dvbs/drop) continue ;; esac
+      dvbs/drop | dvbt/width) continue ;; esac
     a=(--"$o")
     [ -z "${v:-}" ] || a+=("$v")
     refuses "onair-rx: $m takes no --$o" "${f[@]}" "${a[@]}" >/dev/null || fail "$m with --$o"
   done
 done
 echo "ok: every mode refuses the options it does not take (lorawan takes --plan, zwave --region, wisun --region and --drop," \
-  "tetra, gsmr and lte --drop, dvbs --width and --drop)"
+  "tetra, gsmr and lte --drop, dvbs --width and --drop, dvbt --width)"
+# --- --ts-port and --ts-buffer are dvbt's alone, and --ts-buffer needs --ts-port
+refuses "onair-rx: adsb takes no --ts-port" --mode adsb --rate 2400000 --ts-port 40000 >/dev/null || fail "adsb with --ts-port"
+refuses "onair-rx: --ts-buffer requires --ts-port" --mode dvbt --rate 10000000 --ts-buffer 100 >/dev/null ||
+  fail "dvbt with --ts-buffer and no --ts-port"
+echo "ok: --ts-port and --ts-buffer are dvbt's alone; --ts-buffer needs --ts-port"
 
 [ -x "$gen" ] || fail "no test signal generator at $gen (run ./build.sh)"
 
